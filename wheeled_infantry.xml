@@ -12,7 +12,8 @@
   </default>
   <asset>
     <!-- Matte black ground material. -->
-    <material name="ground_black_mat" rgba="0 0 0 1" reflectance="0" />
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512" rgb1=".1 .2 .3" rgb2=".2 .3 .4"/>
+    <material name="ground_black_mat"  texture="grid" texrepeat="8 8" reflectance="0" />
     <mesh name="l_active_aluminum" file="l_active_aluminum.stl" scale="0.001 0.001 0.001" />
     <mesh name="l_long_aluminum" file="l_long_aluminum.stl" scale="0.001 0.001 0.001" />
     <mesh name="l_lower_aluminum" file="l_lower_aluminum.stl" scale="0.001 0.001 0.001" />
@@ -73,7 +74,7 @@
   <worldbody>
     <light name="sun" pos="0 0 6" dir="0 0 -1" directional="true" diffuse="0.55 0.55 0.55" specular="0.05 0.05 0.05" />
     <!-- Static ground: collision group 2 accepts contacts from dynamic group 1. -->
-    <geom name="ground" type="plane" pos="0 0 0" size="10 10 0.1" material="ground_black_mat" friction="1.10 0.05 0.01" contype="2" conaffinity="1" />
+    <geom name="ground" type="plane" pos="0 0 0" size="100 100 0.1" material="ground_black_mat" friction="1.10 0.05 0.01" contype="2" conaffinity="1" />
     <body name="robot" pos="0 0 0.400" quat="0.70710678 0.70710678 0 0">
       <freejoint name="robot_free" />
       <!--6DOF瀹炵幇鐩稿鑵块儴杞姩-->
