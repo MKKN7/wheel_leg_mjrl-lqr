@@ -9,13 +9,17 @@ residual action, producing a checkpoint that is directly compatible with
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor, nn
 
-from env import WheelLegResidualEnv
+import env as environment_definition
+from env import DEFAULT_EPISODE_SECONDS, DomainRandomizationConfig, WheelLegResidualEnv
+import lqr_deploy as lqr
 
 
 class BehaviorCloningPolicy(nn.Module):
@@ -44,6 +48,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--max-speed",
+        type=float,
+        default=None,
+        help=(
+            "Optional forward speed limit in m/s; valid range is "
+            f"{lqr.MIN_FORWARD_SPEED_LIMIT_MPS:.1f}..{lqr.MAX_FORWARD_SPEED_MPS:.1f}."
+        ),
+    )
+    parser.add_argument(
+        "--yaw-range-deg",
+        type=float,
+        default=45.0,
+        help="Sample turn commands uniformly within +/- this yaw delta in degrees.",
+    )
+    parser.add_argument(
+        "--jump-probability",
+        type=float,
+        default=0.5,
+        help="Fraction of episodes that execute the LQR jump sequence.",
+    )
+    parser.add_argument(
+        "--jump-at",
+        type=float,
+        default=0.80,
+        help="Simulation time in seconds at which a scheduled jump begins.",
+    )
+    parser.add_argument(
+        "--domain-randomization",
+        dest="domain_randomization",
+        action="store_true",
+        default=True,
+        help="Randomize physical dynamics, sensors and control delay at every episode reset (default).",
+    )
+    parser.add_argument(
+        "--no-domain-randomization",
+        dest="domain_randomization",
+        action="store_false",
+        help="Disable dynamics/random-sensor randomization for a nominal-model run.",
+    )
+    parser.add_argument(
         "--target",
         choices=("residual",),
         default="residual",
@@ -51,7 +95,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, default=Path("artifacts") / "bc_residual.pt")
     parser.add_argument("--smoke", action="store_true", help="Collect a small dataset and run one optimization epoch.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_speed is not None:
+        try:
+            args.max_speed = lqr.validate_forward_speed_limit(args.max_speed)
+        except ValueError as error:
+            parser.error(str(error))
+    if not 0.0 <= args.yaw_range_deg <= 180.0:
+        parser.error("--yaw-range-deg must be within 0..180")
+    if not 0.0 <= args.jump_probability <= 1.0:
+        parser.error("--jump-probability must be within 0..1")
+    if not 0.0 <= args.jump_at < DEFAULT_EPISODE_SECONDS:
+        parser.error(f"--jump-at must be within 0..{DEFAULT_EPISODE_SECONDS:g} seconds")
+    return args
 
 
 def collect_demonstrations(
@@ -74,7 +130,7 @@ def collect_demonstrations(
         actions.append(environment.expert_action())
         observation, _, terminated, truncated, _ = environment.step(zero_residual)
         if terminated or truncated:
-            speed = float(rng.uniform(-0.65 * environment.max_speed, 0.65 * environment.max_speed))
+            speed = environment.sample_command_speed(rng)
             observation, _ = environment.reset(options={"command_speed": speed})
     return np.asarray(observations, dtype=np.float32), np.asarray(actions, dtype=np.float32)
 
@@ -118,15 +174,17 @@ def save_policy(
     observation_size: int,
     action_size: int,
     target_kind: str,
+    task_config: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "format_version": 1,
+            "format_version": 3,
             "algorithm": "behavior_cloning",
             "target_kind": target_kind,
             "observation_size": observation_size,
             "action_size": action_size,
+            "task_config": task_config,
             "actor_state_dict": policy.actor.state_dict(),
         },
         path,
@@ -142,7 +200,42 @@ def main() -> None:
         args.output = Path("artifacts") / f"bc_{args.target}_smoke.pt"
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    environment = WheelLegResidualEnv()
+    task_config = {
+        "max_speed_mps": float(
+            args.max_speed if args.max_speed is not None else lqr.DEFAULT_FORWARD_SPEED_LIMIT_MPS
+        ),
+        "yaw_range_deg": float(args.yaw_range_deg),
+        "jump_probability": float(args.jump_probability),
+        "jump_at_s": float(args.jump_at),
+        "environment_config": {
+            "episode_seconds": float(DEFAULT_EPISODE_SECONDS),
+            "control_decimation": int(environment_definition.DEFAULT_CONTROL_DECIMATION),
+            "mjcf_sha256": hashlib.sha256(lqr.XML_PATH.read_bytes()).hexdigest(),
+            "jump_thrust_length_m": float(lqr.JUMP_THRUST_LENGTH_M),
+            "jump_thrust_rate_mps": float(lqr.JUMP_THRUST_RATE_MPS),
+            "domain_randomization": (
+                DomainRandomizationConfig.training_defaults().as_dict()
+                if args.domain_randomization
+                else DomainRandomizationConfig.disabled().as_dict()
+            ),
+        },
+        "domain_randomization": (
+            DomainRandomizationConfig.training_defaults().as_dict()
+            if args.domain_randomization
+            else DomainRandomizationConfig.disabled().as_dict()
+        ),
+    }
+    environment = WheelLegResidualEnv(
+        max_forward_speed=getattr(args, "max_speed", None),
+        max_command_yaw_delta_rad=np.deg2rad(args.yaw_range_deg),
+        jump_probability=args.jump_probability,
+        jump_at=args.jump_at,
+        domain_randomization=(
+            DomainRandomizationConfig.training_defaults()
+            if args.domain_randomization
+            else DomainRandomizationConfig.disabled()
+        ),
+    )
     try:
         observations, expert_actions = collect_demonstrations(
             environment,
@@ -164,6 +257,7 @@ def main() -> None:
             observations.shape[1],
             expert_actions.shape[1],
             args.target,
+            task_config,
         )
         print(f"saved BC {args.target} policy: {args.output}")
     finally:

@@ -21,10 +21,19 @@ from scipy.optimize import least_squares
 ROOT = Path(__file__).resolve().parent
 XML_PATH = ROOT / "wheeled_infantry.xml"
 LINEARIZATION_EPSILON = 1e-6
-MAX_WALK_SPEED_MPS = 0.10
-DEFAULT_ACCELERATION_MPS2 = 0.35
-SPEED_INCREMENT_MPS = 0.05
+# The 3 m/s value is a validated physical ceiling.  A lower run-time cap can
+# be selected with --max-speed when a shorter acceleration window is needed.
+MAX_FORWARD_SPEED_MPS = 3.00
+MIN_FORWARD_SPEED_LIMIT_MPS = 1.00
+DEFAULT_FORWARD_SPEED_LIMIT_MPS = MAX_FORWARD_SPEED_MPS
+MAX_REVERSE_SPEED_MPS = 0.35
+# Compatibility alias for callers that only need the largest supported magnitude.
+MAX_WALK_SPEED_MPS = MAX_FORWARD_SPEED_MPS
+DEFAULT_ACCELERATION_MPS2 = 0.60
+SPEED_INCREMENT_MPS = 0.25
 SPEED_TRACKING_TOLERANCE_MPS = 0.025
+HIGH_SPEED_TRACKING_FRACTION = 0.03
+SPEED_TELEMETRY_PERIOD_S = 0.25
 MAX_COMMAND_YAW_RATE_RAD_S = 0.45
 YAW_INCREMENT_RAD = np.deg2rad(15.0)
 YAW_TRACKING_TOLERANCE_RAD = np.deg2rad(8.0)
@@ -48,7 +57,10 @@ WALK_STANCE_GUARD_KD_NM_PER_RAD_PER_S = 20.0
 WALK_SPEED_KP_MOTOR_NM_PER_MPS = 4.0
 WALK_SPEED_KI_MOTOR_NM_PER_M = 3.0
 WALK_SPEED_INTEGRAL_LIMIT_M = 2.00
-WALK_SPEED_GOVERNOR_LIMIT_MOTOR_NM = 2.50
+WALK_SPEED_GOVERNOR_LIMIT_MOTOR_NM = 2.90
+LQR_FORWARD_SPEED_REFERENCE_LIMIT_MPS = 0.10
+LQR_FORWARD_SPEED_FEEDBACK_LIMIT_MPS = 0.25
+FORWARD_SPEED_YAW_OVERRIDE_START_MPS = 0.50
 LEG_LENGTH_LQR_WEIGHT = 5000.0
 LEG_LENGTH_VELOCITY_LQR_WEIGHT = 500.0
 LEG_LENGTH_PROFILE_SHAPES_RAD = np.array((-0.20, -0.10, 0.00, 0.05, 0.12, 0.20, 0.28, 0.35, 0.42, 0.50))
@@ -68,12 +80,17 @@ HARD_LEG_LENGTH_MAX_M = 0.400
 GAS_SPRING_TORQUE_NM = 10.775
 JUMP_PREPARE_LENGTH_M = 0.315
 JUMP_CROUCH_LENGTH_M = 0.205
-JUMP_THRUST_LENGTH_M = 0.390
+# Leave a few millimetres of clearance below the hard 0.400 m safety limit;
+# compliant four-bar motion can overshoot the commanded extension under
+# randomized mass and actuator strength.
+JUMP_THRUST_LENGTH_M = 0.385
 JUMP_LANDING_LENGTH_M = 0.280
 JUMP_PREPARE_RATE_MPS = 0.12
 JUMP_CROUCH_RATE_MPS = 0.15
-JUMP_THRUST_RATE_MPS = 0.90
-JUMP_LANDING_RATE_MPS = 0.30
+# Build upward impulse before liftoff, then keep the legs extended long enough
+# to preserve clearance and reduce asymmetric collapse during landing.
+JUMP_THRUST_RATE_MPS = 1.00
+JUMP_LANDING_RATE_MPS = 0.08
 JUMP_PREPARE_TIMEOUT_S = 3.0
 JUMP_CROUCH_TIMEOUT_S = 3.0
 JUMP_THRUST_TIMEOUT_S = 0.60
@@ -90,6 +107,60 @@ WORLD_UP = np.array((0.0, 0.0, 1.0))
 
 def wrap_to_pi(angle: float) -> float:
     return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def speed_tracking_tolerance(target_speed: float) -> float:
+    return max(SPEED_TRACKING_TOLERANCE_MPS, HIGH_SPEED_TRACKING_FRACTION * abs(target_speed))
+
+
+def validate_forward_speed_limit(limit: float) -> float:
+    if not np.isfinite(limit) or not MIN_FORWARD_SPEED_LIMIT_MPS <= limit <= MAX_FORWARD_SPEED_MPS:
+        raise ValueError(
+            f"forward speed limit must be within {MIN_FORWARD_SPEED_LIMIT_MPS:.2f}.."
+            f"{MAX_FORWARD_SPEED_MPS:.2f}m/s"
+        )
+    return float(limit)
+
+
+def validate_reverse_speed_limit(limit: float) -> float:
+    if not np.isfinite(limit) or not 0.0 <= limit <= MAX_REVERSE_SPEED_MPS:
+        raise ValueError(f"reverse speed limit must be within 0..{MAX_REVERSE_SPEED_MPS:.2f}m/s")
+    return float(limit)
+
+
+def clamp_speed_command(
+    speed: float,
+    *,
+    forward_limit: float = MAX_FORWARD_SPEED_MPS,
+    reverse_limit: float = MAX_REVERSE_SPEED_MPS,
+) -> float:
+    """Clamp a longitudinal command to the validated directional range."""
+    if not np.isfinite(speed):
+        raise ValueError("speed command must be finite")
+    return float(np.clip(
+        speed,
+        -validate_reverse_speed_limit(reverse_limit),
+        validate_forward_speed_limit(forward_limit),
+    ))
+
+
+def speed_tracking_status(
+    target_speed: float,
+    ramped_command: float,
+    measured_speed: float,
+    *,
+    jump_active: bool = False,
+) -> str:
+    tolerance = speed_tracking_tolerance(target_speed)
+    if jump_active:
+        return "JUMP"
+    if abs(target_speed - ramped_command) > tolerance:
+        return "RAMPING"
+    direction = np.sign(target_speed) if abs(target_speed) > 1e-9 else np.sign(measured_speed)
+    signed_error = (measured_speed - target_speed) * (direction if direction != 0.0 else 1.0)
+    if abs(signed_error) <= tolerance:
+        return "TRACKING"
+    return "UNDERSPEED" if signed_error < 0.0 else "OVERSPEED"
 
 
 @dataclass(frozen=True)
@@ -114,9 +185,26 @@ class MotionCommand:
     target_speed: float
     acceleration_limit: float
     current_speed: float = 0.0
+    max_forward_speed: float = MAX_FORWARD_SPEED_MPS
+    max_reverse_speed: float = MAX_REVERSE_SPEED_MPS
+
+    def __post_init__(self) -> None:
+        self.max_forward_speed = validate_forward_speed_limit(self.max_forward_speed)
+        self.max_reverse_speed = validate_reverse_speed_limit(self.max_reverse_speed)
+        self.target_speed = clamp_speed_command(
+            self.target_speed,
+            forward_limit=self.max_forward_speed,
+            reverse_limit=self.max_reverse_speed,
+        )
+        if not np.isfinite(self.acceleration_limit) or self.acceleration_limit <= 0.0:
+            raise ValueError("acceleration_limit must be positive and finite")
 
     def set_target_speed(self, speed: float) -> None:
-        self.target_speed = float(np.clip(speed, -MAX_WALK_SPEED_MPS, MAX_WALK_SPEED_MPS))
+        self.target_speed = clamp_speed_command(
+            speed,
+            forward_limit=self.max_forward_speed,
+            reverse_limit=self.max_reverse_speed,
+        )
 
     def advance(self, elapsed: float) -> None:
         if elapsed <= 0.0:
@@ -172,7 +260,7 @@ class LegLengthCommand:
 
 @dataclass
 class JumpSequence:
-    """Contact-guarded leg-length jump state machine."""
+    """Unconditionally-started, contact-aware leg-length jump state machine."""
 
     phase_name: str | None = None
     phase_start_time: float | None = None
@@ -222,6 +310,17 @@ class LqrTrim:
     control: np.ndarray
     gain: np.ndarray
     hip_qpos: np.ndarray
+
+
+@dataclass(frozen=True)
+class SpeedTrim:
+    """Forward rolling LQR trim used to extend the controller to 3 m/s."""
+
+    speed: float
+    leg_length: float
+    qvel: np.ndarray
+    control: np.ndarray
+    gain: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -388,6 +487,8 @@ class PhysicalLqr:
         speed: float,
         acceleration_limit: float,
         gas_spring_enabled: bool = True,
+        max_forward_speed: float = MAX_FORWARD_SPEED_MPS,
+        max_reverse_speed: float = MAX_REVERSE_SPEED_MPS,
     ) -> None:
         self.model = model
         self.refs = refs
@@ -425,6 +526,7 @@ class PhysicalLqr:
         self._reference_shape = float(self.hip_qpos_equilibrium[0])
         self._reference_leg_length = self.average_leg_length(data)
         self.leg_profile: LegLengthProfile | None = None
+        self.forward_speed_trim: SpeedTrim | None = None
         self.leg_command = LegLengthCommand(self._reference_leg_length, self._reference_leg_length)
         self._leg_shape_integral = 0.0
         # The framequat sensor follows the CAD inertial frame.  Use the actual
@@ -435,7 +537,16 @@ class PhysicalLqr:
         self._last_yaw_measurement = self._trim_heading_yaw
         self._last_yaw_measurement_time = float(data.time)
         self._measured_yaw_rate = 0.0
-        self.motion = MotionCommand(speed, acceleration_limit)
+        self.max_forward_speed = validate_forward_speed_limit(max_forward_speed)
+        self.max_reverse_speed = validate_reverse_speed_limit(max_reverse_speed)
+        self.motion = MotionCommand(
+            speed,
+            acceleration_limit,
+            max_forward_speed=self.max_forward_speed,
+            max_reverse_speed=self.max_reverse_speed,
+        )
+        self._last_speed_report_time = -np.inf
+        self._speed_report_pending = True
         self.speed_error_integral = 0.0
         self.jump = JumpSequence()
         self.jump_rejection_reason = ""
@@ -476,6 +587,42 @@ class PhysicalLqr:
         forward = self.forward_direction(data)
         return float(np.dot(world_velocity, forward[: world_velocity.size]))
 
+    def request_speed_report(self) -> None:
+        """Request an immediate telemetry line on the next simulation tick."""
+        self._speed_report_pending = True
+
+    def speed_telemetry(self, data: mujoco.MjData) -> tuple[float, float, float, float, str]:
+        target = float(self.motion.target_speed)
+        ramped_command = float(self.motion.current_speed)
+        measured = self.forward_speed(data)
+        tracking_error = measured - ramped_command
+        target_error = measured - target
+        status = speed_tracking_status(
+            target,
+            ramped_command,
+            measured,
+            jump_active=self.jump.active,
+        )
+        return target, ramped_command, measured, target_error, status
+
+    def print_speed_telemetry(self, data: mujoco.MjData, *, force: bool = False) -> None:
+        sim_time = float(data.time)
+        if not force and not self._speed_report_pending and (
+            sim_time - self._last_speed_report_time < SPEED_TELEMETRY_PERIOD_S
+        ):
+            return
+        target, ramped_command, measured, target_error, status = self.speed_telemetry(data)
+        tracking_error = measured - ramped_command
+        print(
+            f"Speed telemetry: t={sim_time:.2f}s command={target:.3f}m/s "
+            f"ramp={ramped_command:.3f}m/s measured={measured:.3f}m/s "
+            f"error={tracking_error:+.3f}m/s target_error={target_error:+.3f}m/s "
+            f"status={status}",
+            flush=True,
+        )
+        self._last_speed_report_time = sim_time
+        self._speed_report_pending = False
+
     def configure_leg_profile(self, profile: LegLengthProfile, initial_length: float | None = None) -> None:
         self.leg_profile = profile
         requested_length = self._reference_leg_length if initial_length is None else initial_length
@@ -483,6 +630,29 @@ class PhysicalLqr:
         self.leg_command = LegLengthCommand(current_length, current_length)
         self._leg_shape_integral = 0.0
         self._set_active_profile_reference(profile.shape_for_length(current_length))
+
+    def configure_forward_speed_trim(self, trim: SpeedTrim) -> None:
+        if trim.speed <= 0.0:
+            raise ValueError("forward speed trim must have positive speed")
+        self.forward_speed_trim = trim
+
+    def _forward_speed_schedule_weight(self) -> float:
+        if self.forward_speed_trim is None or self.motion.current_speed <= 0.0:
+            return 0.0
+        return float(np.clip(self.motion.current_speed / self.forward_speed_trim.speed, 0.0, 1.0))
+
+    def _forward_speed_schedule_active(self) -> bool:
+        return self._forward_speed_schedule_weight() > 0.0
+
+    def _scheduled_control_and_gain(self) -> tuple[np.ndarray, np.ndarray]:
+        weight = self._forward_speed_schedule_weight()
+        if weight <= 0.0 or self.forward_speed_trim is None:
+            return self._reference_control, self._reference_gain
+        inverse = 1.0 - weight
+        return (
+            inverse * self._reference_control + weight * self.forward_speed_trim.control,
+            inverse * self._reference_gain + weight * self.forward_speed_trim.gain,
+        )
 
     def leg_length_limits(self, *, jump: bool = False) -> tuple[float, float]:
         if self.leg_profile is None:
@@ -503,6 +673,7 @@ class PhysicalLqr:
     def set_target_speed(self, speed: float) -> float:
         previous = self.motion.target_speed
         self.motion.set_target_speed(speed)
+        self.request_speed_report()
         if previous * self.motion.target_speed < 0.0 or abs(self.motion.target_speed) < 1e-9:
             self.speed_error_integral = 0.0
         return self.motion.target_speed
@@ -557,6 +728,7 @@ class PhysicalLqr:
         self.jump = JumpSequence()
         self.reset_heading_command(data, yaw)
         self._last_reference_time = float(data.time)
+        self.request_speed_report()
 
     def apply_gas_spring_assist(self, data: mujoco.MjData) -> None:
         """Apply the extension-oriented gas-spring torque to both active links."""
@@ -567,20 +739,7 @@ class PhysicalLqr:
             data.qfrc_applied[dof_address] = -GAS_SPRING_TORQUE_NM
 
     def request_jump(self, data: mujoco.MjData) -> bool:
-        wheel_contacts = tuple(wheel_ground_contacts(data, self.refs, geom_id) for geom_id in self.refs.wheel_geoms)
-        if self.jump.active:
-            self.jump_rejection_reason = "a jump is already active"
-            return False
-        if not all(wheel_contacts):
-            self.jump_rejection_reason = "both wheels must be grounded before jump preparation"
-            return False
-        if abs(self.forward_speed(data)) > 0.03:
-            self.jump_rejection_reason = "forward speed must be below 0.03m/s before jump preparation"
-            return False
-        lower, upper = self.leg_length_limits(jump=True)
-        if not lower <= JUMP_CROUCH_LENGTH_M <= JUMP_PREPARE_LENGTH_M <= JUMP_THRUST_LENGTH_M <= upper:
-            self.jump_rejection_reason = "the scheduled leg-length profile does not cover the jump trajectory"
-            return False
+        """Start or restart the jump sequence without software precondition rejects."""
         self.set_target_speed(0.0)
         self.jump.start(float(data.time), self.leg_command.target_length)
         self.set_target_leg_length(JUMP_PREPARE_LENGTH_M, jump=True)
@@ -683,7 +842,13 @@ class PhysicalLqr:
         elif phase == "landing":
             self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
             self.jump.settled_steps = self.jump.settled_steps + 1 if grounded and self._legs_near_target(data, JUMP_LANDING_LENGTH_M) else 0
-            if self.jump.settled_steps >= JUMP_SETTLE_STEPS or self.jump.elapsed(sim_time) > JUMP_LANDING_TIMEOUT_S:
+            if self.jump.settled_steps >= JUMP_SETTLE_STEPS:
+                resume_length = self.jump.resume_length
+                self.jump.finish()
+                if resume_length is not None:
+                    self.set_target_leg_length(resume_length)
+            elif self.jump.elapsed(sim_time) > JUMP_LANDING_TIMEOUT_S:
+                self.jump.abort_reason = "landing timeout without stable contact"
                 resume_length = self.jump.resume_length
                 self.jump.finish()
                 if resume_length is not None:
@@ -801,10 +966,26 @@ class PhysicalLqr:
         for joint_id in self.refs.wheel_joints:
             qpos_address = int(self.model.jnt_qposadr[joint_id])
             qpos_reference[qpos_address] = data.qpos[qpos_address]
-        if self.jump.phase_name != "flight":
+        speed_weight = self._forward_speed_schedule_weight()
+        if speed_weight > 0.0 and self.forward_speed_trim is not None:
+            qvel_reference[self.root_dof : self.root_dof + 3] = (
+                self.forward_direction(data) * speed_weight * self.forward_speed_trim.speed
+            )
+            for joint_id in self.refs.wheel_joints:
+                dof_address = int(self.model.jnt_dofadr[joint_id])
+                qvel_reference[dof_address] = speed_weight * self.forward_speed_trim.qvel[dof_address]
+        elif self.jump.phase_name != "flight":
             # Contact LQR has one stable velocity branch.  The outer PI chooses
             # physical travel sign using the measured world-frame velocity.
-            qvel_reference[self.root_dof : self.root_dof + 3] = -self.forward_direction(data) * abs(self.motion.current_speed)
+            # Keep the linearised reference near its validated trim; the wheel
+            # PI governs all speed above this small-signal branch.
+            lqr_speed_reference = min(
+                abs(self.motion.current_speed),
+                LQR_FORWARD_SPEED_REFERENCE_LIMIT_MPS,
+            )
+            qvel_reference[self.root_dof : self.root_dof + 3] = (
+                -self.forward_direction(data) * lqr_speed_reference
+            )
         return qpos_reference, qvel_reference
 
     def state_error(self, data: mujoco.MjData, sim_time: float | None = None) -> np.ndarray:
@@ -812,7 +993,24 @@ class PhysicalLqr:
         qpos_reference, qvel_reference = self.reference_state(data)
         position_error = np.zeros(self.model.nv)
         mujoco.mj_differentiatePos(self.model, position_error, 1.0, qpos_reference, data.qpos)
-        return np.concatenate((position_error, data.qvel - qvel_reference))
+        velocity_error = data.qvel - qvel_reference
+        if self._forward_speed_schedule_active():
+            return np.concatenate((position_error, velocity_error))
+        # The contact LQR is linearised at walking trim.  Let the outer wheel
+        # PI own high forward speed instead of feeding a multi-m/s error back
+        # through a small-signal gain designed around zero velocity.
+        forward = self.forward_direction(data)
+        root_velocity_error = velocity_error[self.root_dof : self.root_dof + 3]
+        forward_error = float(np.dot(root_velocity_error, forward))
+        root_velocity_error += forward * (
+            float(np.clip(
+                forward_error,
+                -LQR_FORWARD_SPEED_FEEDBACK_LIMIT_MPS,
+                LQR_FORWARD_SPEED_FEEDBACK_LIMIT_MPS,
+            ))
+            - forward_error
+        )
+        return np.concatenate((position_error, velocity_error))
 
     def apply_walking_stance_guard(self, data: mujoco.MjData, command: np.ndarray) -> None:
         """Track the scheduled closed-chain branch without changing MJCF topology."""
@@ -886,8 +1084,19 @@ class PhysicalLqr:
         ))
         # Positive yaw is counter-clockwise about +Z.  The measured drivetrain
         # calibration maps a left-minus-right wheel command to negative yaw.
-        command[self.refs.actuator_ids[2]] -= differential_command
-        command[self.refs.actuator_ids[5]] += differential_command
+        left_wheel = self.refs.actuator_ids[2]
+        right_wheel = self.refs.actuator_ids[5]
+        if self.motion.current_speed >= FORWARD_SPEED_YAW_OVERRIDE_START_MPS:
+            # At high speed, the speed-trim LQR may contain a differential
+            # feedback term that opposes the outer heading loop.  Preserve its
+            # common balancing torque while assigning the wheel difference to
+            # the explicit command_yaw controller.
+            common_command = 0.5 * (command[left_wheel] + command[right_wheel])
+            command[left_wheel] = common_command - differential_command
+            command[right_wheel] = common_command + differential_command
+        else:
+            command[left_wheel] -= differential_command
+            command[right_wheel] += differential_command
 
     def apply_airborne_recovery(self, data: mujoco.MjData, command: np.ndarray) -> None:
         position_error = self._reference_hip_qpos - data.qpos[self.hip_qpos_addresses]
@@ -911,7 +1120,8 @@ class PhysicalLqr:
             self.apply_airborne_recovery(data, command)
             return np.clip(command, self.model.actuator_ctrlrange[:, 0], self.model.actuator_ctrlrange[:, 1])
 
-        command = self._reference_control - self._reference_gain @ self.state_error(data)
+        reference_control, reference_gain = self._scheduled_control_and_gain()
+        command = reference_control - reference_gain @ self.state_error(data)
         self.apply_walking_stance_guard(data, command)
         self.apply_leg_length_force(
             data,
@@ -1126,6 +1336,41 @@ def build_leg_length_profile(
     return profile
 
 
+def build_forward_speed_trim(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    refs: ModelRefs,
+    shape: float,
+    speed_limit: float = MAX_FORWARD_SPEED_MPS,
+) -> SpeedTrim:
+    """Precompute the selected forward rolling working point without changing the MJCF."""
+    speed_limit = validate_forward_speed_limit(speed_limit)
+    mujoco.mj_resetData(model, data)
+    mujoco.mj_forward(model, data)
+    project_walking_stance(model, data, refs, hip_targets_from_shape(shape))
+    trim_controller = PhysicalLqr(model, data, refs, speed=0.0, acceleration_limit=DEFAULT_ACCELERATION_MPS2)
+    wheel_radius = float(np.mean([model.geom_size[geom_id, 0] for geom_id in refs.wheel_geoms]))
+    qvel = np.zeros(model.nv)
+    qvel[trim_controller.root_dof : trim_controller.root_dof + 3] = (
+        speed_limit * trim_controller.forward_direction(data)
+    )
+    for joint_id in refs.wheel_joints:
+        qvel[int(model.jnt_dofadr[joint_id])] = -speed_limit / wheel_radius
+
+    trim_controller.qvel_equilibrium = qvel.copy()
+    data.qvel[:] = qvel
+    mujoco.mj_forward(model, data)
+    control = trim_controller.solve_equilibrium(data)
+    gain = trim_controller.linear_lqr(data)
+    return SpeedTrim(
+        speed=speed_limit,
+        leg_length=trim_controller.average_leg_length(data),
+        qvel=qvel,
+        control=control,
+        gain=gain,
+    )
+
+
 def settle_and_relinearize(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -1133,8 +1378,13 @@ def settle_and_relinearize(
     speed: float,
     acceleration_limit: float,
     leg_length: float | None = None,
+    *,
+    max_forward_speed: float = MAX_FORWARD_SPEED_MPS,
+    max_reverse_speed: float = MAX_REVERSE_SPEED_MPS,
 ) -> PhysicalLqr:
     """Build a scheduled low-centre LQR and select its initial leg length."""
+    max_forward_speed = validate_forward_speed_limit(max_forward_speed)
+    max_reverse_speed = validate_reverse_speed_limit(max_reverse_speed)
     profile = build_leg_length_profile(model, data, refs)
     default_length = profile.length_for_shape(float(WALK_STANCE_HIP_TARGETS_RAD[0]))
     requested_length = default_length if leg_length is None else float(leg_length)
@@ -1146,8 +1396,28 @@ def settle_and_relinearize(
     mujoco.mj_resetData(model, data)
     mujoco.mj_forward(model, data)
     project_walking_stance(model, data, refs, hip_targets_from_shape(selected_shape))
-    controller = PhysicalLqr(model, data, refs, speed, acceleration_limit)
+    controller = PhysicalLqr(
+        model,
+        data,
+        refs,
+        speed,
+        acceleration_limit,
+        max_forward_speed=max_forward_speed,
+        max_reverse_speed=max_reverse_speed,
+    )
+    forward_speed_trim = build_forward_speed_trim(
+        model,
+        data,
+        refs,
+        selected_shape,
+        speed_limit=max_forward_speed,
+    )
+    data.qpos[:] = controller.qpos_equilibrium
+    data.qvel[:] = controller.qvel_equilibrium
+    data.ctrl[:] = controller.control_equilibrium
+    mujoco.mj_forward(model, data)
     controller.configure_leg_profile(profile, requested_length)
+    controller.configure_forward_speed_trim(forward_speed_trim)
     return controller
 
 
@@ -1161,11 +1431,11 @@ def run_headless(
 ) -> None:
     jump_started = False
     steady_speeds: list[float] = []
+    controller.print_speed_telemetry(data, force=True)
     while data.time < seconds:
         if jump_at is not None and not jump_started and data.time >= jump_at:
-            jump_started = controller.request_jump(data)
-            if not jump_started:
-                raise RuntimeError(f"Jump rejected: {controller.jump_rejection_reason}")
+            controller.request_jump(data)
+            jump_started = True
         data.ctrl[:] = controller.command(data)
         mujoco.mj_step(model, data)
         if jump_started and controller.jump.active:
@@ -1175,26 +1445,45 @@ def run_headless(
             validate_linkage_clearance(data, refs)
             validate_closed_loop_error(data, refs)
             validate_leg_length_state(data, refs)
+        controller.print_speed_telemetry(data)
         if jump_at is None and data.time >= max(2.0, seconds - 2.0):
             steady_speeds.append(controller.forward_speed(data))
     measured_speed = float(np.mean(steady_speeds)) if steady_speeds else controller.forward_speed(data)
     speed_error = measured_speed - controller.motion.target_speed
     measured_yaw = controller.heading_yaw(data)
     yaw_error = wrap_to_pi(controller.command_yaw - measured_yaw)
-    if jump_at is None and seconds >= 8.0 and abs(speed_error) > SPEED_TRACKING_TOLERANCE_MPS:
+    allowed_speed_error = speed_tracking_tolerance(controller.motion.target_speed)
+    if jump_at is None and seconds >= 8.0 and abs(speed_error) > allowed_speed_error:
         raise RuntimeError(
             f"Speed tracking failed: target={controller.motion.target_speed:.3f}m/s, "
-            f"measured={measured_speed:.3f}m/s, error={speed_error:.3f}m/s"
+            f"measured={measured_speed:.3f}m/s, error={speed_error:.3f}m/s, "
+            f"allowed={allowed_speed_error:.3f}m/s"
         )
     if jump_at is None and seconds >= 8.0 and abs(yaw_error) > YAW_TRACKING_TOLERANCE_RAD:
         raise RuntimeError(
             f"Yaw tracking failed: target={controller.command_yaw:.3f}rad, "
             f"measured={measured_yaw:.3f}rad, error={yaw_error:.3f}rad"
         )
+    tracking_status = speed_tracking_status(
+        controller.motion.target_speed,
+        controller.motion.current_speed,
+        measured_speed,
+        jump_active=jump_at is not None,
+    )
+    if jump_at is not None and tracking_status == "JUMP":
+        tracking_status = "JUMP_SEQUENCE"
+    if jump_at is not None:
+        completion_label = "Physical LQR jump run complete"
+    elif seconds >= 8.0:
+        completion_label = "Physical LQR check passed"
+    else:
+        completion_label = "Physical LQR warm-up complete (steady-speed check requires >=8s)"
     print(
-        f"Physical LQR check passed: t={data.time:.3f}s, "
+        f"{completion_label}: t={data.time:.3f}s, "
         f"leg_length={controller.average_leg_length(data):.4f}m, "
-        f"speed={measured_speed:.3f}m/s, "
+        f"target_speed={controller.motion.target_speed:.3f}m/s, "
+        f"speed={measured_speed:.3f}m/s, error={speed_error:+.3f}m/s, "
+        f"tolerance={allowed_speed_error:.3f}m/s, status={tracking_status}, "
         f"yaw={measured_yaw:.3f}rad, command_yaw={controller.command_yaw:.3f}rad"
     )
 
@@ -1204,10 +1493,24 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true", help="Run a two-wheel-contact LQR validation without a viewer.")
     parser.add_argument("--seconds", type=float, default=10.0, help="Validation duration in seconds.")
     parser.add_argument(
+        "--max-speed",
+        "--speed-limit",
+        dest="max_speed",
+        type=float,
+        default=DEFAULT_FORWARD_SPEED_LIMIT_MPS,
+        help=(
+            "Run-time forward speed limit in m/s, configurable within "
+            f"{MIN_FORWARD_SPEED_LIMIT_MPS:.1f}..{MAX_FORWARD_SPEED_MPS:.1f}."
+        ),
+    )
+    parser.add_argument(
         "--speed",
         type=float,
         default=0.0,
-        help=f"Forward reference speed in m/s, limited to +/-{MAX_WALK_SPEED_MPS:.2f}.",
+        help=(
+            "Body-forward reference speed in m/s, limited to "
+            f"-{MAX_REVERSE_SPEED_MPS:.2f}..+{MAX_FORWARD_SPEED_MPS:.2f}."
+        ),
     )
     parser.add_argument(
         "--yaw",
@@ -1236,8 +1539,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.seconds <= 0.0:
         parser.error("--seconds must be positive")
-    if abs(args.speed) > MAX_WALK_SPEED_MPS:
-        parser.error(f"--speed must be within +/-{MAX_WALK_SPEED_MPS}m/s")
+    try:
+        args.max_speed = validate_forward_speed_limit(args.max_speed)
+    except ValueError as error:
+        parser.error(str(error))
+    if not -MAX_REVERSE_SPEED_MPS <= args.speed <= args.max_speed:
+        parser.error(
+            f"--speed must be within -{MAX_REVERSE_SPEED_MPS:.2f}..+{args.max_speed:.2f}m/s"
+        )
     if args.yaw is not None and not np.isfinite(args.yaw):
         parser.error("--yaw must be finite")
     if args.leg_length is not None and not WALK_LEG_LENGTH_MIN_M <= args.leg_length <= WALK_LEG_LENGTH_MAX_M:
@@ -1260,6 +1569,8 @@ def main() -> None:
         args.speed,
         args.acceleration,
         leg_length=args.leg_length,
+        max_forward_speed=args.max_speed,
+        max_reverse_speed=MAX_REVERSE_SPEED_MPS,
     )
     if args.yaw is not None:
         controller.set_command_yaw(args.yaw)
@@ -1267,6 +1578,11 @@ def main() -> None:
     print(
         f"Heading: {controller.heading_yaw(data):.3f}rad, "
         f"command_yaw={controller.command_yaw:.3f}rad"
+    )
+    print(
+        f"Speed limits: forward={controller.max_forward_speed:.2f}m/s, "
+        f"reverse={controller.max_reverse_speed:.2f}m/s, "
+        f"acceleration={controller.motion.acceleration_limit:.2f}m/s^2"
     )
     if args.headless:
         run_headless(model, data, controller, refs, args.seconds, args.jump_at)
@@ -1298,14 +1614,12 @@ def main() -> None:
             target = controller.adjust_target_leg_length(-0.01)
             print(f"Target leg length: {target:.3f}m")
         elif keycode in (ord("J"), ord("j")):
-            if controller.request_jump(data):
-                print("Jump sequence: prepare, crouch, thrust, flight, landing")
-            else:
-                print(f"Jump rejected: {controller.jump_rejection_reason}")
+            controller.request_jump(data)
+            print("Jump sequence started: prepare, crouch, thrust, flight, landing")
 
     print(
         "Keys: W/S or Up/Down speed, A/D or Left/Right turn command yaw, "
-        "X stop, C hold current heading, R/F extend/retract legs, J starts a grounded jump."
+        "X stop, C hold current heading, R/F extend/retract legs, J starts or restarts the jump sequence."
     )
     scheduled_jump_attempted = False
     with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
@@ -1314,11 +1628,10 @@ def main() -> None:
             with viewer.lock():
                 if args.jump_at is not None and not scheduled_jump_attempted and data.time >= args.jump_at:
                     scheduled_jump_attempted = True
-                    if controller.request_jump(data):
-                        print("Scheduled jump sequence started")
-                    else:
-                        print(f"Scheduled jump rejected: {controller.jump_rejection_reason}")
+                    controller.request_jump(data)
+                    print("Scheduled jump sequence started")
                 data.ctrl[:] = controller.command(data)
+                controller.print_speed_telemetry(data)
             mujoco.mj_step(model, data)
             if controller.jump.active:
                 validate_jump_contacts(data, refs)

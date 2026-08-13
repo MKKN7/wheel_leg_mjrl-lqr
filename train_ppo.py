@@ -9,7 +9,11 @@ environment.
 from __future__ import annotations
 
 import argparse
+import copy
+import csv
 from dataclasses import dataclass
+import hashlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +22,13 @@ import torch
 from torch import Tensor, nn
 from torch.distributions import Normal
 
-from env import WheelLegResidualEnv
+import env as environment_definition
+from env import DEFAULT_EPISODE_SECONDS, DomainRandomizationConfig, WheelLegResidualEnv
+import lqr_deploy as lqr
+
+
+CHECKPOINT_FORMAT_VERSION = 3
+REWARD_SCHEMA = "ground_tracking_jump_peak_landing_v2"
 
 
 @dataclass
@@ -32,6 +42,14 @@ class Rollout:
     continuation_masks: Tensor
     advantages: Tensor
     returns: Tensor
+
+
+@dataclass(frozen=True)
+class ResumeState:
+    """Persistent PPO state restored at a completed-update boundary."""
+
+    timesteps: int
+    update_index: int
 
 
 class ActorCritic(nn.Module):
@@ -98,15 +116,89 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gradient-norm", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", default="cpu", help="PyTorch device, such as cpu or cuda.")
+    parser.add_argument(
+        "--max-speed",
+        type=float,
+        default=None,
+        help=(
+            "Optional forward speed limit in m/s; valid range is "
+            f"{lqr.MIN_FORWARD_SPEED_LIMIT_MPS:.1f}..{lqr.MAX_FORWARD_SPEED_MPS:.1f}."
+        ),
+    )
+    parser.add_argument(
+        "--yaw-range-deg",
+        type=float,
+        default=45.0,
+        help="Sample turn commands uniformly within +/- this yaw delta in degrees.",
+    )
+    parser.add_argument(
+        "--jump-probability",
+        type=float,
+        default=0.5,
+        help="Fraction of episodes that execute the LQR jump sequence.",
+    )
+    parser.add_argument(
+        "--jump-at",
+        type=float,
+        default=0.80,
+        help="Simulation time in seconds at which a scheduled jump begins.",
+    )
+    parser.add_argument(
+        "--domain-randomization",
+        dest="domain_randomization",
+        action="store_true",
+        default=True,
+        help="Randomize physical dynamics, sensors and control delay at every episode reset (default).",
+    )
+    parser.add_argument(
+        "--no-domain-randomization",
+        dest="domain_randomization",
+        action="store_false",
+        help="Disable dynamics/random-sensor randomization for a nominal-model run.",
+    )
     parser.add_argument("--output", type=Path, default=Path("artifacts") / "ppo_residual.pt")
-    parser.add_argument("--checkpoint-interval", type=int, default=25)
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=25,
+        help="Save a step-numbered checkpoint snapshot every N completed PPO updates.",
+    )
+    parser.add_argument(
+        "--metrics-path",
+        type=Path,
+        help="CSV update metrics path; defaults to <output>.metrics.csv.",
+    )
     parser.add_argument(
         "--bc-checkpoint",
         type=Path,
         help="Optional BC checkpoint trained with --target residual for a safe residual warm start.",
     )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        help=(
+            "Resume PPO model and optimizer state. --total-timesteps is the final cumulative target, "
+            "not additional steps."
+        ),
+    )
     parser.add_argument("--smoke", action="store_true", help="Run one short PPO update for dependency verification.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_speed is not None:
+        try:
+            args.max_speed = lqr.validate_forward_speed_limit(args.max_speed)
+        except ValueError as error:
+            parser.error(str(error))
+    if not 0.0 <= args.yaw_range_deg <= 180.0:
+        parser.error("--yaw-range-deg must be within 0..180")
+    if not 0.0 <= args.jump_probability <= 1.0:
+        parser.error("--jump-probability must be within 0..1")
+    if not 0.0 <= args.jump_at < DEFAULT_EPISODE_SECONDS:
+        parser.error(f"--jump-at must be within 0..{DEFAULT_EPISODE_SECONDS:g} seconds")
+    if args.checkpoint_interval < 1:
+        parser.error("--checkpoint-interval must be positive")
+    if args.bc_checkpoint is not None and args.resume_checkpoint is not None:
+        parser.error("--bc-checkpoint and --resume-checkpoint cannot be used together")
+    return args
 
 
 def tensor_from_observation(observation: np.ndarray, device: torch.device) -> Tensor:
@@ -237,37 +329,348 @@ def update_policy(
     }
 
 
-def save_checkpoint(
-    path: Path,
+def default_metrics_path(output: Path) -> Path:
+    return output.with_name(f"{output.stem}_metrics.csv")
+
+
+def task_config_for_args(args: argparse.Namespace) -> dict[str, Any]:
+    domain_randomization = (
+        DomainRandomizationConfig.training_defaults()
+        if args.domain_randomization
+        else DomainRandomizationConfig.disabled()
+    )
+    return {
+        "max_speed_mps": float(
+            args.max_speed if args.max_speed is not None else lqr.DEFAULT_FORWARD_SPEED_LIMIT_MPS
+        ),
+        "yaw_range_deg": float(args.yaw_range_deg),
+        "jump_probability": float(args.jump_probability),
+        "jump_at_s": float(args.jump_at),
+        "domain_randomization": domain_randomization.as_dict(),
+        "reward_schema": REWARD_SCHEMA,
+        "reward_config": {
+            "jump_peak_body_rise_scale_m": float(environment_definition.JUMP_PEAK_BODY_RISE_SCALE_M),
+            "jump_peak_body_rise_weight": float(environment_definition.JUMP_HEIGHT_REWARD_WEIGHT),
+            "jump_success_reward": float(environment_definition.JUMP_SUCCESS_REWARD),
+            "jump_abort_penalty": float(environment_definition.JUMP_ABORT_PENALTY),
+            "jump_landing_fall_penalty": float(environment_definition.JUMP_LANDING_FALL_PENALTY),
+            "jump_landing_guard_seconds": float(environment_definition.JUMP_LANDING_GUARD_SECONDS),
+            "jump_stable_attitude_limit_rad": float(
+                environment_definition.JUMP_STABLE_ATTITUDE_LIMIT_RAD
+            ),
+            "jump_stable_vertical_speed_mps": float(
+                environment_definition.JUMP_STABLE_VERTICAL_SPEED_MPS
+            ),
+            "jump_stable_angular_speed_rad_s": float(
+                environment_definition.JUMP_STABLE_ANGULAR_SPEED_RAD_S
+            ),
+        },
+        "environment_config": {
+            "episode_seconds": float(DEFAULT_EPISODE_SECONDS),
+            "control_decimation": int(environment_definition.DEFAULT_CONTROL_DECIMATION),
+            "mjcf_sha256": hashlib.sha256(lqr.XML_PATH.read_bytes()).hexdigest(),
+            "jump_thrust_length_m": float(lqr.JUMP_THRUST_LENGTH_M),
+            "jump_thrust_rate_mps": float(lqr.JUMP_THRUST_RATE_MPS),
+            "domain_randomization": domain_randomization.as_dict(),
+        },
+    }
+
+
+def training_config_for_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "rollout_steps": int(args.rollout_steps),
+        "epochs": int(args.epochs),
+        "minibatch_size": int(args.minibatch_size),
+        "gamma": float(args.gamma),
+        "gae_lambda": float(args.gae_lambda),
+        "clip_ratio": float(args.clip_ratio),
+        "value_coefficient": float(args.value_coefficient),
+        "entropy_coefficient": float(args.entropy_coefficient),
+        "max_gradient_norm": float(args.max_gradient_norm),
+    }
+
+
+def capture_rng_state(environment: WheelLegResidualEnv | None = None) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "torch": torch.get_rng_state().clone(),
+        "numpy": copy.deepcopy(np.random.get_state()),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = [value.clone() for value in torch.cuda.get_rng_state_all()]
+    if environment is not None:
+        state["environment_np_random"] = copy.deepcopy(environment.np_random.bit_generator.state)
+    return state
+
+
+def restore_rng_state(state: Any, environment: WheelLegResidualEnv | None = None) -> None:
+    if not isinstance(state, dict):
+        print("Resume checkpoint has no RNG state; continuing from a fresh random sequence.")
+        return
+    torch_state = state.get("torch")
+    numpy_state = state.get("numpy")
+    if isinstance(torch_state, torch.Tensor):
+        torch.set_rng_state(torch_state.cpu())
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+    environment_state = state.get("environment_np_random")
+    if environment is not None and environment_state is not None:
+        environment.np_random.bit_generator.state = copy.deepcopy(environment_state)
+
+
+def build_checkpoint_payload(
     policy: ActorCritic,
     optimizer: torch.optim.Optimizer,
     observation_size: int,
     action_size: int,
     timesteps: int,
-) -> None:
+    update_index: int,
+    task_config: dict[str, Any],
+    training_config: dict[str, Any],
+    environment: WheelLegResidualEnv | None = None,
+) -> dict[str, Any]:
+    return {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "algorithm": "ppo",
+        "action_semantics": "residual",
+        "resume_semantics": "fresh_episode_at_completed_update_boundary",
+        "observation_size": observation_size,
+        "action_size": action_size,
+        "task_config": copy.deepcopy(task_config),
+        "training_config": copy.deepcopy(training_config),
+        "model_state_dict": copy.deepcopy(policy.state_dict()),
+        "actor_state_dict": copy.deepcopy(policy.actor.state_dict()),
+        "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
+        "rng_state": capture_rng_state(environment),
+        "timesteps": int(timesteps),
+        "update_index": int(update_index),
+    }
+
+
+def checkpoint_snapshot_path(path: Path, timesteps: int) -> Path:
+    return path.with_name(f"{path.stem}_step_{timesteps:09d}{path.suffix}")
+
+
+def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "format_version": 1,
-            "algorithm": "ppo",
-            "action_semantics": "residual",
-            "observation_size": observation_size,
-            "action_size": action_size,
-            "model_state_dict": policy.state_dict(),
-            "actor_state_dict": policy.actor.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "timesteps": timesteps,
-        },
-        path,
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def save_checkpoint(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    save_snapshot: bool,
+) -> Path | None:
+    atomic_torch_save(payload, path)
+    if not save_snapshot:
+        return None
+    snapshot_path = checkpoint_snapshot_path(path, int(payload["timesteps"]))
+    atomic_torch_save(payload, snapshot_path)
+    return snapshot_path
+
+
+def optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def validate_resume_task_config(
+    checkpoint_config: Any,
+    current_config: dict[str, Any],
+) -> None:
+    if not isinstance(checkpoint_config, dict):
+        raise ValueError("PPO resume checkpoint is missing task_config")
+    required_keys = ("max_speed_mps", "yaw_range_deg", "jump_probability", "jump_at_s")
+    mismatches: list[str] = []
+    for key in required_keys:
+        saved_value = checkpoint_config.get(key)
+        current_value = current_config[key]
+        if saved_value is None or not np.isclose(float(saved_value), float(current_value)):
+            mismatches.append(f"{key}: checkpoint={saved_value!r}, requested={current_value!r}")
+    if mismatches:
+        raise ValueError("PPO resume task configuration mismatch: " + "; ".join(mismatches))
+    saved_reward_schema = checkpoint_config.get("reward_schema")
+    if saved_reward_schema is None:
+        print(
+            "Resume checkpoint predates reward metadata; using the current reward definition. "
+            "This is not an exact continuation if the reward changed."
+        )
+    elif saved_reward_schema != current_config["reward_schema"]:
+        raise ValueError(
+            "PPO resume reward schema mismatch: "
+            f"checkpoint={saved_reward_schema!r}, current={current_config['reward_schema']!r}"
+        )
+    saved_reward_config = checkpoint_config.get("reward_config")
+    current_reward_config = current_config["reward_config"]
+    if saved_reward_config is None:
+        print("Resume checkpoint has no reward parameters; using the current reward parameters.")
+    elif not isinstance(saved_reward_config, dict):
+        raise ValueError("PPO resume checkpoint has an invalid reward configuration")
+    else:
+        reward_mismatches = [
+            f"{key}: checkpoint={saved_reward_config.get(key)!r}, current={value!r}"
+            for key, value in current_reward_config.items()
+            if key not in saved_reward_config
+            or not np.isclose(float(saved_reward_config[key]), float(value))
+        ]
+        if reward_mismatches:
+            raise ValueError("PPO resume reward configuration mismatch: " + "; ".join(reward_mismatches))
+    saved_environment_config = checkpoint_config.get("environment_config")
+    current_environment_config = current_config["environment_config"]
+    if saved_environment_config is None:
+        current_domain_config = current_environment_config.get("domain_randomization")
+        if isinstance(current_domain_config, dict) and current_domain_config.get("enabled"):
+            raise ValueError(
+                "PPO resume checkpoint has no domain-randomization metadata; "
+                "start a new PPO run or resume with --no-domain-randomization explicitly."
+            )
+        print("Resume checkpoint has no environment fingerprint; using the current MJCF and environment settings.")
+    elif not isinstance(saved_environment_config, dict):
+        raise ValueError("PPO resume checkpoint has an invalid environment configuration")
+    else:
+        environment_mismatches = [
+            f"{key}: checkpoint={saved_environment_config.get(key)!r}, current={value!r}"
+            for key, value in current_environment_config.items()
+            if saved_environment_config.get(key) != value
+        ]
+        if environment_mismatches:
+            raise ValueError(
+                "PPO resume environment configuration mismatch: " + "; ".join(environment_mismatches)
+            )
+
+
+def report_resume_training_config(checkpoint_config: Any, current_config: dict[str, Any]) -> None:
+    if not isinstance(checkpoint_config, dict):
+        print("Resume checkpoint has no training configuration; using the requested PPO update settings.")
+        return
+    changed = [
+        key
+        for key, current_value in current_config.items()
+        if checkpoint_config.get(key) != current_value
+    ]
+    if changed:
+        print(
+            "Resume uses the requested PPO update settings; checkpoint values differ for: "
+            + ", ".join(changed)
+        )
+
+
+def load_ppo_resume(
+    path: Path,
+    policy: ActorCritic,
+    optimizer: torch.optim.Optimizer,
+    observation_size: int,
+    action_size: int,
+    task_config: dict[str, Any],
+    training_config: dict[str, Any],
+    environment: WheelLegResidualEnv,
+    device: torch.device,
+) -> ResumeState:
+    checkpoint: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint.get("algorithm") != "ppo" or checkpoint.get("action_semantics") != "residual":
+        raise ValueError("--resume-checkpoint must contain a residual PPO checkpoint")
+    if checkpoint.get("observation_size") != observation_size or checkpoint.get("action_size") != action_size:
+        raise ValueError("PPO resume checkpoint dimensions do not match the current environment")
+    validate_resume_task_config(checkpoint.get("task_config"), task_config)
+    report_resume_training_config(checkpoint.get("training_config"), training_config)
+    timesteps = checkpoint.get("timesteps")
+    if not isinstance(timesteps, int) or timesteps < 0:
+        raise ValueError("PPO resume checkpoint has an invalid timesteps value")
+    if "model_state_dict" not in checkpoint or "optimizer_state_dict" not in checkpoint:
+        raise ValueError("PPO resume checkpoint is missing model or optimizer state")
+    policy.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    optimizer_to_device(optimizer, device)
+    restore_rng_state(checkpoint.get("rng_state"), environment)
+    update_index = checkpoint.get("update_index")
+    if not isinstance(update_index, int) or update_index < 0:
+        rollout_steps = training_config["rollout_steps"]
+        update_index = (timesteps + rollout_steps - 1) // rollout_steps
+        print(
+            "Resume checkpoint has no update index; inferred "
+            f"update={update_index} from timesteps and the requested rollout length."
+        )
+    print(f"Resumed PPO checkpoint: {path} at timesteps={timesteps}, update={update_index}")
+    return ResumeState(timesteps=timesteps, update_index=update_index)
+
+
+def append_metrics(path: Path, row: dict[str, float | int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = (
+        "update",
+        "timesteps",
+        "completed_episodes",
+        "mean_completed_return",
+        "partial_return",
+        "policy_loss",
+        "value_loss",
+        "entropy",
     )
+    needs_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="ascii") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
-def load_residual_bc_warm_start(path: Path, policy: ActorCritic, observation_size: int, action_size: int) -> None:
+def load_residual_bc_warm_start(
+    path: Path,
+    policy: ActorCritic,
+    observation_size: int,
+    action_size: int,
+    task_config: dict[str, Any] | None = None,
+) -> None:
     checkpoint: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("target_kind") != "residual":
         raise ValueError("BC warm start requires a checkpoint trained with '--target residual'")
     if checkpoint.get("observation_size") != observation_size or checkpoint.get("action_size") != action_size:
         raise ValueError("BC checkpoint dimensions do not match the residual environment")
+    if task_config is not None:
+        saved_task_config = checkpoint.get("task_config")
+        if not isinstance(saved_task_config, dict):
+            raise ValueError("BC checkpoint is missing task metadata; regenerate BC for the current PPO task.")
+        task_mismatches: list[str] = []
+        for key in ("max_speed_mps", "yaw_range_deg", "jump_probability", "jump_at_s"):
+            saved_value = saved_task_config.get(key)
+            current_value = task_config.get(key)
+            if saved_value is None or current_value is None or not np.isclose(
+                float(saved_value), float(current_value)
+            ):
+                task_mismatches.append(
+                    f"{key}: checkpoint={saved_value!r}, current={current_value!r}"
+                )
+        if task_mismatches:
+            raise ValueError("BC checkpoint task configuration does not match PPO: " + "; ".join(task_mismatches))
+        saved_domain = saved_task_config.get("domain_randomization") if isinstance(saved_task_config, dict) else None
+        current_domain = task_config.get("domain_randomization")
+        if saved_domain is None and isinstance(current_domain, dict) and current_domain.get("enabled"):
+            raise ValueError(
+                "BC checkpoint has no domain-randomization metadata; regenerate BC with the current DR settings."
+            )
+        if saved_domain is not None and saved_domain != current_domain:
+            raise ValueError("BC checkpoint domain-randomization configuration does not match PPO")
+        saved_environment = (
+            saved_task_config.get("environment_config") if isinstance(saved_task_config, dict) else None
+        )
+        current_environment = task_config.get("environment_config")
+        if saved_environment is None:
+            raise ValueError(
+                "BC checkpoint has no environment fingerprint; regenerate BC with the current environment."
+            )
+        if saved_environment != current_environment:
+            raise ValueError("BC checkpoint environment configuration does not match PPO")
     policy.actor.load_state_dict(checkpoint["actor_state_dict"])
 
 
@@ -279,18 +682,65 @@ def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
-    environment = WheelLegResidualEnv()
+    task_config = task_config_for_args(args)
+    training_config = training_config_for_args(args)
+    metrics_path = args.metrics_path if args.metrics_path is not None else default_metrics_path(args.output)
+    environment = WheelLegResidualEnv(
+        max_forward_speed=getattr(args, "max_speed", None),
+        max_command_yaw_delta_rad=np.deg2rad(args.yaw_range_deg),
+        jump_probability=args.jump_probability,
+        jump_at=args.jump_at,
+        domain_randomization=(
+            DomainRandomizationConfig.training_defaults()
+            if args.domain_randomization
+            else DomainRandomizationConfig.disabled()
+        ),
+    )
+    policy: ActorCritic | None = None
+    optimizer: torch.optim.Optimizer | None = None
+    observation_size = 0
+    action_size = 0
+    timesteps = 0
+    update_index = 0
+    completed_payload: dict[str, Any] | None = None
     try:
         observation, _ = environment.reset(seed=args.seed)
         observation_size = environment.observation_space.shape[0]
         action_size = environment.action_space.shape[0]
         policy = ActorCritic(observation_size, action_size).to(device)
         optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
-        if args.bc_checkpoint is not None:
-            load_residual_bc_warm_start(args.bc_checkpoint, policy, observation_size, action_size)
+        if args.resume_checkpoint is not None:
+            resume_state = load_ppo_resume(
+                args.resume_checkpoint,
+                policy,
+                optimizer,
+                observation_size,
+                action_size,
+                task_config,
+                training_config,
+                environment,
+                device,
+            )
+            timesteps = resume_state.timesteps
+            update_index = resume_state.update_index
+            if timesteps >= args.total_timesteps:
+                raise ValueError(
+                    "--total-timesteps must be greater than the resumed checkpoint's "
+                    f"timesteps ({timesteps})"
+                )
+            # The checkpoint stores RNG state at a completed-update boundary;
+            # reset once after restoring it so the first rollout starts from
+            # the next reproducible randomized episode.
+            observation, _ = environment.reset()
+        elif args.bc_checkpoint is not None:
+            load_residual_bc_warm_start(
+                args.bc_checkpoint,
+                policy,
+                observation_size,
+                action_size,
+                task_config,
+            )
 
-        timesteps = 0
-        update_index = 0
         episode_return = 0.0
         while timesteps < args.total_timesteps:
             current_rollout_steps = min(args.rollout_steps, args.total_timesteps - timesteps)
@@ -317,19 +767,61 @@ def train(args: argparse.Namespace) -> None:
             )
             timesteps += current_rollout_steps
             update_index += 1
+            completed_payload = build_checkpoint_payload(
+                policy,
+                optimizer,
+                observation_size,
+                action_size,
+                timesteps,
+                update_index,
+                task_config,
+                training_config,
+                environment,
+            )
             if completed_returns:
                 return_text = f"return={float(np.mean(completed_returns)):.3f}"
+                mean_completed_return = float(np.mean(completed_returns))
             else:
                 return_text = f"partial_return={episode_return:.3f}"
+                mean_completed_return = float("nan")
+            append_metrics(
+                metrics_path,
+                {
+                    "update": update_index,
+                    "timesteps": timesteps,
+                    "completed_episodes": len(completed_returns),
+                    "mean_completed_return": mean_completed_return,
+                    "partial_return": float(episode_return),
+                    "policy_loss": metrics["policy_loss"],
+                    "value_loss": metrics["value_loss"],
+                    "entropy": metrics["entropy"],
+                },
+            )
             print(
                 f"update={update_index} timesteps={timesteps} {return_text} "
                 f"policy_loss={metrics['policy_loss']:.4f} value_loss={metrics['value_loss']:.4f} "
                 f"entropy={metrics['entropy']:.4f}"
             )
-            if update_index % args.checkpoint_interval == 0:
-                save_checkpoint(args.output, policy, optimizer, observation_size, action_size, timesteps)
-        save_checkpoint(args.output, policy, optimizer, observation_size, action_size, timesteps)
-        print(f"saved PPO residual policy: {args.output}")
+            snapshot_path = save_checkpoint(
+                args.output,
+                completed_payload,
+                save_snapshot=update_index % args.checkpoint_interval == 0,
+            )
+            if snapshot_path is not None:
+                print(f"saved PPO checkpoint: latest={args.output}, snapshot={snapshot_path}")
+        if completed_payload is None:
+            raise RuntimeError("PPO training completed without a full update")
+        snapshot_path = save_checkpoint(args.output, completed_payload, save_snapshot=True)
+        print(f"saved PPO residual policy: latest={args.output}, snapshot={snapshot_path}")
+    except KeyboardInterrupt:
+        if completed_payload is not None:
+            snapshot_path = save_checkpoint(args.output, completed_payload, save_snapshot=True)
+            print(
+                "Interrupted after a completed PPO update; saved checkpoint: "
+                f"latest={args.output}, snapshot={snapshot_path}"
+            )
+        else:
+            print("Interrupted before the first completed PPO update; no partial checkpoint was written.")
     finally:
         environment.close()
 
