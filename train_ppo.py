@@ -27,14 +27,15 @@ from env import DEFAULT_EPISODE_SECONDS, DomainRandomizationConfig, WheelLegResi
 import lqr_deploy as lqr
 
 
-CHECKPOINT_FORMAT_VERSION = 3
-REWARD_SCHEMA = "ground_tracking_jump_peak_landing_v2"
+CHECKPOINT_FORMAT_VERSION = 5
+REWARD_SCHEMA = "ground_tracking_jump_clearance_landing_v5"
 
 
 @dataclass
 class Rollout:
     observations: Tensor
     actions: Tensor
+    policy_action_masks: Tensor
     log_probabilities: Tensor
     rewards: Tensor
     values: Tensor
@@ -117,6 +118,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", default="cpu", help="PyTorch device, such as cpu or cuda.")
     parser.add_argument(
+        "--xml-path",
+        type=Path,
+        help="MJCF scene to train in; defaults to wheeled_infantry.xml.",
+    )
+    parser.add_argument(
         "--max-speed",
         type=float,
         default=None,
@@ -156,7 +162,12 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable dynamics/random-sensor randomization for a nominal-model run.",
     )
-    parser.add_argument("--output", type=Path, default=Path("artifacts") / "ppo_residual.pt")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("artifacts") / "ppo_jump_clearance.pt",
+        help="Latest PPO checkpoint path; the high-jump default preserves prior residual checkpoints.",
+    )
     parser.add_argument(
         "--checkpoint-interval",
         type=int,
@@ -188,6 +199,10 @@ def parse_args() -> argparse.Namespace:
             args.max_speed = lqr.validate_forward_speed_limit(args.max_speed)
         except ValueError as error:
             parser.error(str(error))
+    if args.xml_path is not None:
+        args.xml_path = args.xml_path.resolve()
+        if not args.xml_path.is_file():
+            parser.error(f"--xml-path does not exist: {args.xml_path}")
     if not 0.0 <= args.yaw_range_deg <= 180.0:
         parser.error("--yaw-range-deg must be within 0..180")
     if not 0.0 <= args.jump_probability <= 1.0:
@@ -214,30 +229,33 @@ def collect_rollout(
     gae_lambda: float,
     device: torch.device,
     episode_return: float,
-) -> tuple[Rollout, np.ndarray, list[float], float]:
+) -> tuple[Rollout, np.ndarray, list[float], list[dict[str, Any]], float]:
     observation_size = environment.observation_space.shape[0]
     action_size = environment.action_space.shape[0]
     observations = torch.empty((rollout_steps, observation_size), dtype=torch.float32, device=device)
     actions = torch.empty((rollout_steps, action_size), dtype=torch.float32, device=device)
+    policy_action_masks = torch.empty(rollout_steps, dtype=torch.float32, device=device)
     log_probabilities = torch.empty(rollout_steps, dtype=torch.float32, device=device)
     rewards = torch.empty(rollout_steps, dtype=torch.float32, device=device)
     values = torch.empty(rollout_steps, dtype=torch.float32, device=device)
     bootstrap_values = torch.empty(rollout_steps, dtype=torch.float32, device=device)
     continuation_masks = torch.empty(rollout_steps, dtype=torch.float32, device=device)
     completed_returns: list[float] = []
+    completed_infos: list[dict[str, Any]] = []
 
     for index in range(rollout_steps):
         observation_tensor = tensor_from_observation(observation, device)
         with torch.no_grad():
             action_tensor, log_probability_tensor, value_tensor = policy.sample_action(observation_tensor)
         action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
-        next_observation, reward, terminated, truncated, _ = environment.step(action)
+        next_observation, reward, terminated, truncated, info = environment.step(action)
         done = terminated or truncated
         with torch.no_grad():
             next_value_tensor = policy.critic(tensor_from_observation(next_observation, device)).squeeze()
 
         observations[index] = observation_tensor.squeeze(0)
         actions[index] = action_tensor.squeeze(0)
+        policy_action_masks[index] = 1.0 if bool(info.get("policy_action_applied", True)) else 0.0
         log_probabilities[index] = log_probability_tensor.squeeze(0)
         rewards[index] = float(reward)
         values[index] = value_tensor.squeeze(0)
@@ -247,6 +265,7 @@ def collect_rollout(
 
         if done:
             completed_returns.append(episode_return)
+            completed_infos.append(info)
             episode_return = 0.0
             next_observation, _ = environment.reset()
         observation = next_observation
@@ -265,6 +284,7 @@ def collect_rollout(
         Rollout(
             observations=observations,
             actions=actions,
+            policy_action_masks=policy_action_masks,
             log_probabilities=log_probabilities,
             rewards=rewards,
             values=values,
@@ -275,6 +295,7 @@ def collect_rollout(
         ),
         observation,
         completed_returns,
+        completed_infos,
         episode_return,
     )
 
@@ -308,9 +329,17 @@ def update_policy(
             ratio = torch.exp(new_log_probabilities - rollout.log_probabilities[batch_indices])
             unclipped_objective = ratio * advantages[batch_indices]
             clipped_objective = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages[batch_indices]
-            policy_loss = -torch.minimum(unclipped_objective, clipped_objective).mean()
+            action_mask = rollout.policy_action_masks[batch_indices]
+            active_count = action_mask.sum()
+            if active_count.item() > 0.0:
+                policy_loss = -(
+                    torch.minimum(unclipped_objective, clipped_objective) * action_mask
+                ).sum() / active_count
+                entropy_bonus = (entropy * action_mask).sum() / active_count
+            else:
+                policy_loss = (new_log_probabilities * 0.0).sum()
+                entropy_bonus = (entropy * 0.0).sum()
             value_loss = torch.nn.functional.mse_loss(predicted_values, rollout.returns[batch_indices])
-            entropy_bonus = entropy.mean()
             loss = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy_bonus
 
             optimizer.zero_grad(set_to_none=True)
@@ -334,10 +363,16 @@ def default_metrics_path(output: Path) -> Path:
 
 
 def task_config_for_args(args: argparse.Namespace) -> dict[str, Any]:
+    xml_path = (lqr.XML_PATH if args.xml_path is None else args.xml_path).resolve()
     domain_randomization = (
         DomainRandomizationConfig.training_defaults()
         if args.domain_randomization
         else DomainRandomizationConfig.disabled()
+    )
+    jump_domain_randomization = (
+        DomainRandomizationConfig.jump_training_defaults()
+        if args.domain_randomization and args.jump_probability > 0.0
+        else None
     )
     return {
         "max_speed_mps": float(
@@ -347,10 +382,16 @@ def task_config_for_args(args: argparse.Namespace) -> dict[str, Any]:
         "jump_probability": float(args.jump_probability),
         "jump_at_s": float(args.jump_at),
         "domain_randomization": domain_randomization.as_dict(),
+        "jump_domain_randomization": (
+            None if jump_domain_randomization is None else jump_domain_randomization.as_dict()
+        ),
         "reward_schema": REWARD_SCHEMA,
         "reward_config": {
-            "jump_peak_body_rise_scale_m": float(environment_definition.JUMP_PEAK_BODY_RISE_SCALE_M),
-            "jump_peak_body_rise_weight": float(environment_definition.JUMP_HEIGHT_REWARD_WEIGHT),
+            "jump_target_clearance_m": float(environment_definition.JUMP_TARGET_CLEARANCE_M),
+            "jump_max_reward_clearance_m": float(environment_definition.JUMP_MAX_REWARD_CLEARANCE_M),
+            "jump_min_clearance_success_m": float(environment_definition.JUMP_MIN_CLEARANCE_SUCCESS_M),
+            "jump_peak_clearance_scale_m": float(environment_definition.JUMP_PEAK_CLEARANCE_SCALE_M),
+            "jump_peak_clearance_weight": float(environment_definition.JUMP_HEIGHT_REWARD_WEIGHT),
             "jump_success_reward": float(environment_definition.JUMP_SUCCESS_REWARD),
             "jump_abort_penalty": float(environment_definition.JUMP_ABORT_PENALTY),
             "jump_landing_fall_penalty": float(environment_definition.JUMP_LANDING_FALL_PENALTY),
@@ -368,10 +409,13 @@ def task_config_for_args(args: argparse.Namespace) -> dict[str, Any]:
         "environment_config": {
             "episode_seconds": float(DEFAULT_EPISODE_SECONDS),
             "control_decimation": int(environment_definition.DEFAULT_CONTROL_DECIMATION),
-            "mjcf_sha256": hashlib.sha256(lqr.XML_PATH.read_bytes()).hexdigest(),
-            "jump_thrust_length_m": float(lqr.JUMP_THRUST_LENGTH_M),
-            "jump_thrust_rate_mps": float(lqr.JUMP_THRUST_RATE_MPS),
+            "mjcf_sha256": hashlib.sha256(xml_path.read_bytes()).hexdigest(),
+            "lqr_source_sha256": hashlib.sha256(Path(lqr.__file__).read_bytes()).hexdigest(),
+            "jump_controller": lqr.jump_controller_config(),
             "domain_randomization": domain_randomization.as_dict(),
+            "jump_domain_randomization": (
+                None if jump_domain_randomization is None else jump_domain_randomization.as_dict()
+            ),
         },
     }
 
@@ -616,13 +660,68 @@ def append_metrics(path: Path, row: dict[str, float | int]) -> None:
         "policy_loss",
         "value_loss",
         "entropy",
+        "jump_episodes",
+        "jump_successes",
+        "jump_trigger_rate",
+        "jump_height_target_rate",
+        "jump_stable_landing_rate",
+        "mean_jump_peak_clearance_m",
+        "mean_jump_min_clearance_m",
     )
     needs_header = not path.exists() or path.stat().st_size == 0
+    if not needs_header:
+        with path.open("r", newline="", encoding="ascii") as handle:
+            existing_header = next(csv.reader(handle), [])
+        if tuple(existing_header) != fieldnames:
+            raise ValueError(
+                f"metrics CSV schema mismatch at {path}; choose a new --metrics-path or remove the old file"
+            )
     with path.open("a", newline="", encoding="ascii") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if needs_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def summarize_jump_episodes(infos: list[dict[str, Any]]) -> dict[str, float | int]:
+    scheduled_infos = [info for info in infos if bool(info.get("jump_scheduled"))]
+    triggered_infos = [info for info in scheduled_infos if bool(info.get("jump_triggered"))]
+    if not scheduled_infos:
+        return {
+            "jump_episodes": 0,
+            "jump_successes": 0,
+            "jump_trigger_rate": float("nan"),
+            "jump_height_target_rate": float("nan"),
+            "jump_stable_landing_rate": float("nan"),
+            "mean_jump_peak_clearance_m": float("nan"),
+            "mean_jump_min_clearance_m": float("nan"),
+        }
+    peaks = np.asarray(
+        [float(info["jump_peak_mean_wheel_clearance_m"]) for info in scheduled_infos],
+        dtype=np.float64,
+    )
+    minimums = np.asarray(
+        [float(info["jump_peak_wheel_clearance_m"]) for info in scheduled_infos],
+        dtype=np.float64,
+    )
+    height_reached = np.asarray(
+        [bool(info["jump_height_target_reached"]) for info in scheduled_infos],
+        dtype=np.float64,
+    )
+    stable = np.asarray(
+        [bool(info.get("jump_landing_stable", info["jump_succeeded"])) for info in scheduled_infos],
+        dtype=np.float64,
+    )
+    successes = np.asarray([bool(info["jump_succeeded"]) for info in scheduled_infos], dtype=np.float64)
+    return {
+        "jump_episodes": len(scheduled_infos),
+        "jump_successes": int(np.sum(successes)),
+        "jump_trigger_rate": float(len(triggered_infos) / len(scheduled_infos)),
+        "jump_height_target_rate": float(np.mean(height_reached)),
+        "jump_stable_landing_rate": float(np.mean(stable)),
+        "mean_jump_peak_clearance_m": float(np.mean(peaks)),
+        "mean_jump_min_clearance_m": float(np.mean(minimums)),
+    }
 
 
 def load_residual_bc_warm_start(
@@ -686,6 +785,7 @@ def train(args: argparse.Namespace) -> None:
     training_config = training_config_for_args(args)
     metrics_path = args.metrics_path if args.metrics_path is not None else default_metrics_path(args.output)
     environment = WheelLegResidualEnv(
+        xml_path=args.xml_path,
         max_forward_speed=getattr(args, "max_speed", None),
         max_command_yaw_delta_rad=np.deg2rad(args.yaw_range_deg),
         jump_probability=args.jump_probability,
@@ -694,6 +794,11 @@ def train(args: argparse.Namespace) -> None:
             DomainRandomizationConfig.training_defaults()
             if args.domain_randomization
             else DomainRandomizationConfig.disabled()
+        ),
+        jump_domain_randomization=(
+            DomainRandomizationConfig.jump_training_defaults()
+            if args.domain_randomization and args.jump_probability > 0.0
+            else None
         ),
     )
     policy: ActorCritic | None = None
@@ -744,7 +849,7 @@ def train(args: argparse.Namespace) -> None:
         episode_return = 0.0
         while timesteps < args.total_timesteps:
             current_rollout_steps = min(args.rollout_steps, args.total_timesteps - timesteps)
-            rollout, observation, completed_returns, episode_return = collect_rollout(
+            rollout, observation, completed_returns, completed_infos, episode_return = collect_rollout(
                 environment,
                 policy,
                 observation,
@@ -784,6 +889,7 @@ def train(args: argparse.Namespace) -> None:
             else:
                 return_text = f"partial_return={episode_return:.3f}"
                 mean_completed_return = float("nan")
+            jump_metrics = summarize_jump_episodes(completed_infos)
             append_metrics(
                 metrics_path,
                 {
@@ -795,12 +901,21 @@ def train(args: argparse.Namespace) -> None:
                     "policy_loss": metrics["policy_loss"],
                     "value_loss": metrics["value_loss"],
                     "entropy": metrics["entropy"],
+                    **jump_metrics,
                 },
             )
+            jump_text = ""
+            if jump_metrics["jump_episodes"]:
+                jump_text = (
+                    f" jump_height={jump_metrics['mean_jump_peak_clearance_m']:.3f}m"
+                    f" trigger_rate={jump_metrics['jump_trigger_rate']:.2f}"
+                    f" target_rate={jump_metrics['jump_height_target_rate']:.2f}"
+                    f" landing_rate={jump_metrics['jump_stable_landing_rate']:.2f}"
+                )
             print(
                 f"update={update_index} timesteps={timesteps} {return_text} "
                 f"policy_loss={metrics['policy_loss']:.4f} value_loss={metrics['value_loss']:.4f} "
-                f"entropy={metrics['entropy']:.4f}"
+                f"entropy={metrics['entropy']:.4f}{jump_text}"
             )
             snapshot_path = save_checkpoint(
                 args.output,
@@ -833,7 +948,7 @@ def main() -> None:
         args.rollout_steps = min(args.rollout_steps, 16)
         args.epochs = 1
         args.minibatch_size = min(args.minibatch_size, args.rollout_steps)
-        args.output = Path("artifacts") / "ppo_residual_smoke.pt"
+        args.output = Path("artifacts") / "ppo_jump_clearance_smoke.pt"
     train(args)
 
 

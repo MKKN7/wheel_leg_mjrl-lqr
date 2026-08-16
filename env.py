@@ -35,10 +35,13 @@ LEG_DIFF_TURN_WEIGHT = 0.5
 YAW_RATE_TRACKING_WEIGHT = 0.05
 JUMP_PHASE_NAMES = ("prepare", "crouch", "thrust", "flight", "landing")
 DEFAULT_JUMP_AT_S = 0.80
-JUMP_PEAK_BODY_RISE_SCALE_M = 0.10
+JUMP_TARGET_CLEARANCE_M = 0.20
+JUMP_MAX_REWARD_CLEARANCE_M = 0.25
+JUMP_MIN_CLEARANCE_SUCCESS_M = 0.18
+JUMP_PEAK_CLEARANCE_SCALE_M = 0.10
 JUMP_HEIGHT_REWARD_WEIGHT = 8.0
 JUMP_SUCCESS_REWARD = 15.0
-JUMP_ABORT_PENALTY = 2.0
+JUMP_ABORT_PENALTY = 10.0
 JUMP_LANDING_FALL_PENALTY = 60.0
 JUMP_LANDING_GUARD_SECONDS = 0.50
 JUMP_STABLE_ATTITUDE_LIMIT_RAD = 0.35
@@ -98,12 +101,34 @@ class DomainRandomizationConfig:
         return cls(enabled=True)
 
     @classmethod
+    def jump_training_defaults(cls) -> "DomainRandomizationConfig":
+        """Symmetric physical curriculum for a jump that runs at motor saturation.
+
+        The jump controller is already near the actuator limit.  Keep
+        symmetric physical perturbations, while reserving sensor noise and
+        control delay for the walking curriculum until a landing observer is
+        tuned for those disturbances.
+        """
+        return cls(
+            enabled=True,
+            mass_global_range=(0.98, 1.02),
+            mass_body_range=(0.98, 1.02),
+            inertia_range=(0.90, 1.10),
+            friction_sliding_range=(0.90, 1.10),
+            damping_range=(0.90, 1.10),
+            hip_strength_range=(0.98, 1.02),
+            wheel_strength_range=(0.95, 1.05),
+            sensor_noise_scale_range=(0.0, 0.0),
+            control_delay_steps_range=(0, 0),
+        )
+
+    @classmethod
     def disabled(cls) -> "DomainRandomizationConfig":
         return cls(enabled=False)
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "enabled": self.enabled,
             "mass_global_range": self.mass_global_range,
             "mass_body_range": self.mass_body_range,
@@ -143,6 +168,7 @@ class WheelLegResidualEnv(gym.Env):
         jump_probability: float = 0.0,
         jump_at: float = DEFAULT_JUMP_AT_S,
         domain_randomization: DomainRandomizationConfig | None = None,
+        jump_domain_randomization: DomainRandomizationConfig | None = None,
     ) -> None:
         super().__init__()
         if render_mode not in (None, "rgb_array"):
@@ -176,6 +202,7 @@ class WheelLegResidualEnv(gym.Env):
 
         self.render_mode = render_mode
         self._renderer: mujoco.Renderer | None = None
+        self._render_camera: mujoco.MjvCamera | None = None
         self.episode_seconds = float(episode_seconds)
         self.control_decimation = int(control_decimation)
         self.randomize_command = bool(randomize_command)
@@ -188,6 +215,9 @@ class WheelLegResidualEnv(gym.Env):
             if domain_randomization is None
             else domain_randomization
         )
+        self.jump_domain_randomization = jump_domain_randomization
+        self._active_domain_randomization = self.domain_randomization
+        self._active_domain_randomization_profile = "walking"
         configured_forward_limit = (
             getattr(lqr, "DEFAULT_FORWARD_SPEED_LIMIT_MPS", getattr(lqr, "MAX_FORWARD_SPEED_MPS", 0.25))
             if max_forward_speed is None
@@ -204,12 +234,17 @@ class WheelLegResidualEnv(gym.Env):
         self._nominal_body_mass = self.model.body_mass.copy()
         self._nominal_body_inertia = self.model.body_inertia.copy()
         self._nominal_geom_friction = self.model.geom_friction.copy()
+        self._nominal_geom_contype = self.model.geom_contype.copy()
+        self._nominal_geom_conaffinity = self.model.geom_conaffinity.copy()
         self._nominal_dof_damping = self.model.dof_damping.copy()
         self._nominal_actuator_gainprm = self.model.actuator_gainprm.copy()
         self._nominal_actuator_forcerange = self.model.actuator_forcerange.copy()
         self._control_low = self.model.actuator_ctrlrange[:, 0].copy()
         self._control_high = self.model.actuator_ctrlrange[:, 1].copy()
         self._control_scale = np.maximum(np.abs(self._control_low), np.abs(self._control_high))
+        self._terrain_support_geoms = tuple(
+            geom_id for geom_id in self.refs.ground_geoms if geom_id != self.refs.ground_geom
+        )
         requested_residual_limits = np.array((8.0, 8.0, 0.75, 8.0, 8.0, 0.75))
         self.residual_limits = np.minimum(
             requested_residual_limits,
@@ -254,8 +289,8 @@ class WheelLegResidualEnv(gym.Env):
         # 3 tilt + 3 velocity + 3 angular velocity + 4 hip positions +
         # 4 hip velocities + 2 wheel velocities + 2 leg lengths + 2 length
         # rates + speed/leg commands + 3 heading features + jump task/countdown/phase
-        # state + 2 contacts + 7 previous actions.
-        self._observation_size = 44
+        # state + 5 jump-height/vertical-motion features + 2 contacts + 7 previous actions.
+        self._observation_size = 49
         self.observation_space = spaces.Box(
             low=np.full(self._observation_size, -10.0, dtype=np.float32),
             high=np.full(self._observation_size, 10.0, dtype=np.float32),
@@ -282,6 +317,8 @@ class WheelLegResidualEnv(gym.Env):
         self._jump_at: float | None = None
         self._jump_triggered = False
         self._jump_succeeded = False
+        self._jump_landing_stable = False
+        self._jump_landing_pending = False
         self._jump_failed = False
         self._jump_failure_reason = ""
         self._jump_success_this_step = False
@@ -291,7 +328,9 @@ class WheelLegResidualEnv(gym.Env):
         self._jump_has_been_airborne = False
         self._jump_peak_body_rise_m = 0.0
         self._jump_peak_clearance_m = 0.0
-        self._jump_rewarded_peak_body_rise_m = 0.0
+        self._jump_peak_clearance_mean_m = 0.0
+        self._jump_rewarded_peak_clearance_mean_m = 0.0
+        self._jump_height_target_reached = False
         self._jump_landing_guard_until_s = -np.inf
         self._sensor_noise_standard_deviation = np.zeros(self.model.nsensordata, dtype=np.float64)
         self._sensor_noise_bias = np.zeros(self.model.nsensordata, dtype=np.float64)
@@ -308,6 +347,7 @@ class WheelLegResidualEnv(gym.Env):
     def _nominal_domain_randomization_sample(self) -> dict[str, Any]:
         return {
             "enabled": False,
+            "profile": "nominal",
             "mass_global_scale": 1.0,
             "body_mass_scale_min": 1.0,
             "body_mass_scale_max": 1.0,
@@ -322,6 +362,14 @@ class WheelLegResidualEnv(gym.Env):
             "control_delay_ms": 0.0,
         }
 
+    def _select_episode_domain_randomization(self) -> None:
+        if self._jump_scheduled and self.jump_domain_randomization is not None:
+            self._active_domain_randomization = self.jump_domain_randomization
+            self._active_domain_randomization_profile = "jump_safe"
+        else:
+            self._active_domain_randomization = self.domain_randomization
+            self._active_domain_randomization_profile = "walking"
+
     @staticmethod
     def _sample_uniform(
         rng: np.random.Generator,
@@ -330,10 +378,40 @@ class WheelLegResidualEnv(gym.Env):
     ) -> float | np.ndarray:
         return rng.uniform(bounds[0], bounds[1], size=size)
 
+    def _sample_mirrored_body_scales(
+        self,
+        dynamic_bodies: np.ndarray,
+        bounds: tuple[float, float],
+    ) -> np.ndarray:
+        """Sample physical-body scales while preserving left/right linkage symmetry."""
+        scales = np.ones(self.model.nbody, dtype=np.float64)
+        dynamic_body_ids = {int(body_id) for body_id in dynamic_bodies}
+        sampled: set[int] = set()
+        for body_id in dynamic_bodies:
+            body_id = int(body_id)
+            if body_id in sampled:
+                continue
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            paired_body_id = -1
+            if body_name is not None and body_name.startswith("left_"):
+                paired_name = f"right_{body_name[len('left_'):]}"
+                paired_body_id = mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_BODY, paired_name
+                )
+            scale = float(self._sample_uniform(self.np_random, bounds))
+            scales[body_id] = scale
+            sampled.add(body_id)
+            if paired_body_id in dynamic_body_ids:
+                scales[paired_body_id] = scale
+                sampled.add(paired_body_id)
+        return scales
+
     def _restore_nominal_model_parameters(self) -> None:
         self.model.body_mass[:] = self._nominal_body_mass
         self.model.body_inertia[:] = self._nominal_body_inertia
         self.model.geom_friction[:] = self._nominal_geom_friction
+        self.model.geom_contype[:] = self._nominal_geom_contype
+        self.model.geom_conaffinity[:] = self._nominal_geom_conaffinity
         self.model.dof_damping[:] = self._nominal_dof_damping
         self.model.actuator_gainprm[:] = self._nominal_actuator_gainprm
         self.model.actuator_forcerange[:] = self._nominal_actuator_forcerange
@@ -341,8 +419,9 @@ class WheelLegResidualEnv(gym.Env):
     def _apply_domain_randomization(self) -> None:
         """Restore nominal dynamics, then sample one episode-constant model."""
         self._restore_nominal_model_parameters()
-        config = self.domain_randomization
+        config = self._active_domain_randomization
         sample = self._nominal_domain_randomization_sample()
+        sample["profile"] = self._active_domain_randomization_profile
         if not config.enabled:
             mujoco.mj_setConst(self.model, self.data)
             self._domain_randomization_sample = sample
@@ -351,22 +430,16 @@ class WheelLegResidualEnv(gym.Env):
 
         dynamic_bodies = np.flatnonzero(self._nominal_body_mass > 0.0)
         global_mass_scale = float(self._sample_uniform(self.np_random, config.mass_global_range))
-        local_mass_scales = np.ones(self.model.nbody, dtype=np.float64)
-        local_mass_scales[dynamic_bodies] = self._sample_uniform(
-            self.np_random,
-            config.mass_body_range,
-            size=dynamic_bodies.size,
+        local_mass_scales = self._sample_mirrored_body_scales(
+            dynamic_bodies, config.mass_body_range
         )
         body_mass_scales = global_mass_scale * local_mass_scales
         self.model.body_mass[dynamic_bodies] = (
             self._nominal_body_mass[dynamic_bodies] * body_mass_scales[dynamic_bodies]
         )
 
-        inertia_scales = np.ones(self.model.nbody, dtype=np.float64)
-        inertia_scales[dynamic_bodies] = self._sample_uniform(
-            self.np_random,
-            config.inertia_range,
-            size=dynamic_bodies.size,
+        inertia_scales = self._sample_mirrored_body_scales(
+            dynamic_bodies, config.inertia_range
         )
         self.model.body_inertia[dynamic_bodies] = (
             self._nominal_body_inertia[dynamic_bodies] * inertia_scales[dynamic_bodies, None]
@@ -375,7 +448,7 @@ class WheelLegResidualEnv(gym.Env):
         sliding_friction_scale = float(self._sample_uniform(
             self.np_random, config.friction_sliding_range,
         ))
-        friction_geoms = (self.refs.ground_geom, *self.refs.wheel_geoms)
+        friction_geoms = (*self.refs.ground_geoms, *self.refs.wheel_geoms)
         self.model.geom_friction[list(friction_geoms), 0] = (
             self._nominal_geom_friction[list(friction_geoms), 0] * sliding_friction_scale
         )
@@ -431,7 +504,7 @@ class WheelLegResidualEnv(gym.Env):
         self._state_position_noise.fill(0.0)
         self._state_velocity_noise.fill(0.0)
         self._orientation_measurement_noise = np.zeros(3, dtype=np.float64)
-        if not self.domain_randomization.enabled:
+        if not self._active_domain_randomization.enabled:
             self._sensor_noise_scale = 0.0
             return
 
@@ -461,7 +534,7 @@ class WheelLegResidualEnv(gym.Env):
         self._sample_sensor_noise()
 
     def _sample_sensor_noise(self) -> None:
-        if not self.domain_randomization.enabled:
+        if not self._active_domain_randomization.enabled:
             return
         self._sensor_noise_sample[:] = self.np_random.normal(
             0.0,
@@ -507,7 +580,7 @@ class WheelLegResidualEnv(gym.Env):
         """Temporarily expose a noisy state estimate to the LQR command path."""
         true_qpos = self.data.qpos.copy()
         true_qvel = self.data.qvel.copy()
-        if not self.domain_randomization.enabled:
+        if not self._active_domain_randomization.enabled:
             return true_qpos, true_qvel
 
         self.data.qpos[:] += self._state_position_noise
@@ -533,7 +606,7 @@ class WheelLegResidualEnv(gym.Env):
         MuJoCo's raw sensors before the next safety check, so safety guards
         always evaluate the true mechanism rather than noisy measurements.
         """
-        if not self.domain_randomization.enabled:
+        if not self._active_domain_randomization.enabled:
             return
         # Recompute the raw sensor vector first; otherwise adding samples at
         # the policy boundary would accumulate noise across control steps.
@@ -603,6 +676,28 @@ class WheelLegResidualEnv(gym.Env):
         self.data.ctrl[:] = self._stance_ctrl
         self.data.qfrc_applied[:] = 0.0
         self.data.time = 0.0
+        mujoco.mj_forward(self.model, self.data)
+
+    def _prepare_lqr_projection_support(self) -> None:
+        """Use the inherited plane while building an LQR trim for an hfield scene."""
+        if not self._terrain_support_geoms:
+            return
+        self.model.geom_contype[self.refs.ground_geom] = self._nominal_geom_contype[self.refs.ground_geom]
+        self.model.geom_conaffinity[self.refs.ground_geom] = self._nominal_geom_conaffinity[self.refs.ground_geom]
+        for geom_id in self._terrain_support_geoms:
+            self.model.geom_contype[geom_id] = 0
+            self.model.geom_conaffinity[geom_id] = 0
+        mujoco.mj_forward(self.model, self.data)
+
+    def _activate_terrain_support(self) -> None:
+        """Replace the temporary LQR projection plane with the scene hfield."""
+        if not self._terrain_support_geoms:
+            return
+        self.model.geom_contype[self.refs.ground_geom] = 0
+        self.model.geom_conaffinity[self.refs.ground_geom] = 0
+        for geom_id in self._terrain_support_geoms:
+            self.model.geom_contype[geom_id] = self._nominal_geom_contype[geom_id]
+            self.model.geom_conaffinity[geom_id] = self._nominal_geom_conaffinity[geom_id]
         mujoco.mj_forward(self.model, self.data)
 
     def _reset_lqr_command(self, command_yaw: float | None = None) -> None:
@@ -700,11 +795,14 @@ class WheelLegResidualEnv(gym.Env):
         # Domains are episode-constant.  Rebuilding the working point after a
         # physical change is required because equilibrium, trims and LQR gains
         # all depend on the sampled model.
+        self._select_episode_domain_randomization()
         self._apply_domain_randomization()
-        if self._controller is None or self.domain_randomization.enabled:
+        self._prepare_lqr_projection_support()
+        if self._controller is None or self._active_domain_randomization.enabled:
             self._project_low_centre_stance()
         else:
             self._restore_stance()
+        self._activate_terrain_support()
         if not self.randomize_leg_length and "command_leg_length" not in options:
             self._command_leg_length = self._default_leg_length
 
@@ -731,6 +829,8 @@ class WheelLegResidualEnv(gym.Env):
         self._contact_loss_steps = 0
         self._jump_triggered = False
         self._jump_succeeded = False
+        self._jump_landing_stable = False
+        self._jump_landing_pending = False
         self._jump_failed = False
         self._jump_failure_reason = ""
         self._jump_success_this_step = False
@@ -740,7 +840,9 @@ class WheelLegResidualEnv(gym.Env):
         self._jump_has_been_airborne = False
         self._jump_peak_body_rise_m = 0.0
         self._jump_peak_clearance_m = 0.0
-        self._jump_rewarded_peak_body_rise_m = 0.0
+        self._jump_peak_clearance_mean_m = 0.0
+        self._jump_rewarded_peak_clearance_mean_m = 0.0
+        self._jump_height_target_reached = False
         self._jump_landing_guard_until_s = -np.inf
         info = self._info("reset")
         self._apply_sensor_noise_to_data()
@@ -781,10 +883,8 @@ class WheelLegResidualEnv(gym.Env):
             for geom_id in self.refs.wheel_geoms
         )
 
-    def _wheel_ground_clearance_m(self) -> float:
-        """Return the lowest physical wheel-bottom clearance above the ground."""
-        if any(self._wheel_contacts()):
-            return 0.0
+    def _wheel_ground_clearances_m(self) -> np.ndarray:
+        """Return physical left/right wheel-bottom clearance above the ground."""
         clearances: list[float] = []
         for geom_id in self.refs.wheel_geoms:
             radius = float(self.model.geom_size[geom_id, 0])
@@ -793,13 +893,18 @@ class WheelLegResidualEnv(gym.Env):
             vertical_extent = radius * np.sqrt(max(0.0, 1.0 - wheel_axis_z * wheel_axis_z))
             vertical_extent += half_width * abs(wheel_axis_z)
             clearances.append(float(self.data.geom_xpos[geom_id, 2] - vertical_extent))
-        return max(0.0, min(clearances))
+        return np.maximum(0.0, np.asarray(clearances, dtype=np.float64))
+
+    def _wheel_ground_clearance_m(self) -> float:
+        """Return the lower wheel clearance, the hard-safe jump-height metric."""
+        return float(np.min(self._wheel_ground_clearances_m()))
 
     def _ground_has_nonwheel_contact(self) -> bool:
+        support_geoms = set(self.refs.ground_geoms)
         for contact in self.data.contact[: self.data.ncon]:
-            if contact.geom1 == self.refs.ground_geom:
+            if contact.geom1 in support_geoms:
                 other_geom = contact.geom2
-            elif contact.geom2 == self.refs.ground_geom:
+            elif contact.geom2 in support_geoms:
                 other_geom = contact.geom1
             else:
                 continue
@@ -820,6 +925,21 @@ class WheelLegResidualEnv(gym.Env):
         if self._controller is not None and self._controller.jump.phase_name in JUMP_PHASE_NAMES:
             phase_features[2 + JUMP_PHASE_NAMES.index(self._controller.jump.phase_name)] = 1.0
         return phase_features
+
+    def _jump_height_observation(self) -> np.ndarray:
+        """Expose current height and vertical motion for the scheduled jump task."""
+        clearances = self._wheel_ground_clearances_m()
+        body_rise = max(
+            0.0,
+            float(self.data.xpos[self._robot_body, 2]) - self._reference_body_height,
+        )
+        return np.array((
+            clearances[0] / JUMP_MAX_REWARD_CLEARANCE_M,
+            clearances[1] / JUMP_MAX_REWARD_CLEARANCE_M,
+            float(np.mean(clearances)) / JUMP_MAX_REWARD_CLEARANCE_M,
+            body_rise / JUMP_MAX_REWARD_CLEARANCE_M,
+            float(self.data.qvel[self._root_dof_address + 2]) / 3.0,
+        ), dtype=np.float64)
 
     def _schedule_jump_if_due(self) -> None:
         if (
@@ -856,22 +976,39 @@ class WheelLegResidualEnv(gym.Env):
         if self._controller is None or not self._jump_triggered or not self._controller.jump.active:
             return
         airborne = not any(self._wheel_contacts())
-        clearance = self._wheel_ground_clearance_m()
+        clearances = self._wheel_ground_clearances_m()
         if not airborne:
             return
         self._jump_has_been_airborne = True
-        self._jump_peak_clearance_m = max(self._jump_peak_clearance_m, clearance)
+        self._jump_peak_clearance_m = max(self._jump_peak_clearance_m, float(np.min(clearances)))
+        self._jump_peak_clearance_mean_m = max(
+            self._jump_peak_clearance_mean_m,
+            float(np.mean(clearances)),
+        )
+        self._jump_height_target_reached = bool(
+            self._jump_peak_clearance_mean_m >= JUMP_TARGET_CLEARANCE_M
+            and self._jump_peak_clearance_m >= JUMP_MIN_CLEARANCE_SUCCESS_M
+        )
         body_rise = max(0.0, float(self.data.xpos[self._robot_body, 2]) - self._reference_body_height)
         self._jump_peak_body_rise_m = max(self._jump_peak_body_rise_m, body_rise)
 
     def _record_jump_landing_guard(self, safety_reason: str | None) -> None:
         if safety_reason is None or self._jump_landing_fall_penalized:
             return
+        # A stable but low jump is a task miss, not a physical landing fall.
+        # An unstable landing or timeout remains subject to the severe penalty.
+        if safety_reason == "jump_aborted_jump_height_target_not_reached":
+            return
         before_stable_landing = self._jump_has_been_airborne and not self._jump_succeeded
-        within_landing_guard = float(self.data.time) <= self._jump_landing_guard_until_s
+        within_landing_guard = self._jump_landing_pending
         if before_stable_landing or within_landing_guard:
             self._jump_landing_fall_penalized = True
             self._jump_landing_fall_this_step = True
+            self._jump_succeeded = False
+            self._jump_landing_stable = False
+            self._jump_landing_pending = False
+            self._jump_failed = True
+            self._jump_failure_reason = f"post-landing fall: {safety_reason}"
 
     def _record_jump_transition(self, was_active: bool) -> None:
         if self._controller is None or not was_active or self._controller.jump.active:
@@ -886,17 +1023,45 @@ class WheelLegResidualEnv(gym.Env):
                 self._jump_failed = True
                 self._jump_failure_reason = "insufficient two-wheel liftoff"
                 self._jump_failure_this_step = True
-            elif self._jump_landing_is_stable():
-                self._jump_succeeded = True
-                self._jump_success_this_step = True
-                self._jump_landing_guard_until_s = float(self.data.time) + JUMP_LANDING_GUARD_SECONDS
             else:
-                self._jump_failed = True
-                self._jump_failure_reason = "unstable landing"
-                self._jump_failure_this_step = True
+                self._jump_landing_stable = self._jump_landing_is_stable()
+                if self._jump_landing_stable:
+                    # Success is confirmed only after the full guard period.
+                    # This prevents a single quiet touchdown sample from
+                    # earning the landing reward before the body settles.
+                    self._jump_landing_pending = True
+                    self._jump_landing_guard_until_s = float(self.data.time) + JUMP_LANDING_GUARD_SECONDS
+                else:
+                    self._jump_failed = True
+                    self._jump_failure_reason = "unstable landing"
+                    self._jump_failure_this_step = True
+
+    def _update_jump_landing_guard(self) -> None:
+        """Confirm stable touchdown continuously before awarding jump success."""
+        if not self._jump_landing_pending:
+            return
+        if not self._jump_landing_is_stable():
+            self._jump_landing_pending = False
+            self._jump_landing_stable = False
+            self._jump_failed = True
+            self._jump_failure_reason = "unstable landing during guard"
+            self._jump_failure_this_step = True
+            self._jump_landing_fall_penalized = True
+            self._jump_landing_fall_this_step = True
+            return
+        if float(self.data.time) < self._jump_landing_guard_until_s:
+            return
+        self._jump_landing_pending = False
+        if self._jump_height_target_reached:
+            self._jump_succeeded = True
+            self._jump_success_this_step = True
+        else:
+            self._jump_failed = True
+            self._jump_failure_reason = "jump height target not reached"
+            self._jump_failure_this_step = True
 
     def _safety_reason(self) -> str | None:
-        if self.domain_randomization.enabled:
+        if self._active_domain_randomization.enabled:
             # Noise is presented to the controller/policy measurement path,
             # never to physical safety checks or contact geometry validation.
             mujoco.mj_forward(self.model, self.data)
@@ -989,6 +1154,7 @@ class WheelLegResidualEnv(gym.Env):
                     yaw_state["yaw_rate_normalized"],
                 )),
                 self._jump_observation(),
+                self._jump_height_observation(),
                 contacts,
                 self._previous_action,
             )
@@ -1032,6 +1198,59 @@ class WheelLegResidualEnv(gym.Env):
     def set_command_yaw(self, yaw: float) -> float:
         """Set the LQR world-frame heading command from the environment."""
         return self.lqr_controller.set_command_yaw(yaw)
+
+    def set_command_speed(self, speed: float) -> float:
+        """Set a manual LQR speed command and keep telemetry in sync."""
+        target = self.lqr_controller.set_target_speed(speed)
+        self._command_speed = float(target)
+        return target
+
+    def adjust_command_speed(self, delta: float) -> float:
+        """Increment the manual LQR speed command and keep telemetry in sync."""
+        target = self.lqr_controller.adjust_target_speed(delta)
+        self._command_speed = float(target)
+        return target
+
+    def adjust_command_yaw(self, delta: float) -> float:
+        """Increment the manual world-frame heading command."""
+        return self.lqr_controller.adjust_command_yaw(delta)
+
+    def hold_current_yaw(self) -> float:
+        """Make the current measured heading the manual LQR heading target."""
+        return self.lqr_controller.hold_current_yaw(self.data)
+
+    def adjust_command_leg_length(self, delta: float) -> float:
+        """Increment the common LQR leg-length command and update telemetry."""
+        target = self.lqr_controller.adjust_target_leg_length(delta)
+        self._command_leg_length = float(target)
+        return target
+
+    def request_lqr_jump(self) -> bool:
+        """Start an operator-requested LQR jump with environment safety tracking."""
+        controller = self.lqr_controller
+        controller.request_jump(self.data)
+        self._command_speed = 0.0
+        self._command_leg_length = float(controller.leg_command.target_length)
+        self._jump_scheduled = True
+        self._jump_at = None
+        self._jump_triggered = True
+        self._jump_succeeded = False
+        self._jump_landing_stable = False
+        self._jump_landing_pending = False
+        self._jump_failed = False
+        self._jump_failure_reason = ""
+        self._jump_success_this_step = False
+        self._jump_failure_this_step = False
+        self._jump_landing_fall_this_step = False
+        self._jump_landing_fall_penalized = False
+        self._jump_has_been_airborne = False
+        self._jump_peak_body_rise_m = 0.0
+        self._jump_peak_clearance_m = 0.0
+        self._jump_peak_clearance_mean_m = 0.0
+        self._jump_rewarded_peak_clearance_mean_m = 0.0
+        self._jump_height_target_reached = False
+        self._jump_landing_guard_until_s = -np.inf
+        return True
 
     def yaw_state(self) -> dict[str, float]:
         """Return the LQR heading variables without changing the policy interface."""
@@ -1096,6 +1315,7 @@ class WheelLegResidualEnv(gym.Env):
         if jump_active:
             # LQR owns all actions in the jump sequence, so only reward the
             # observable flight result instead of unreachable speed/yaw costs.
+            # 防止reward hacking
             tracking = 0.0
             leg_tracking = 0.0
             attitude_tracking = 0.0
@@ -1104,11 +1324,14 @@ class WheelLegResidualEnv(gym.Env):
             energy_cost = 0.0
             residual_cost = 0.0
             contact_bonus = 0.0
-            leg_diff_weight = 0.0
-            new_peak = max(0.0, self._jump_peak_body_rise_m - self._jump_rewarded_peak_body_rise_m)
+            # A new peak is rewarded once and capped at 25 cm.  This promotes
+            # useful clearance rather than accumulating reward by hovering.
+            leg_diff_weight = LEG_DIFF_TURN_WEIGHT
+            capped_peak = min(self._jump_peak_clearance_mean_m, JUMP_MAX_REWARD_CLEARANCE_M)
+            new_peak = max(0.0, capped_peak - self._jump_rewarded_peak_clearance_mean_m)
             if new_peak > 0.0:
-                self._jump_rewarded_peak_body_rise_m = self._jump_peak_body_rise_m
-            jump_peak_increment = new_peak / JUMP_PEAK_BODY_RISE_SCALE_M
+                self._jump_rewarded_peak_clearance_mean_m = capped_peak
+            jump_peak_increment = new_peak / JUMP_PEAK_CLEARANCE_SCALE_M
         else:
             tracking = float(np.exp(-((speed_error / 0.20) ** 2)))
             leg_error = float(np.mean((
@@ -1186,18 +1409,27 @@ class WheelLegResidualEnv(gym.Env):
             "jump_phase": jump_phase,
             "jump_elapsed_s": jump_elapsed,
             "jump_succeeded": self._jump_succeeded,
+            "jump_landing_stable": self._jump_landing_stable,
+            "jump_landing_pending": self._jump_landing_pending,
             "jump_failed": self._jump_failed,
             "jump_abort_reason": self._jump_failure_reason,
             "jump_has_been_airborne": self._jump_has_been_airborne,
             "jump_landing_fall_penalized": self._jump_landing_fall_penalized,
+            "wheel_ground_clearances_m": self._wheel_ground_clearances_m().astype(np.float32),
             "wheel_ground_clearance_m": self._wheel_ground_clearance_m(),
             "jump_peak_body_rise_m": self._jump_peak_body_rise_m,
             "jump_peak_wheel_clearance_m": self._jump_peak_clearance_m,
+            "jump_peak_mean_wheel_clearance_m": self._jump_peak_clearance_mean_m,
+            "jump_target_clearance_m": JUMP_TARGET_CLEARANCE_M,
+            "jump_max_reward_clearance_m": JUMP_MAX_REWARD_CLEARANCE_M,
+            "jump_min_clearance_success_m": JUMP_MIN_CLEARANCE_SUCCESS_M,
+            "jump_height_target_reached": self._jump_height_target_reached,
             "jump_landing_guard_remaining_s": max(
                 0.0, self._jump_landing_guard_until_s - float(self.data.time)
             ),
             "jump_observation": self._jump_observation().astype(np.float32),
             "domain_randomization": dict(self._domain_randomization_sample),
+            "domain_randomization_profile": self._active_domain_randomization_profile,
             "control_delay_steps": self._control_delay_steps,
             "control_delay_ms": 1000.0 * self._control_delay_steps * self.model.opt.timestep,
             "sensor_noise_scale": self._sensor_noise_scale,
@@ -1245,23 +1477,45 @@ class WheelLegResidualEnv(gym.Env):
         self._jump_landing_fall_this_step = False
         self._schedule_jump_if_due()
         self._sample_sensor_noise()
-        if self._controller.jump.active:
+        # The jump state machine owns all six torques and the common leg
+        # command.  Report this to PPO so action-independent jump rewards do
+        # not create actor-gradient noise.
+        policy_action_applied = not (
+            self._controller.jump.active or self._jump_landing_pending
+        )
+        if not policy_action_applied:
             leg_length_action = 0.0
+            # The jump state machine owns its own wider, jump-safe leg range.
+            # Do not re-clamp it through the normal walking leg limit here.
+            self._command_leg_length = float(self._controller.leg_command.target_length)
         else:
             leg_length_action = float(action_array[-1])
-        self._command_leg_length = self._controller.adjust_target_leg_length(
-            leg_length_action * RL_LEG_LENGTH_COMMAND_RATE_MPS * self.control_decimation * self.model.opt.timestep
-        )
+            self._command_leg_length = self._controller.adjust_target_leg_length(
+                leg_length_action
+                * RL_LEG_LENGTH_COMMAND_RATE_MPS
+                * self.control_decimation
+                * self.model.opt.timestep
+            )
 
         safety_reason: str | None = None
         for _ in range(self.control_decimation):
             was_jump_active = self._controller.jump.active
-            true_qpos, true_qvel = self._prepare_noisy_controller_measurement()
-            lqr_control = self._controller.command(self.data)
+            lqr_owns_control = was_jump_active or self._jump_landing_pending
+            if was_jump_active:
+                # The scheduled jump has no residual action authority.  Keep
+                # sensor noise in the policy observation, but do not corrupt
+                # the contact-critical LQR phase/length state machine with an
+                # unobservable disturbance it cannot reject.
+                mujoco.mj_forward(self.model, self.data)
+                lqr_control = self._controller.command(self.data)
+                true_qpos = true_qvel = None
+            else:
+                true_qpos, true_qvel = self._prepare_noisy_controller_measurement()
+                lqr_control = self._controller.command(self.data)
             current_jump_phase = self._controller.jump.phase_name
             residual_action = (
                 np.zeros(self.model.nu, dtype=np.float64)
-                if was_jump_active
+                if lqr_owns_control
                 else action_array[: self.model.nu]
             )
             requested_control = np.clip(
@@ -1269,10 +1523,11 @@ class WheelLegResidualEnv(gym.Env):
                 self._control_low,
                 self._control_high,
             )
-            self._restore_true_controller_state(true_qpos, true_qvel)
+            if true_qpos is not None and true_qvel is not None:
+                self._restore_true_controller_state(true_qpos, true_qvel)
             control = self._apply_control_delay(
                 requested_control,
-                bypass=current_jump_phase in ("thrust", "flight"),
+                bypass=lqr_owns_control or current_jump_phase is not None,
             )
             self.data.ctrl[:] = control
             mujoco.mj_step(self.model, self.data)
@@ -1280,17 +1535,23 @@ class WheelLegResidualEnv(gym.Env):
             self._last_requested_control[:] = requested_control
             self._last_control[:] = control
             self._record_jump_transition(was_jump_active)
-            safety_reason = self._safety_reason()
             self._update_jump_peak_height()
+            self._update_jump_landing_guard()
+            safety_reason = self._safety_reason()
             self._record_jump_landing_guard(safety_reason)
             if safety_reason is not None:
                 break
 
         terminated = safety_reason is not None
         truncated = bool(self.data.time >= self.episode_seconds and not terminated)
-        self._previous_action[:] = action_array
-        reward = self._reward(self._last_control, action_array, terminated)
+        self._previous_action[:] = action_array if policy_action_applied else 0.0
+        # Missing the height target after an otherwise stable touchdown is a
+        # task failure, not a physical fall.  It receives the explicit abort
+        # cost but not the separate unsafe-state penalty.
+        physical_unsafe = terminated and safety_reason != "jump_aborted_jump_height_target_not_reached"
+        reward = self._reward(self._last_control, action_array, physical_unsafe)
         info = self._info(safety_reason)
+        info["policy_action_applied"] = policy_action_applied
         self._apply_sensor_noise_to_data()
         observation = self._observation()
         return observation, reward, terminated, truncated, info
@@ -1300,13 +1561,20 @@ class WheelLegResidualEnv(gym.Env):
             return None
         if self._renderer is None:
             self._renderer = mujoco.Renderer(self.model, height=480, width=640)
-        self._renderer.update_scene(self.data)
+            self._render_camera = mujoco.MjvCamera()
+            self._render_camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            self._render_camera.trackbodyid = self.refs.robot_body
+            self._render_camera.distance = 3.2
+            self._render_camera.azimuth = 135.0
+            self._render_camera.elevation = -20.0
+        self._renderer.update_scene(self.data, camera=self._render_camera)
         return self._renderer.render()
 
     def close(self) -> None:
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
+        self._render_camera = None
 
 
 def main() -> None:

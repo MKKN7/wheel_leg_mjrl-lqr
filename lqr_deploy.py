@@ -84,25 +84,65 @@ JUMP_CROUCH_LENGTH_M = 0.205
 # compliant four-bar motion can overshoot the commanded extension under
 # randomized mass and actuator strength.
 JUMP_THRUST_LENGTH_M = 0.385
-JUMP_LANDING_LENGTH_M = 0.280
 JUMP_PREPARE_RATE_MPS = 0.12
 JUMP_CROUCH_RATE_MPS = 0.15
-# Build upward impulse before liftoff, then keep the legs extended long enough
-# to preserve clearance and reduce asymmetric collapse during landing.
-JUMP_THRUST_RATE_MPS = 1.00
-JUMP_LANDING_RATE_MPS = 0.08
+# The jump profile is deliberately bounded by the physical motor limits in the
+# MJCF.  The flight phase folds both legs to raise the wheel bottoms, then
+# preloads them before contact so touchdown does not drive a link below its
+# hard length limit.
+JUMP_THRUST_RATE_MPS = 1.35
+JUMP_FLIGHT_RETRACT_LENGTH_M = 0.205
+JUMP_FLIGHT_RETRACT_RATE_MPS = 2.00
+JUMP_FLIGHT_RETRACT_STEPS = 150
+JUMP_FLIGHT_RETRACT_FORCE_LIMIT_N = 170.0
+JUMP_FLIGHT_PRELOAD_LENGTH_M = JUMP_THRUST_LENGTH_M
+JUMP_FLIGHT_PRELOAD_RATE_MPS = 0.50
+JUMP_FLIGHT_PRELOAD_FORCE_LIMIT_N = 90.0
+JUMP_LANDING_LENGTH_M = 0.285
+JUMP_LANDING_RATE_MPS = 0.40
+JUMP_LANDING_FORCE_LIMIT_N = 80.0
+JUMP_LANDING_STANCE_GUARD_SCALE = 0.30
 JUMP_PREPARE_TIMEOUT_S = 3.0
 JUMP_CROUCH_TIMEOUT_S = 3.0
 JUMP_THRUST_TIMEOUT_S = 0.60
 JUMP_FLIGHT_TIMEOUT_S = 1.20
 JUMP_LANDING_TIMEOUT_S = 2.0
 JUMP_LENGTH_TOLERANCE_M = 0.012
-JUMP_SETTLE_STEPS = 30
+JUMP_SETTLE_STEPS = 100
 JUMP_LIFTOFF_STEPS = 3
-JUMP_THRUST_FORCE_LIMIT_N = 190.0
-AIRBORNE_HIP_KP_NM_PER_RAD = 16.0
-AIRBORNE_HIP_KD_NM_PER_RAD_PER_S = 1.8
+JUMP_THRUST_FORCE_LIMIT_N = 240.0
+AIRBORNE_HIP_KP_NM_PER_RAD = 20.0
+AIRBORNE_HIP_KD_NM_PER_RAD_PER_S = 4.0
+AIRBORNE_WHEEL_ATTITUDE_KP_NM_PER_RAD = 6.0
+AIRBORNE_WHEEL_ATTITUDE_KD_NM_PER_RAD_S = 0.48
 WORLD_UP = np.array((0.0, 0.0, 1.0))
+
+
+def jump_controller_config() -> dict[str, float | int]:
+    """Return every trajectory parameter that changes jump behavior."""
+    return {
+        "jump_prepare_length_m": JUMP_PREPARE_LENGTH_M,
+        "jump_crouch_length_m": JUMP_CROUCH_LENGTH_M,
+        "jump_thrust_length_m": JUMP_THRUST_LENGTH_M,
+        "jump_thrust_rate_mps": JUMP_THRUST_RATE_MPS,
+        "jump_thrust_force_limit_n": JUMP_THRUST_FORCE_LIMIT_N,
+        "jump_flight_retract_length_m": JUMP_FLIGHT_RETRACT_LENGTH_M,
+        "jump_flight_retract_rate_mps": JUMP_FLIGHT_RETRACT_RATE_MPS,
+        "jump_flight_retract_steps": JUMP_FLIGHT_RETRACT_STEPS,
+        "jump_flight_retract_force_limit_n": JUMP_FLIGHT_RETRACT_FORCE_LIMIT_N,
+        "jump_flight_preload_length_m": JUMP_FLIGHT_PRELOAD_LENGTH_M,
+        "jump_flight_preload_rate_mps": JUMP_FLIGHT_PRELOAD_RATE_MPS,
+        "jump_flight_preload_force_limit_n": JUMP_FLIGHT_PRELOAD_FORCE_LIMIT_N,
+        "jump_landing_length_m": JUMP_LANDING_LENGTH_M,
+        "jump_landing_rate_mps": JUMP_LANDING_RATE_MPS,
+        "jump_landing_force_limit_n": JUMP_LANDING_FORCE_LIMIT_N,
+        "jump_landing_stance_guard_scale": JUMP_LANDING_STANCE_GUARD_SCALE,
+        "jump_settle_steps": JUMP_SETTLE_STEPS,
+        "airborne_hip_kp_nm_per_rad": AIRBORNE_HIP_KP_NM_PER_RAD,
+        "airborne_hip_kd_nm_per_rad_per_s": AIRBORNE_HIP_KD_NM_PER_RAD_PER_S,
+        "airborne_wheel_attitude_kp_nm_per_rad": AIRBORNE_WHEEL_ATTITUDE_KP_NM_PER_RAD,
+        "airborne_wheel_attitude_kd_nm_per_rad_s": AIRBORNE_WHEEL_ATTITUDE_KD_NM_PER_RAD_S,
+    }
 
 
 def wrap_to_pi(angle: float) -> float:
@@ -168,6 +208,7 @@ class ModelRefs:
     root_joint: int
     robot_body: int
     ground_geom: int
+    ground_geoms: tuple[int, ...]
     wheel_geoms: tuple[int, int]
     base_geoms: tuple[int, int]
     linkage_collision_geoms: tuple[int, ...]
@@ -266,6 +307,7 @@ class JumpSequence:
     phase_start_time: float | None = None
     resume_length: float | None = None
     airborne_steps: int = 0
+    flight_steps: int = 0
     settled_steps: int = 0
     abort_reason: str = ""
 
@@ -278,6 +320,7 @@ class JumpSequence:
         self.phase_start_time = sim_time
         self.resume_length = resume_length
         self.airborne_steps = 0
+        self.flight_steps = 0
         self.settled_steps = 0
         self.abort_reason = ""
 
@@ -285,6 +328,7 @@ class JumpSequence:
         self.phase_name = phase_name
         self.phase_start_time = sim_time
         self.airborne_steps = 0
+        self.flight_steps = 0
         self.settled_steps = 0
 
     def elapsed(self, sim_time: float) -> float:
@@ -296,6 +340,7 @@ class JumpSequence:
         self.phase_name = None
         self.phase_start_time = None
         self.airborne_steps = 0
+        self.flight_steps = 0
         self.settled_steps = 0
 
 
@@ -406,10 +451,19 @@ def build_refs(model: mujoco.MjModel) -> ModelRefs:
         "left_hip_motor", "left_active_hip_motor", "left_wheel_motor",
         "right_hip_motor", "right_active_hip_motor", "right_wheel_motor",
     )
+    ground_geom = object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "ground")
+    ground_geoms = [ground_geom]
+    # ``ground`` remains the mandatory flat LQR trim surface.  Terrain scenes
+    # can declare one of these optional support geoms for the rest of the map.
+    for terrain_name in ("terrain", "rmuc_terrain"):
+        terrain_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, terrain_name)
+        if terrain_geom >= 0:
+            ground_geoms.append(int(terrain_geom))
     return ModelRefs(
         root_joint=object_id(model, mujoco.mjtObj.mjOBJ_JOINT, "robot_free"),
         robot_body=object_id(model, mujoco.mjtObj.mjOBJ_BODY, "robot"),
-        ground_geom=object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "ground"),
+        ground_geom=ground_geom,
+        ground_geoms=tuple(ground_geoms),
         wheel_geoms=(
             object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "left_wheel_contact"),
             object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "right_wheel_contact"),
@@ -470,10 +524,10 @@ def contacts_for_geom(data: mujoco.MjData, geom_id: int) -> int:
 
 
 def wheel_ground_contacts(data: mujoco.MjData, refs: ModelRefs, wheel_geom: int) -> int:
-    """Count only physical support contacts between one wheel and the ground."""
+    """Count physical support contacts between one wheel and any declared ground geom."""
     return sum(
-        (contact.geom1 == refs.ground_geom and contact.geom2 == wheel_geom)
-        or (contact.geom2 == refs.ground_geom and contact.geom1 == wheel_geom)
+        (contact.geom1 in refs.ground_geoms and contact.geom2 == wheel_geom)
+        or (contact.geom2 in refs.ground_geoms and contact.geom1 == wheel_geom)
         for contact in data.contact[: data.ncon]
     )
 
@@ -660,6 +714,7 @@ class PhysicalLqr:
         lower = max(WALK_LEG_LENGTH_MIN_M, self.leg_profile.minimum_length)
         upper = min(WALK_LEG_LENGTH_MAX_M, self.leg_profile.maximum_length)
         if jump:
+            lower = max(JUMP_CROUCH_LENGTH_M, self.leg_profile.minimum_length)
             upper = min(JUMP_THRUST_LENGTH_M, self.leg_profile.maximum_length)
         return float(lower), float(upper)
 
@@ -788,7 +843,13 @@ class PhysicalLqr:
             return JUMP_CROUCH_RATE_MPS
         if phase == "thrust":
             return JUMP_THRUST_RATE_MPS
-        if phase in ("flight", "landing"):
+        if phase == "flight":
+            return (
+                JUMP_FLIGHT_RETRACT_RATE_MPS
+                if self.jump.flight_steps < JUMP_FLIGHT_RETRACT_STEPS
+                else JUMP_FLIGHT_PRELOAD_RATE_MPS
+            )
+        if phase == "landing":
             return JUMP_LANDING_RATE_MPS
         return WALK_LEG_LENGTH_RATE_MPS
 
@@ -829,14 +890,21 @@ class PhysicalLqr:
             self.jump.airborne_steps = self.jump.airborne_steps + 1 if not grounded else 0
             if self.jump.airborne_steps >= JUMP_LIFTOFF_STEPS:
                 self.jump.transition("flight", sim_time)
-                self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
+                self.set_target_leg_length(JUMP_FLIGHT_RETRACT_LENGTH_M, jump=True)
                 print(f"Jump liftoff: t={sim_time:.3f}s")
             elif self.jump.elapsed(sim_time) > JUMP_THRUST_TIMEOUT_S:
                 self._abort_jump(data, "thrust timeout without liftoff")
         elif phase == "flight":
-            self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
+            self.jump.flight_steps += 1
+            target_length = (
+                JUMP_FLIGHT_RETRACT_LENGTH_M
+                if self.jump.flight_steps < JUMP_FLIGHT_RETRACT_STEPS
+                else JUMP_FLIGHT_PRELOAD_LENGTH_M
+            )
+            self.set_target_leg_length(target_length, jump=True)
             if grounded:
                 self.jump.transition("landing", sim_time)
+                self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
             elif self.jump.elapsed(sim_time) > JUMP_FLIGHT_TIMEOUT_S:
                 self._abort_jump(data, "flight timeout")
         elif phase == "landing":
@@ -1109,6 +1177,39 @@ class PhysicalLqr:
         command[self.refs.actuator_ids[2]] = 0.0
         command[self.refs.actuator_ids[5]] = 0.0
 
+    def airborne_attitude_error(self, data: mujoco.MjData) -> np.ndarray:
+        """Return body attitude error relative to the yaw-aligned trim frame."""
+        reference_qpos, _ = self.reference_state(data)
+        position_error = np.zeros(self.model.nv)
+        mujoco.mj_differentiatePos(self.model, position_error, 1.0, reference_qpos, data.qpos)
+        return position_error[self.root_dof + 3 : self.root_dof + 6]
+
+    def apply_airborne_wheel_attitude_control(self, data: mujoco.MjData, command: np.ndarray) -> None:
+        """Use bounded common wheel torque as a reaction wheel while airborne."""
+        attitude_error = self.airborne_attitude_error(data)
+        pitch_rate = float(data.qvel[self.root_dof + 3])
+        wheel_torque = float(np.clip(
+            AIRBORNE_WHEEL_ATTITUDE_KP_NM_PER_RAD * attitude_error[0]
+            + AIRBORNE_WHEEL_ATTITUDE_KD_NM_PER_RAD_S * pitch_rate,
+            self.model.actuator_ctrlrange[self.refs.actuator_ids[2], 0],
+            self.model.actuator_ctrlrange[self.refs.actuator_ids[2], 1],
+        ))
+        command[self.refs.actuator_ids[2]] = wheel_torque
+        command[self.refs.actuator_ids[5]] = wheel_torque
+
+    def _jump_leg_force_limit(self, phase: str | None) -> float:
+        if phase == "thrust":
+            return JUMP_THRUST_FORCE_LIMIT_N
+        if phase == "flight":
+            return (
+                JUMP_FLIGHT_RETRACT_FORCE_LIMIT_N
+                if self.jump.flight_steps < JUMP_FLIGHT_RETRACT_STEPS
+                else JUMP_FLIGHT_PRELOAD_FORCE_LIMIT_N
+            )
+        if phase == "landing":
+            return JUMP_LANDING_FORCE_LIMIT_N
+        return LEG_LENGTH_FORCE_LIMIT_N
+
     def command(self, data: mujoco.MjData) -> np.ndarray:
         self.apply_gas_spring_assist(data)
         self._advance_motion_reference(data)
@@ -1118,15 +1219,25 @@ class PhysicalLqr:
         if phase == "flight":
             command = np.zeros(self.model.nu)
             self.apply_airborne_recovery(data, command)
+            self.apply_leg_length_force(data, command, self._jump_leg_force_limit(phase))
+            self.apply_airborne_wheel_attitude_control(data, command)
             return np.clip(command, self.model.actuator_ctrlrange[:, 0], self.model.actuator_ctrlrange[:, 1])
 
         reference_control, reference_gain = self._scheduled_control_and_gain()
         command = reference_control - reference_gain @ self.state_error(data)
-        self.apply_walking_stance_guard(data, command)
+        if phase == "landing":
+            position_error = self._reference_hip_qpos - data.qpos[self.hip_qpos_addresses]
+            velocity_error = -data.qvel[self.hip_dof_addresses]
+            command[list(self.hip_actuator_ids)] += JUMP_LANDING_STANCE_GUARD_SCALE * (
+                WALK_STANCE_GUARD_KP_NM_PER_RAD * position_error
+                + WALK_STANCE_GUARD_KD_NM_PER_RAD_PER_S * velocity_error
+            )
+        else:
+            self.apply_walking_stance_guard(data, command)
         self.apply_leg_length_force(
             data,
             command,
-            JUMP_THRUST_FORCE_LIMIT_N if phase == "thrust" else LEG_LENGTH_FORCE_LIMIT_N,
+            self._jump_leg_force_limit(phase),
         )
         if phase is None:
             self.apply_wheel_speed_governor(data, command)
@@ -1140,11 +1251,12 @@ class PhysicalLqr:
 def validate_standing_contact(data: mujoco.MjData, refs: ModelRefs) -> None:
     wheel_contacts = tuple(wheel_ground_contacts(data, refs, geom_id) for geom_id in refs.wheel_geoms)
     protected_contacts = sum(contacts_for_geom(data, geom_id) for geom_id in refs.base_geoms)
+    support_geoms = set(refs.ground_geoms)
     nonwheel_ground_contacts = 0
     for contact in data.contact[: data.ncon]:
-        if contact.geom1 == refs.ground_geom:
+        if contact.geom1 in support_geoms:
             nonwheel_ground_contacts += contact.geom2 not in refs.wheel_geoms
-        elif contact.geom2 == refs.ground_geom:
+        elif contact.geom2 in support_geoms:
             nonwheel_ground_contacts += contact.geom1 not in refs.wheel_geoms
     if not all(wheel_contacts) or protected_contacts or nonwheel_ground_contacts:
         raise RuntimeError(
@@ -1200,10 +1312,11 @@ def validate_leg_length_state(data: mujoco.MjData, refs: ModelRefs) -> None:
 def validate_jump_contacts(data: mujoco.MjData, refs: ModelRefs) -> None:
     """Allow wheel liftoff during a jump, but reject unsafe body/leg impacts."""
     protected_contacts = sum(contacts_for_geom(data, geom_id) for geom_id in refs.base_geoms)
+    support_geoms = set(refs.ground_geoms)
     for contact in data.contact[: data.ncon]:
-        if contact.geom1 == refs.ground_geom:
+        if contact.geom1 in support_geoms:
             nonwheel_ground_contact = contact.geom2 not in refs.wheel_geoms
-        elif contact.geom2 == refs.ground_geom:
+        elif contact.geom2 in support_geoms:
             nonwheel_ground_contact = contact.geom1 not in refs.wheel_geoms
         else:
             continue

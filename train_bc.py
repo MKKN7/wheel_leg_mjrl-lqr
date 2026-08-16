@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--xml-path",
+        type=Path,
+        help="MJCF scene to train in; defaults to wheeled_infantry.xml.",
+    )
+    parser.add_argument(
         "--max-speed",
         type=float,
         default=None,
@@ -93,7 +98,12 @@ def parse_args() -> argparse.Namespace:
         default="residual",
         help="Only residual targets are valid for WheelLegResidualEnv.",
     )
-    parser.add_argument("--output", type=Path, default=Path("artifacts") / "bc_residual.pt")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("artifacts") / "bc_jump_clearance.pt",
+        help="BC checkpoint path for the current high-jump residual interface.",
+    )
     parser.add_argument("--smoke", action="store_true", help="Collect a small dataset and run one optimization epoch.")
     args = parser.parse_args()
     if args.max_speed is not None:
@@ -101,6 +111,10 @@ def parse_args() -> argparse.Namespace:
             args.max_speed = lqr.validate_forward_speed_limit(args.max_speed)
         except ValueError as error:
             parser.error(str(error))
+    if args.xml_path is not None:
+        args.xml_path = args.xml_path.resolve()
+        if not args.xml_path.is_file():
+            parser.error(f"--xml-path does not exist: {args.xml_path}")
     if not 0.0 <= args.yaw_range_deg <= 180.0:
         parser.error("--yaw-range-deg must be within 0..180")
     if not 0.0 <= args.jump_probability <= 1.0:
@@ -179,7 +193,7 @@ def save_policy(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "format_version": 3,
+            "format_version": 5,
             "algorithm": "behavior_cloning",
             "target_kind": target_kind,
             "observation_size": observation_size,
@@ -197,9 +211,10 @@ def main() -> None:
         args.samples = min(args.samples, 32)
         args.epochs = 1
         args.batch_size = min(args.batch_size, args.samples)
-        args.output = Path("artifacts") / f"bc_{args.target}_smoke.pt"
+        args.output = Path("artifacts") / f"bc_jump_clearance_{args.target}_smoke.pt"
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    xml_path = (lqr.XML_PATH if args.xml_path is None else args.xml_path).resolve()
     task_config = {
         "max_speed_mps": float(
             args.max_speed if args.max_speed is not None else lqr.DEFAULT_FORWARD_SPEED_LIMIT_MPS
@@ -210,13 +225,18 @@ def main() -> None:
         "environment_config": {
             "episode_seconds": float(DEFAULT_EPISODE_SECONDS),
             "control_decimation": int(environment_definition.DEFAULT_CONTROL_DECIMATION),
-            "mjcf_sha256": hashlib.sha256(lqr.XML_PATH.read_bytes()).hexdigest(),
-            "jump_thrust_length_m": float(lqr.JUMP_THRUST_LENGTH_M),
-            "jump_thrust_rate_mps": float(lqr.JUMP_THRUST_RATE_MPS),
+            "mjcf_sha256": hashlib.sha256(xml_path.read_bytes()).hexdigest(),
+            "lqr_source_sha256": hashlib.sha256(Path(lqr.__file__).read_bytes()).hexdigest(),
+            "jump_controller": lqr.jump_controller_config(),
             "domain_randomization": (
                 DomainRandomizationConfig.training_defaults().as_dict()
                 if args.domain_randomization
                 else DomainRandomizationConfig.disabled().as_dict()
+            ),
+            "jump_domain_randomization": (
+                DomainRandomizationConfig.jump_training_defaults().as_dict()
+                if args.domain_randomization and args.jump_probability > 0.0
+                else None
             ),
         },
         "domain_randomization": (
@@ -224,8 +244,14 @@ def main() -> None:
             if args.domain_randomization
             else DomainRandomizationConfig.disabled().as_dict()
         ),
+        "jump_domain_randomization": (
+            DomainRandomizationConfig.jump_training_defaults().as_dict()
+            if args.domain_randomization and args.jump_probability > 0.0
+            else None
+        ),
     }
     environment = WheelLegResidualEnv(
+        xml_path=args.xml_path,
         max_forward_speed=getattr(args, "max_speed", None),
         max_command_yaw_delta_rad=np.deg2rad(args.yaw_range_deg),
         jump_probability=args.jump_probability,
@@ -234,6 +260,11 @@ def main() -> None:
             DomainRandomizationConfig.training_defaults()
             if args.domain_randomization
             else DomainRandomizationConfig.disabled()
+        ),
+        jump_domain_randomization=(
+            DomainRandomizationConfig.jump_training_defaults()
+            if args.domain_randomization and args.jump_probability > 0.0
+            else None
         ),
     )
     try:
