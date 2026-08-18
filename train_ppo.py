@@ -25,10 +25,15 @@ from torch.distributions import Normal
 import env as environment_definition
 from env import DEFAULT_EPISODE_SECONDS, DomainRandomizationConfig, WheelLegResidualEnv
 import lqr_deploy as lqr
+from terrain_curriculum import (
+    TerrainCurriculumConfig,
+    TerrainCurriculumError,
+    load_terrain_curriculum,
+)
 
 
-CHECKPOINT_FORMAT_VERSION = 5
-REWARD_SCHEMA = "ground_tracking_jump_clearance_landing_v5"
+CHECKPOINT_FORMAT_VERSION = 12
+REWARD_SCHEMA = "command_tracking_jump_clearance_terrain_safe_terminal_v12"
 
 
 @dataclass
@@ -92,18 +97,20 @@ class ActorCritic(nn.Module):
         latent_actions = 0.5 * (torch.log1p(bounded_actions) - torch.log1p(-bounded_actions))
         distribution = self._distribution(observations)
         log_probability = self._squashed_log_probability(distribution, latent_actions, bounded_actions)
-        entropy = distribution.entropy().sum(dim=-1)
+        entropy = distribution.entropy()
         value = self.critic(observations).squeeze(-1)
         return log_probability, entropy, value
 
     @staticmethod
     def _squashed_log_probability(distribution: Normal, latent: Tensor, action: Tensor) -> Tensor:
         correction = torch.log(1.0 - action.square() + 1e-6)
-        return (distribution.log_prob(latent) - correction).sum(dim=-1)
+        return distribution.log_prob(latent) - correction
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a PyTorch PPO residual policy for the wheeled-leg robot.")
+    parser = argparse.ArgumentParser(
+        description="Train a command-conditioned PPO residual locomotion controller for the wheeled-leg robot."
+    )
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--epochs", type=int, default=10)
@@ -120,7 +127,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--xml-path",
         type=Path,
-        help="MJCF scene to train in; defaults to wheeled_infantry.xml.",
+        help=(
+            "MJCF scene to train in; defaults to wheeled_infantry.xml, or "
+            "rm_train_ground.xml when --terrain-curriculum is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--terrain-curriculum",
+        type=Path,
+        help=(
+            "Strict RMUC terrain curriculum YAML. When supplied, --terrain-stage selects the "
+            "fixed non-navigating task stage used at environment reset."
+        ),
+    )
+    parser.add_argument(
+        "--terrain-stage",
+        help="Stage id from --terrain-curriculum; required when a terrain curriculum is selected.",
     )
     parser.add_argument(
         "--max-speed",
@@ -132,10 +154,40 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--command-speed-limit",
+        type=float,
+        default=None,
+        help=(
+            "Maximum magnitude sampled for high-level speed commands. Defaults to --max-speed; "
+            "use a lower value for an RMUC locomotion curriculum."
+        ),
+    )
+    parser.add_argument(
+        "--command-speed-fraction",
+        type=float,
+        default=environment_definition.RL_COMMAND_SPEED_FRACTION,
+        help=(
+            "Fraction of --command-speed-limit used by randomly sampled high-level commands "
+            f"(0..1, default {environment_definition.RL_COMMAND_SPEED_FRACTION:g})."
+        ),
+    )
+    parser.add_argument(
+        "--command-resample-seconds",
+        type=float,
+        default=0.75,
+        help="Seconds between sampled high-level speed/yaw-rate commands; 0 holds one command per episode.",
+    )
+    parser.add_argument(
         "--yaw-range-deg",
         type=float,
-        default=45.0,
-        help="Sample turn commands uniformly within +/- this yaw delta in degrees.",
+        default=0.0,
+        help="Optional initial heading offset range in degrees; yaw-rate commands drive normal turn training.",
+    )
+    parser.add_argument(
+        "--max-yaw-rate",
+        type=float,
+        default=lqr.MAX_YAW_RATE_RAD_S,
+        help=f"Maximum absolute high-level yaw-rate command in rad/s (0..{lqr.MAX_YAW_RATE_RAD_S:.2f}).",
     )
     parser.add_argument(
         "--jump-probability",
@@ -163,10 +215,15 @@ def parse_args() -> argparse.Namespace:
         help="Disable dynamics/random-sensor randomization for a nominal-model run.",
     )
     parser.add_argument(
+        "--vehicle-only-domain-randomization",
+        action="store_true",
+        help="Keep terrain geometry and friction fixed while randomizing robot dynamics, sensing and delay.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
-        default=Path("artifacts") / "ppo_jump_clearance.pt",
-        help="Latest PPO checkpoint path; the high-jump default preserves prior residual checkpoints.",
+        default=Path("artifacts") / "ppo_locomotion_controller.pt",
+        help="Latest checkpoint for the high-level-command residual locomotion controller.",
     )
     parser.add_argument(
         "--checkpoint-interval",
@@ -192,6 +249,15 @@ def parse_args() -> argparse.Namespace:
             "not additional steps."
         ),
     )
+    parser.add_argument(
+        "--resume-stage-transfer",
+        action="store_true",
+        help=(
+            "Permit an explicit resume from an earlier stage of the same RMUC curriculum YAML. "
+            "MJCF, LQR, reward, command, action-authority, and domain-randomization fingerprints "
+            "remain strict."
+        ),
+    )
     parser.add_argument("--smoke", action="store_true", help="Run one short PPO update for dependency verification.")
     args = parser.parse_args()
     if args.max_speed is not None:
@@ -199,20 +265,45 @@ def parse_args() -> argparse.Namespace:
             args.max_speed = lqr.validate_forward_speed_limit(args.max_speed)
         except ValueError as error:
             parser.error(str(error))
+    physical_speed_limit = float(
+        args.max_speed if args.max_speed is not None else lqr.DEFAULT_FORWARD_SPEED_LIMIT_MPS
+    )
+    if args.command_speed_limit is not None:
+        if (
+            not np.isfinite(args.command_speed_limit)
+            or args.command_speed_limit <= 0.0
+            or args.command_speed_limit > physical_speed_limit
+        ):
+            parser.error(
+                "--command-speed-limit must be positive and no greater than the selected physical --max-speed"
+            )
+    if not np.isfinite(args.command_speed_fraction) or not 0.0 < args.command_speed_fraction <= 1.0:
+        parser.error("--command-speed-fraction must be within (0, 1]")
+    if not np.isfinite(args.command_resample_seconds) or args.command_resample_seconds < 0.0:
+        parser.error("--command-resample-seconds must be finite and non-negative")
     if args.xml_path is not None:
         args.xml_path = args.xml_path.resolve()
         if not args.xml_path.is_file():
             parser.error(f"--xml-path does not exist: {args.xml_path}")
     if not 0.0 <= args.yaw_range_deg <= 180.0:
         parser.error("--yaw-range-deg must be within 0..180")
+    if not 0.0 <= args.max_yaw_rate <= lqr.MAX_YAW_RATE_RAD_S:
+        parser.error(f"--max-yaw-rate must be within 0..{lqr.MAX_YAW_RATE_RAD_S:.3f}")
     if not 0.0 <= args.jump_probability <= 1.0:
         parser.error("--jump-probability must be within 0..1")
     if not 0.0 <= args.jump_at < DEFAULT_EPISODE_SECONDS:
         parser.error(f"--jump-at must be within 0..{DEFAULT_EPISODE_SECONDS:g} seconds")
     if args.checkpoint_interval < 1:
         parser.error("--checkpoint-interval must be positive")
+    if args.vehicle_only_domain_randomization and not args.domain_randomization:
+        parser.error("--vehicle-only-domain-randomization requires --domain-randomization")
     if args.bc_checkpoint is not None and args.resume_checkpoint is not None:
         parser.error("--bc-checkpoint and --resume-checkpoint cannot be used together")
+    resolve_terrain_curriculum_args(args, parser)
+    if args.resume_stage_transfer and args.resume_checkpoint is None:
+        parser.error("--resume-stage-transfer requires --resume-checkpoint")
+    if args.resume_stage_transfer and args.terrain_curriculum_config is None:
+        parser.error("--resume-stage-transfer requires --terrain-curriculum and --terrain-stage")
     return args
 
 
@@ -234,7 +325,9 @@ def collect_rollout(
     action_size = environment.action_space.shape[0]
     observations = torch.empty((rollout_steps, observation_size), dtype=torch.float32, device=device)
     actions = torch.empty((rollout_steps, action_size), dtype=torch.float32, device=device)
-    policy_action_masks = torch.empty(rollout_steps, dtype=torch.float32, device=device)
+    policy_action_masks = torch.empty(
+        (rollout_steps, action_size), dtype=torch.float32, device=device
+    )
     log_probabilities = torch.empty(rollout_steps, dtype=torch.float32, device=device)
     rewards = torch.empty(rollout_steps, dtype=torch.float32, device=device)
     values = torch.empty(rollout_steps, dtype=torch.float32, device=device)
@@ -246,16 +339,33 @@ def collect_rollout(
     for index in range(rollout_steps):
         observation_tensor = tensor_from_observation(observation, device)
         with torch.no_grad():
-            action_tensor, log_probability_tensor, value_tensor = policy.sample_action(observation_tensor)
+            action_tensor, _, value_tensor = policy.sample_action(observation_tensor)
         action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
         next_observation, reward, terminated, truncated, info = environment.step(action)
         done = terminated or truncated
         with torch.no_grad():
             next_value_tensor = policy.critic(tensor_from_observation(next_observation, device)).squeeze()
+        action_mask = np.asarray(
+            info.get("policy_action_mask", np.ones(action_size, dtype=np.float32)),
+            dtype=np.float32,
+        )
+        if action_mask.shape != (action_size,):
+            raise RuntimeError(
+                "environment returned invalid policy_action_mask shape "
+                f"{action_mask.shape}; expected ({action_size},)"
+            )
+        if not np.all(np.isfinite(action_mask)) or np.any((action_mask < 0.0) | (action_mask > 1.0)):
+            raise RuntimeError("environment returned an invalid policy_action_mask")
+        action_mask_tensor = torch.as_tensor(action_mask, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            log_probability_dimensions, _, _ = policy.evaluate_actions(
+                observation_tensor, action_tensor
+            )
+            log_probability_tensor = (log_probability_dimensions * action_mask_tensor).sum(dim=-1)
 
         observations[index] = observation_tensor.squeeze(0)
         actions[index] = action_tensor.squeeze(0)
-        policy_action_masks[index] = 1.0 if bool(info.get("policy_action_applied", True)) else 0.0
+        policy_action_masks[index] = action_mask_tensor
         log_probabilities[index] = log_probability_tensor.squeeze(0)
         rewards[index] = float(reward)
         values[index] = value_tensor.squeeze(0)
@@ -312,8 +422,13 @@ def update_policy(
     entropy_coefficient: float,
     max_gradient_norm: float,
 ) -> dict[str, float]:
-    advantages = rollout.advantages
-    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    advantages = torch.zeros_like(rollout.advantages)
+    active_samples = rollout.policy_action_masks.any(dim=-1)
+    if bool(active_samples.any()):
+        active_advantages = rollout.advantages[active_samples]
+        advantages[active_samples] = (
+            active_advantages - active_advantages.mean()
+        ) / (active_advantages.std(unbiased=False) + 1e-8)
     batch_size = rollout.observations.shape[0]
     policy_losses: list[float] = []
     value_losses: list[float] = []
@@ -323,22 +438,25 @@ def update_policy(
         indices = torch.randperm(batch_size, device=rollout.observations.device)
         for start in range(0, batch_size, minibatch_size):
             batch_indices = indices[start : start + minibatch_size]
-            new_log_probabilities, entropy, predicted_values = policy.evaluate_actions(
+            log_probability_dimensions, entropy_dimensions, predicted_values = policy.evaluate_actions(
                 rollout.observations[batch_indices], rollout.actions[batch_indices]
             )
+            action_mask = rollout.policy_action_masks[batch_indices]
+            new_log_probabilities = (log_probability_dimensions * action_mask).sum(dim=-1)
             ratio = torch.exp(new_log_probabilities - rollout.log_probabilities[batch_indices])
             unclipped_objective = ratio * advantages[batch_indices]
             clipped_objective = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages[batch_indices]
-            action_mask = rollout.policy_action_masks[batch_indices]
-            active_count = action_mask.sum()
-            if active_count.item() > 0.0:
-                policy_loss = -(
-                    torch.minimum(unclipped_objective, clipped_objective) * action_mask
-                ).sum() / active_count
-                entropy_bonus = (entropy * action_mask).sum() / active_count
+            active_samples = action_mask.any(dim=-1)
+            if bool(active_samples.any()):
+                policy_loss = -torch.minimum(
+                    unclipped_objective[active_samples], clipped_objective[active_samples]
+                ).mean()
+                entropy_bonus = (
+                    entropy_dimensions * action_mask
+                ).sum() / action_mask.sum().clamp_min(1.0)
             else:
                 policy_loss = (new_log_probabilities * 0.0).sum()
-                entropy_bonus = (entropy * 0.0).sum()
+                entropy_bonus = (entropy_dimensions * 0.0).sum()
             value_loss = torch.nn.functional.mse_loss(predicted_values, rollout.returns[batch_indices])
             loss = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy_bonus
 
@@ -362,25 +480,162 @@ def default_metrics_path(output: Path) -> Path:
     return output.with_name(f"{output.stem}_metrics.csv")
 
 
+def command_speed_limit_for_args(args: argparse.Namespace) -> float:
+    if args.command_speed_limit is not None:
+        return float(args.command_speed_limit)
+    if args.max_speed is not None:
+        return float(args.max_speed)
+    return float(lqr.DEFAULT_FORWARD_SPEED_LIMIT_MPS)
+
+
+def command_resample_seconds_for_args(args: argparse.Namespace) -> float | None:
+    return None if args.command_resample_seconds == 0.0 else float(args.command_resample_seconds)
+
+
+def resolve_terrain_curriculum_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Load and validate an optional fixed-stage RMUC curriculum before training starts."""
+    if args.terrain_curriculum is None:
+        if args.terrain_stage is not None:
+            parser.error("--terrain-stage requires --terrain-curriculum")
+        args.terrain_curriculum_config = None
+        args.terrain_stage_id = None
+        return
+
+    curriculum_path = args.terrain_curriculum.expanduser().resolve()
+    try:
+        curriculum = load_terrain_curriculum(curriculum_path)
+    except (FileNotFoundError, RuntimeError, TerrainCurriculumError) as error:
+        parser.error(str(error))
+    if args.terrain_stage is None:
+        parser.error("--terrain-curriculum requires --terrain-stage")
+    try:
+        stage = curriculum.stage(args.terrain_stage)
+    except KeyError:
+        parser.error(
+            f"unknown --terrain-stage {args.terrain_stage!r}; available stages: "
+            + ", ".join(item.stage_id for item in curriculum.stages)
+        )
+
+    physical_speed_limit = float(
+        args.max_speed if args.max_speed is not None else lqr.DEFAULT_FORWARD_SPEED_LIMIT_MPS
+    )
+    if curriculum.limits.max_forward_speed_mps > physical_speed_limit + 1e-9:
+        parser.error(
+            "terrain curriculum max_forward_speed_mps exceeds the selected physical --max-speed: "
+            f"{curriculum.limits.max_forward_speed_mps:.3f} > {physical_speed_limit:.3f}"
+        )
+    if curriculum.limits.max_yaw_rate_rad_s > float(args.max_yaw_rate) + 1e-9:
+        parser.error(
+            "terrain curriculum max_yaw_rate_rad_s exceeds --max-yaw-rate: "
+            f"{curriculum.limits.max_yaw_rate_rad_s:.3f} > {float(args.max_yaw_rate):.3f}"
+        )
+
+    command_speed_limit = command_speed_limit_for_args(args)
+    for task_id in stage.task_ids:
+        command = stage.command_for(curriculum.task(task_id))
+        if abs(command.forward_speed_mps) > command_speed_limit + 1e-9:
+            parser.error(
+                f"terrain stage {stage.stage_id!r} task {task_id!r} command speed "
+                f"{command.forward_speed_mps:.3f} exceeds --command-speed-limit "
+                f"{command_speed_limit:.3f}"
+            )
+
+    args.terrain_curriculum = curriculum_path
+    args.terrain_curriculum_config = curriculum
+    args.terrain_stage_id = stage.stage_id
+    if args.xml_path is None:
+        rmuc_xml_path = Path(__file__).with_name("rm_train_ground.xml")
+        if rmuc_xml_path.is_file():
+            # A terrain curriculum is explicitly an RMUC-scene training run;
+            # avoid silently falling back to the flat wheeled XML.
+            args.xml_path = rmuc_xml_path.resolve()
+
+
+def terrain_curriculum_metadata_for_args(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Stable curriculum identity embedded in PPO and BC compatibility metadata."""
+    curriculum = getattr(args, "terrain_curriculum_config", None)
+    stage_id = getattr(args, "terrain_stage_id", None)
+    if curriculum is None:
+        return None
+    if not isinstance(curriculum, TerrainCurriculumConfig) or not isinstance(stage_id, str):
+        raise ValueError("terrain curriculum arguments were not resolved before metadata generation")
+    curriculum_path = getattr(args, "terrain_curriculum", None)
+    if not isinstance(curriculum_path, Path):
+        raise ValueError("terrain curriculum path is unavailable")
+    stage = curriculum.stage(stage_id)
+    return {
+        "yaml_sha256": hashlib.sha256(curriculum_path.read_bytes()).hexdigest(),
+        "schema_version": int(curriculum.schema_version),
+        "stage_id": stage.stage_id,
+        "stage_task_ids": list(stage.task_ids),
+    }
+
+
+def episode_seconds_for_args(args: argparse.Namespace) -> float:
+    """Use the YAML horizon so slow fixed terrain tasks are not truncated at 8 s."""
+    curriculum = getattr(args, "terrain_curriculum_config", None)
+    stage_id = getattr(args, "terrain_stage_id", None)
+    if curriculum is None:
+        return float(DEFAULT_EPISODE_SECONDS)
+    if not isinstance(curriculum, TerrainCurriculumConfig) or not isinstance(stage_id, str):
+        raise ValueError("terrain curriculum arguments were not resolved before episode duration selection")
+    return max(float(DEFAULT_EPISODE_SECONDS), float(curriculum.stage_max_episode_seconds(stage_id)))
+
+
+def terrain_stage_uses_progress_jump(args: argparse.Namespace) -> bool:
+    """Whether a selected fixed terrain stage issues a future jump edge."""
+    curriculum = getattr(args, "terrain_curriculum_config", None)
+    stage_id = getattr(args, "terrain_stage_id", None)
+    if curriculum is None:
+        return False
+    if not isinstance(curriculum, TerrainCurriculumConfig) or not isinstance(stage_id, str):
+        raise ValueError("terrain curriculum arguments were not resolved before jump-profile selection")
+    return any(
+        curriculum.task(task_id).has_progress_jump_trigger
+        for task_id in curriculum.stage(stage_id).task_ids
+    )
+
+
+def domain_randomization_for_args(
+    args: argparse.Namespace,
+) -> tuple[DomainRandomizationConfig, DomainRandomizationConfig | None]:
+    if not args.domain_randomization:
+        return DomainRandomizationConfig.disabled(), None
+    if getattr(args, "terrain_curriculum_config", None) is not None:
+        # RMUC terrain geometry and support friction are fixed.  Randomize the
+        # vehicle with the staged profile; jump episodes still use the
+        # conservative landing profile selected by the environment.
+        walking = DomainRandomizationConfig.terrain_vehicle_only_defaults()
+        jumping = DomainRandomizationConfig.jump_vehicle_only_defaults()
+    elif args.vehicle_only_domain_randomization:
+        walking = DomainRandomizationConfig.vehicle_only_defaults()
+        jumping = DomainRandomizationConfig.jump_vehicle_only_defaults()
+    else:
+        walking = DomainRandomizationConfig.training_defaults()
+        jumping = DomainRandomizationConfig.jump_training_defaults()
+    return walking, jumping if (
+        args.jump_probability > 0.0 or terrain_stage_uses_progress_jump(args)
+    ) else None
+
+
 def task_config_for_args(args: argparse.Namespace) -> dict[str, Any]:
     xml_path = (lqr.XML_PATH if args.xml_path is None else args.xml_path).resolve()
-    domain_randomization = (
-        DomainRandomizationConfig.training_defaults()
-        if args.domain_randomization
-        else DomainRandomizationConfig.disabled()
-    )
-    jump_domain_randomization = (
-        DomainRandomizationConfig.jump_training_defaults()
-        if args.domain_randomization and args.jump_probability > 0.0
-        else None
-    )
+    domain_randomization, jump_domain_randomization = domain_randomization_for_args(args)
+    terrain_curriculum = terrain_curriculum_metadata_for_args(args)
     return {
         "max_speed_mps": float(
             args.max_speed if args.max_speed is not None else lqr.DEFAULT_FORWARD_SPEED_LIMIT_MPS
         ),
+        "command_speed_limit_mps": command_speed_limit_for_args(args),
+        "command_speed_fraction": float(args.command_speed_fraction),
+        "command_resample_seconds": float(args.command_resample_seconds),
         "yaw_range_deg": float(args.yaw_range_deg),
+        "max_yaw_rate_rad_s": float(args.max_yaw_rate),
         "jump_probability": float(args.jump_probability),
         "jump_at_s": float(args.jump_at),
+        "terrain_curriculum": terrain_curriculum,
+        "locomotion_command_schema": environment_definition.LOCOMOTION_COMMAND_SCHEMA,
+        "residual_authority_schema": environment_definition.RESIDUAL_AUTHORITY_SCHEMA,
         "domain_randomization": domain_randomization.as_dict(),
         "jump_domain_randomization": (
             None if jump_domain_randomization is None else jump_domain_randomization.as_dict()
@@ -405,17 +660,38 @@ def task_config_for_args(args: argparse.Namespace) -> dict[str, Any]:
             "jump_stable_angular_speed_rad_s": float(
                 environment_definition.JUMP_STABLE_ANGULAR_SPEED_RAD_S
             ),
+            "terrain_progress_reward_per_m": float(
+                environment_definition.TERRAIN_PROGRESS_REWARD_PER_M
+            ),
+            "terrain_completion_reward": float(environment_definition.TERRAIN_COMPLETION_REWARD),
+            "terrain_corridor_penalty_per_m": float(
+                environment_definition.TERRAIN_CORRIDOR_PENALTY_PER_M
+            ),
+            "terrain_dense_reward_rate_scale": float(
+                environment_definition.TERRAIN_DENSE_REWARD_RATE_SCALE
+            ),
+            "terrain_task_timeout_penalty": float(
+                environment_definition.TERRAIN_TASK_TIMEOUT_PENALTY
+            ),
         },
         "environment_config": {
-            "episode_seconds": float(DEFAULT_EPISODE_SECONDS),
+            "episode_seconds": episode_seconds_for_args(args),
             "control_decimation": int(environment_definition.DEFAULT_CONTROL_DECIMATION),
+            "command_speed_limit_mps": command_speed_limit_for_args(args),
+            "command_speed_fraction": float(args.command_speed_fraction),
+            "command_resample_seconds": float(args.command_resample_seconds),
             "mjcf_sha256": hashlib.sha256(xml_path.read_bytes()).hexdigest(),
             "lqr_source_sha256": hashlib.sha256(Path(lqr.__file__).read_bytes()).hexdigest(),
             "jump_controller": lqr.jump_controller_config(),
+            "terrain_controller": lqr.terrain_controller_config(),
+            "locomotion_command_schema": environment_definition.LOCOMOTION_COMMAND_SCHEMA,
+            "residual_authority_schema": environment_definition.RESIDUAL_AUTHORITY_SCHEMA,
             "domain_randomization": domain_randomization.as_dict(),
             "jump_domain_randomization": (
                 None if jump_domain_randomization is None else jump_domain_randomization.as_dict()
             ),
+            "terrain_curriculum": terrain_curriculum,
+            "terrain_evaluation": False,
         },
     }
 
@@ -529,13 +805,83 @@ def optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device) 
                 state[key] = value.to(device)
 
 
+def validate_terrain_stage_transfer(
+    saved_metadata: Any,
+    current_metadata: Any,
+    curriculum: TerrainCurriculumConfig | None,
+) -> tuple[str, str]:
+    """Validate an explicit monotonic RMUC curriculum-stage continuation.
+
+    Checkpoint metadata carries the YAML digest rather than the full task
+    catalog.  Re-reading the selected YAML here lets us prove that both the
+    saved and requested stage IDs/tasks belong to exactly the same curriculum
+    before allowing the episode horizon to change.
+    """
+    if not isinstance(saved_metadata, dict) or not isinstance(current_metadata, dict):
+        raise ValueError(
+            "--resume-stage-transfer requires terrain curriculum metadata in both checkpoint and request"
+        )
+    if curriculum is None:
+        raise ValueError("--resume-stage-transfer requires a resolved terrain curriculum")
+    for key in ("yaml_sha256", "schema_version"):
+        if saved_metadata.get(key) != current_metadata.get(key):
+            raise ValueError(
+                "PPO stage transfer requires the identical terrain curriculum YAML: "
+                f"{key} checkpoint={saved_metadata.get(key)!r}, requested={current_metadata.get(key)!r}"
+            )
+    saved_stage_id = saved_metadata.get("stage_id")
+    current_stage_id = current_metadata.get("stage_id")
+    if not isinstance(saved_stage_id, str) or not isinstance(current_stage_id, str):
+        raise ValueError("PPO stage transfer metadata is missing a valid stage_id")
+    stage_ids = tuple(stage.stage_id for stage in curriculum.stages)
+    if saved_stage_id not in stage_ids or current_stage_id not in stage_ids:
+        raise ValueError(
+            "PPO stage transfer stage is not present in the selected terrain curriculum: "
+            f"checkpoint={saved_stage_id!r}, requested={current_stage_id!r}"
+        )
+    expected_saved_tasks = list(curriculum.stage(saved_stage_id).task_ids)
+    expected_current_tasks = list(curriculum.stage(current_stage_id).task_ids)
+    saved_tasks = saved_metadata.get("stage_task_ids")
+    current_tasks = current_metadata.get("stage_task_ids")
+    if not isinstance(saved_tasks, (list, tuple)) or not isinstance(current_tasks, (list, tuple)):
+        raise ValueError("PPO stage transfer metadata is missing stage_task_ids")
+    if list(saved_tasks) != expected_saved_tasks:
+        raise ValueError(
+            "PPO stage transfer checkpoint task list does not match the selected curriculum YAML"
+        )
+    if list(current_tasks) != expected_current_tasks:
+        raise ValueError(
+            "PPO stage transfer requested task list does not match the selected curriculum YAML"
+        )
+    saved_index = stage_ids.index(saved_stage_id)
+    current_index = stage_ids.index(current_stage_id)
+    if current_index <= saved_index:
+        raise ValueError(
+            "--resume-stage-transfer only permits a later curriculum stage: "
+            f"checkpoint={saved_stage_id!r}, requested={current_stage_id!r}"
+        )
+    return saved_stage_id, current_stage_id
+
+
 def validate_resume_task_config(
     checkpoint_config: Any,
     current_config: dict[str, Any],
+    *,
+    allow_terrain_stage_transfer: bool = False,
+    terrain_curriculum: TerrainCurriculumConfig | None = None,
 ) -> None:
     if not isinstance(checkpoint_config, dict):
         raise ValueError("PPO resume checkpoint is missing task_config")
-    required_keys = ("max_speed_mps", "yaw_range_deg", "jump_probability", "jump_at_s")
+    required_keys = (
+        "max_speed_mps",
+        "command_speed_limit_mps",
+        "command_speed_fraction",
+        "command_resample_seconds",
+        "yaw_range_deg",
+        "max_yaw_rate_rad_s",
+        "jump_probability",
+        "jump_at_s",
+    )
     mismatches: list[str] = []
     for key in required_keys:
         saved_value = checkpoint_config.get(key)
@@ -544,6 +890,20 @@ def validate_resume_task_config(
             mismatches.append(f"{key}: checkpoint={saved_value!r}, requested={current_value!r}")
     if mismatches:
         raise ValueError("PPO resume task configuration mismatch: " + "; ".join(mismatches))
+    saved_terrain_curriculum = checkpoint_config.get("terrain_curriculum")
+    current_terrain_curriculum = current_config.get("terrain_curriculum")
+    stage_transfer: tuple[str, str] | None = None
+    if saved_terrain_curriculum != current_terrain_curriculum:
+        if not allow_terrain_stage_transfer:
+            raise ValueError(
+                "PPO resume terrain curriculum mismatch: "
+                f"checkpoint={saved_terrain_curriculum!r}, current={current_terrain_curriculum!r}"
+            )
+        stage_transfer = validate_terrain_stage_transfer(
+            saved_terrain_curriculum,
+            current_terrain_curriculum,
+            terrain_curriculum,
+        )
     saved_reward_schema = checkpoint_config.get("reward_schema")
     if saved_reward_schema is None:
         print(
@@ -583,15 +943,38 @@ def validate_resume_task_config(
     elif not isinstance(saved_environment_config, dict):
         raise ValueError("PPO resume checkpoint has an invalid environment configuration")
     else:
+        if stage_transfer is not None:
+            saved_environment_terrain = saved_environment_config.get("terrain_curriculum")
+            current_environment_terrain = current_environment_config.get("terrain_curriculum")
+            if (
+                saved_environment_terrain != saved_terrain_curriculum
+                or current_environment_terrain != current_terrain_curriculum
+            ):
+                raise ValueError(
+                    "PPO stage transfer environment/task curriculum metadata is inconsistent"
+                )
+        stage_environment_keys = {"terrain_curriculum", "episode_seconds"} if stage_transfer else set()
         environment_mismatches = [
             f"{key}: checkpoint={saved_environment_config.get(key)!r}, current={value!r}"
             for key, value in current_environment_config.items()
-            if saved_environment_config.get(key) != value
+            if key not in stage_environment_keys
+            and not (
+                key == "terrain_curriculum"
+                and key not in saved_environment_config
+                and value is None
+            )
+            and saved_environment_config.get(key) != value
         ]
         if environment_mismatches:
             raise ValueError(
                 "PPO resume environment configuration mismatch: " + "; ".join(environment_mismatches)
             )
+    if stage_transfer is not None:
+        print(
+            "Accepted PPO curriculum stage transfer: "
+            f"{stage_transfer[0]} -> {stage_transfer[1]}. "
+            "The next rollout starts from fresh episodes at the later stage."
+        )
 
 
 def report_resume_training_config(checkpoint_config: Any, current_config: dict[str, Any]) -> None:
@@ -620,13 +1003,26 @@ def load_ppo_resume(
     training_config: dict[str, Any],
     environment: WheelLegResidualEnv,
     device: torch.device,
+    *,
+    allow_terrain_stage_transfer: bool = False,
+    terrain_curriculum: TerrainCurriculumConfig | None = None,
 ) -> ResumeState:
     checkpoint: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            "PPO resume checkpoint uses an incompatible locomotion-command/action-authority schema; "
+            "start a new run or use a checkpoint produced by this trainer version."
+        )
     if checkpoint.get("algorithm") != "ppo" or checkpoint.get("action_semantics") != "residual":
         raise ValueError("--resume-checkpoint must contain a residual PPO checkpoint")
     if checkpoint.get("observation_size") != observation_size or checkpoint.get("action_size") != action_size:
         raise ValueError("PPO resume checkpoint dimensions do not match the current environment")
-    validate_resume_task_config(checkpoint.get("task_config"), task_config)
+    validate_resume_task_config(
+        checkpoint.get("task_config"),
+        task_config,
+        allow_terrain_stage_transfer=allow_terrain_stage_transfer,
+        terrain_curriculum=terrain_curriculum,
+    )
     report_resume_training_config(checkpoint.get("training_config"), training_config)
     timesteps = checkpoint.get("timesteps")
     if not isinstance(timesteps, int) or timesteps < 0:
@@ -667,6 +1063,13 @@ def append_metrics(path: Path, row: dict[str, float | int]) -> None:
         "jump_stable_landing_rate",
         "mean_jump_peak_clearance_m",
         "mean_jump_min_clearance_m",
+        "physical_unsafe_episodes",
+        "physical_unsafe_rate",
+        "terrain_episodes",
+        "terrain_completions",
+        "terrain_completion_rate",
+        "terrain_physical_unsafe_episodes",
+        "terrain_physical_unsafe_rate",
     )
     needs_header = not path.exists() or path.stat().st_size == 0
     if not needs_header:
@@ -724,6 +1127,45 @@ def summarize_jump_episodes(infos: list[dict[str, Any]]) -> dict[str, float | in
     }
 
 
+def summarize_safety_and_terrain_episodes(infos: list[dict[str, Any]]) -> dict[str, float | int]:
+    """Aggregate terminal physical safety and fixed-terrain task outcomes.
+
+    ``physical_unsafe`` deliberately excludes a curriculum corridor miss and
+    other task-level failures.  That keeps the reported unsafe rate aligned
+    with the robot-fall target while terrain completion remains separately
+    visible in the same metrics CSV.
+    """
+    physical_unsafe_episodes = sum(bool(info.get("physical_unsafe", False)) for info in infos)
+    terrain_infos = [info for info in infos if info.get("terrain_task_id") is not None]
+    terrain_completions = sum(bool(info.get("terrain_task_completed", False)) for info in terrain_infos)
+    terrain_physical_unsafe = sum(
+        bool(info.get("physical_unsafe", False)) for info in terrain_infos
+    )
+    episode_count = len(infos)
+    terrain_episode_count = len(terrain_infos)
+    return {
+        "physical_unsafe_episodes": physical_unsafe_episodes,
+        "physical_unsafe_rate": (
+            float(physical_unsafe_episodes / episode_count)
+            if episode_count
+            else float("nan")
+        ),
+        "terrain_episodes": terrain_episode_count,
+        "terrain_completions": terrain_completions,
+        "terrain_completion_rate": (
+            float(terrain_completions / terrain_episode_count)
+            if terrain_episode_count
+            else float("nan")
+        ),
+        "terrain_physical_unsafe_episodes": terrain_physical_unsafe,
+        "terrain_physical_unsafe_rate": (
+            float(terrain_physical_unsafe / terrain_episode_count)
+            if terrain_episode_count
+            else float("nan")
+        ),
+    }
+
+
 def load_residual_bc_warm_start(
     path: Path,
     policy: ActorCritic,
@@ -732,6 +1174,11 @@ def load_residual_bc_warm_start(
     task_config: dict[str, Any] | None = None,
 ) -> None:
     checkpoint: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            "BC checkpoint uses an incompatible locomotion-command/action-authority schema; "
+            "regenerate BC with the current environment."
+        )
     if checkpoint.get("target_kind") != "residual":
         raise ValueError("BC warm start requires a checkpoint trained with '--target residual'")
     if checkpoint.get("observation_size") != observation_size or checkpoint.get("action_size") != action_size:
@@ -741,7 +1188,16 @@ def load_residual_bc_warm_start(
         if not isinstance(saved_task_config, dict):
             raise ValueError("BC checkpoint is missing task metadata; regenerate BC for the current PPO task.")
         task_mismatches: list[str] = []
-        for key in ("max_speed_mps", "yaw_range_deg", "jump_probability", "jump_at_s"):
+        for key in (
+            "max_speed_mps",
+            "command_speed_limit_mps",
+            "command_speed_fraction",
+            "command_resample_seconds",
+            "yaw_range_deg",
+            "max_yaw_rate_rad_s",
+            "jump_probability",
+            "jump_at_s",
+        ):
             saved_value = saved_task_config.get(key)
             current_value = task_config.get(key)
             if saved_value is None or current_value is None or not np.isclose(
@@ -750,6 +1206,28 @@ def load_residual_bc_warm_start(
                 task_mismatches.append(
                     f"{key}: checkpoint={saved_value!r}, current={current_value!r}"
                 )
+        for key in ("locomotion_command_schema", "residual_authority_schema"):
+            if saved_task_config.get(key) != task_config.get(key):
+                task_mismatches.append(
+                    f"{key}: checkpoint={saved_task_config.get(key)!r}, current={task_config.get(key)!r}"
+                )
+        if saved_task_config.get("reward_schema") != task_config.get("reward_schema"):
+            task_mismatches.append(
+                "reward_schema: "
+                f"checkpoint={saved_task_config.get('reward_schema')!r}, "
+                f"current={task_config.get('reward_schema')!r}"
+            )
+        saved_reward_config = saved_task_config.get("reward_config")
+        current_reward_config = task_config.get("reward_config")
+        if saved_reward_config != current_reward_config:
+            task_mismatches.append("reward_config differs between BC and PPO")
+        saved_terrain_curriculum = saved_task_config.get("terrain_curriculum")
+        current_terrain_curriculum = task_config.get("terrain_curriculum")
+        if saved_terrain_curriculum != current_terrain_curriculum:
+            task_mismatches.append(
+                "terrain_curriculum: "
+                f"checkpoint={saved_terrain_curriculum!r}, current={current_terrain_curriculum!r}"
+            )
         if task_mismatches:
             raise ValueError("BC checkpoint task configuration does not match PPO: " + "; ".join(task_mismatches))
         saved_domain = saved_task_config.get("domain_randomization") if isinstance(saved_task_config, dict) else None
@@ -768,7 +1246,12 @@ def load_residual_bc_warm_start(
             raise ValueError(
                 "BC checkpoint has no environment fingerprint; regenerate BC with the current environment."
             )
-        if saved_environment != current_environment:
+        if not isinstance(saved_environment, dict) or not isinstance(current_environment, dict):
+            raise ValueError("BC checkpoint has an invalid environment fingerprint")
+        normalized_saved_environment = dict(saved_environment)
+        if current_environment.get("terrain_curriculum") is None:
+            normalized_saved_environment.setdefault("terrain_curriculum", None)
+        if normalized_saved_environment != current_environment:
             raise ValueError("BC checkpoint environment configuration does not match PPO")
     policy.actor.load_state_dict(checkpoint["actor_state_dict"])
 
@@ -784,22 +1267,23 @@ def train(args: argparse.Namespace) -> None:
     task_config = task_config_for_args(args)
     training_config = training_config_for_args(args)
     metrics_path = args.metrics_path if args.metrics_path is not None else default_metrics_path(args.output)
+    domain_randomization, jump_domain_randomization = domain_randomization_for_args(args)
     environment = WheelLegResidualEnv(
         xml_path=args.xml_path,
+        episode_seconds=episode_seconds_for_args(args),
         max_forward_speed=getattr(args, "max_speed", None),
+        command_speed_limit_mps=command_speed_limit_for_args(args),
+        command_resample_seconds=command_resample_seconds_for_args(args),
+        command_speed_fraction=float(args.command_speed_fraction),
         max_command_yaw_delta_rad=np.deg2rad(args.yaw_range_deg),
+        max_command_yaw_rate_rad_s=args.max_yaw_rate,
         jump_probability=args.jump_probability,
         jump_at=args.jump_at,
-        domain_randomization=(
-            DomainRandomizationConfig.training_defaults()
-            if args.domain_randomization
-            else DomainRandomizationConfig.disabled()
-        ),
-        jump_domain_randomization=(
-            DomainRandomizationConfig.jump_training_defaults()
-            if args.domain_randomization and args.jump_probability > 0.0
-            else None
-        ),
+        domain_randomization=domain_randomization,
+        jump_domain_randomization=jump_domain_randomization,
+        terrain_curriculum=getattr(args, "terrain_curriculum_config", None),
+        terrain_stage_id=getattr(args, "terrain_stage_id", None),
+        terrain_evaluation=False,
     )
     policy: ActorCritic | None = None
     optimizer: torch.optim.Optimizer | None = None
@@ -825,6 +1309,8 @@ def train(args: argparse.Namespace) -> None:
                 training_config,
                 environment,
                 device,
+                allow_terrain_stage_transfer=args.resume_stage_transfer,
+                terrain_curriculum=getattr(args, "terrain_curriculum_config", None),
             )
             timesteps = resume_state.timesteps
             update_index = resume_state.update_index
@@ -890,6 +1376,7 @@ def train(args: argparse.Namespace) -> None:
                 return_text = f"partial_return={episode_return:.3f}"
                 mean_completed_return = float("nan")
             jump_metrics = summarize_jump_episodes(completed_infos)
+            safety_metrics = summarize_safety_and_terrain_episodes(completed_infos)
             append_metrics(
                 metrics_path,
                 {
@@ -902,6 +1389,7 @@ def train(args: argparse.Namespace) -> None:
                     "value_loss": metrics["value_loss"],
                     "entropy": metrics["entropy"],
                     **jump_metrics,
+                    **safety_metrics,
                 },
             )
             jump_text = ""
@@ -912,10 +1400,19 @@ def train(args: argparse.Namespace) -> None:
                     f" target_rate={jump_metrics['jump_height_target_rate']:.2f}"
                     f" landing_rate={jump_metrics['jump_stable_landing_rate']:.2f}"
                 )
+            terrain_text = ""
+            if safety_metrics["terrain_episodes"]:
+                terrain_text = (
+                    f" terrain_complete={safety_metrics['terrain_completion_rate']:.2f}"
+                    f" terrain_unsafe={safety_metrics['terrain_physical_unsafe_rate']:.2f}"
+                )
+            safety_text = ""
+            if completed_returns:
+                safety_text = f" unsafe={safety_metrics['physical_unsafe_rate']:.2f}"
             print(
                 f"update={update_index} timesteps={timesteps} {return_text} "
                 f"policy_loss={metrics['policy_loss']:.4f} value_loss={metrics['value_loss']:.4f} "
-                f"entropy={metrics['entropy']:.4f}{jump_text}"
+                f"entropy={metrics['entropy']:.4f}{jump_text}{safety_text}{terrain_text}"
             )
             snapshot_path = save_checkpoint(
                 args.output,
@@ -948,7 +1445,7 @@ def main() -> None:
         args.rollout_steps = min(args.rollout_steps, 16)
         args.epochs = 1
         args.minibatch_size = min(args.minibatch_size, args.rollout_steps)
-        args.output = Path("artifacts") / "ppo_jump_clearance_smoke.pt"
+        args.output = Path("artifacts") / "ppo_locomotion_controller_smoke.pt"
     train(args)
 
 

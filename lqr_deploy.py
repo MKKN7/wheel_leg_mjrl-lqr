@@ -41,6 +41,13 @@ MAX_YAW_RATE_RAD_S = 0.45
 YAW_HEADING_KP_RAD_S_PER_RAD = 1.20
 YAW_RATE_KP_MOTOR_NM_PER_RAD_S = 0.55
 YAW_GOVERNOR_LIMIT_MOTOR_NM = 0.45
+# A height field can alternately unload one wheel while a grade crosses the
+# contact patch.  Keep this stronger heading loop opt-in so the validated
+# flat-scene controller remains unchanged.  The terrain environment enables it
+# only after placing the robot on a declared RMUC terrain task.
+TERRAIN_YAW_HEADING_KP_RAD_S_PER_RAD = 3.00
+TERRAIN_YAW_RATE_KP_MOTOR_NM_PER_RAD_S = 3.00
+TERRAIN_YAW_GOVERNOR_LIMIT_MOTOR_NM = 2.50
 YAW_RATE_FILTER_TIME_CONSTANT_S = 0.02
 GLFW_KEY_RIGHT = 262
 GLFW_KEY_LEFT = 263
@@ -58,6 +65,7 @@ WALK_SPEED_KP_MOTOR_NM_PER_MPS = 4.0
 WALK_SPEED_KI_MOTOR_NM_PER_M = 3.0
 WALK_SPEED_INTEGRAL_LIMIT_M = 2.00
 WALK_SPEED_GOVERNOR_LIMIT_MOTOR_NM = 2.90
+CONTACT_RECOVERY_WHEEL_BRAKE_LIMIT_MOTOR_NM = 4.50
 LQR_FORWARD_SPEED_REFERENCE_LIMIT_MPS = 0.10
 LQR_FORWARD_SPEED_FEEDBACK_LIMIT_MPS = 0.25
 FORWARD_SPEED_YAW_OVERRIDE_START_MPS = 0.50
@@ -95,13 +103,40 @@ JUMP_FLIGHT_RETRACT_LENGTH_M = 0.205
 JUMP_FLIGHT_RETRACT_RATE_MPS = 2.00
 JUMP_FLIGHT_RETRACT_STEPS = 150
 JUMP_FLIGHT_RETRACT_FORCE_LIMIT_N = 170.0
-JUMP_FLIGHT_PRELOAD_LENGTH_M = JUMP_THRUST_LENGTH_M
+# Do not re-extend to the full thrust length before touchdown.  The compliant
+# closed chains otherwise arrive asymmetric and can cross the 15 mm leg-diff
+# hard safety limit on the RMUC height field.  A 0.320 m preload leaves travel
+# for impact absorption while reducing the left/right compression-rate split
+# observed at first contact under the vehicle-only randomization profile.
+JUMP_FLIGHT_PRELOAD_LENGTH_M = 0.320
 JUMP_FLIGHT_PRELOAD_RATE_MPS = 0.50
 JUMP_FLIGHT_PRELOAD_FORCE_LIMIT_N = 90.0
 JUMP_LANDING_LENGTH_M = 0.285
 JUMP_LANDING_RATE_MPS = 0.40
 JUMP_LANDING_FORCE_LIMIT_N = 80.0
 JUMP_LANDING_STANCE_GUARD_SCALE = 0.30
+# The two closed chains see slightly different hfield contact impulses.  A
+# bounded differential force keeps their lengths synchronized during impact;
+# it does not alter the common jump trajectory or any hard safety limit.
+JUMP_LEG_SYNC_KP_N_PER_M = 1200.0
+JUMP_LEG_SYNC_KD_NS_PER_M = 70.0
+JUMP_LEG_SYNC_FORCE_LIMIT_N = 35.0
+# Keep the jump controller active while it transitions from the landing
+# impedance target back to the requested walking length.  This prevents the
+# former one-tick handoff to full wheel-speed control from re-launching the
+# robot after a high landing.
+JUMP_RECOVERY_LEG_RATE_MPS = 0.05
+JUMP_RECOVERY_STABLE_SECONDS = 0.30
+JUMP_RECOVERY_TIMEOUT_S = 2.50
+JUMP_RECOVERY_STANCE_GUARD_INITIAL_SCALE = 0.50
+JUMP_RECOVERY_STANCE_GUARD_RAMP_SECONDS = 0.15
+JUMP_RECOVERY_WHEEL_BRAKE_KP_NM_PER_MPS = 6.0
+JUMP_RECOVERY_WHEEL_BRAKE_LIMIT_NM = 1.20
+JUMP_RECOVERY_MAX_PITCH_ERROR_RAD = 0.20
+JUMP_RECOVERY_MAX_PITCH_RATE_RAD_S = 0.60
+JUMP_RECOVERY_MAX_VERTICAL_SPEED_MPS = 0.30
+JUMP_RECOVERY_MAX_FORWARD_SPEED_MPS = 0.12
+JUMP_RECOVERY_MAX_LEG_DIFFERENCE_M = 0.012
 JUMP_PREPARE_TIMEOUT_S = 3.0
 JUMP_CROUCH_TIMEOUT_S = 3.0
 JUMP_THRUST_TIMEOUT_S = 0.60
@@ -109,12 +144,80 @@ JUMP_FLIGHT_TIMEOUT_S = 1.20
 JUMP_LANDING_TIMEOUT_S = 2.0
 JUMP_LENGTH_TOLERANCE_M = 0.012
 JUMP_SETTLE_STEPS = 100
+# A local down-step supervisor is intentionally separate from the jump state
+# machine.  It only arms when both wheel tracks see the same 14--25 cm terrain
+# drop through the hfield preview supplied by the environment.  The controller
+# pre-extends before the edge, permits a short expected loss of support, then
+# reuses the landing impedance/recovery branch without weakening any hard
+# contact, closure, attitude, or leg-length validation.
+TERRAIN_DROP_MIN_HEIGHT_M = 0.140
+TERRAIN_DROP_MAX_HEIGHT_M = 0.250
+TERRAIN_DROP_LOOKAHEAD_M = 0.280
+TERRAIN_DROP_FULL_WIDTH_TOLERANCE_M = 0.025
+TERRAIN_DROP_ARM_MIN_FORWARD_SPEED_MPS = 0.040
+DROP_PRELOAD_LENGTH_M = 0.285
+DROP_PRELOAD_RATE_MPS = 0.08
+DROP_PRELOAD_FORCE_LIMIT_N = 90.0
+DROP_PRELOAD_TIMEOUT_S = 2.00
+DROP_FLIGHT_ENTRY_CONFIRM_STEPS = 4
+DROP_FLIGHT_EXTENSION_LENGTH_M = 0.350
+DROP_FLIGHT_EXTENSION_RATE_MPS = 1.20
+DROP_FLIGHT_FORCE_LIMIT_N = 130.0
+DROP_FLIGHT_TIMEOUT_S = 0.240
+DROP_LANDING_LENGTH_M = 0.310
+DROP_LANDING_RATE_MPS = 0.45
+DROP_LANDING_FORCE_LIMIT_N = 95.0
+DROP_LANDING_CONTACT_CONFIRM_STEPS = 8
+DROP_LANDING_SETTLE_STEPS = 40
+DROP_LANDING_TIMEOUT_S = 0.80
+DROP_RECOVERY_LEG_RATE_MPS = 0.05
+DROP_RECOVERY_STABLE_SECONDS = 0.30
+DROP_RECOVERY_TIMEOUT_S = 3.00
+DROP_RECOVERY_MAX_PITCH_ERROR_RAD = JUMP_RECOVERY_MAX_PITCH_ERROR_RAD
+DROP_RECOVERY_MAX_PITCH_RATE_RAD_S = JUMP_RECOVERY_MAX_PITCH_RATE_RAD_S
+DROP_RECOVERY_MAX_VERTICAL_SPEED_MPS = JUMP_RECOVERY_MAX_VERTICAL_SPEED_MPS
+DROP_RECOVERY_MAX_FORWARD_SPEED_MPS = 0.55
+DROP_RECOVERY_MAX_LEG_DIFFERENCE_M = JUMP_RECOVERY_MAX_LEG_DIFFERENCE_M
+# A requested jump first uses the normal two-wheel controller to regulate into
+# a measured low-speed rolling window.  The RMUC hfield has a small persistent
+# creep at a zero wheel reference, so this deliberately allows a controlled
+# rolling launch rather than requiring a stationary robot.
+JUMP_MAX_LAUNCH_SPEED_MPS = 0.13
+JUMP_LAUNCH_SPEED_TOLERANCE_MPS = 0.0
+# The hfield's nominal downhill creep is about +0.10 m/s at this tiny
+# counter-command, which yields a controlled rolling rather than static launch.
+JUMP_LAUNCH_REFERENCE_SPEED_MPS = -0.01
+JUMP_ROLLING_LAUNCH_MAX_SPEED_MPS = 0.55
+JUMP_ROLLING_LAUNCH_TOLERANCE_MPS = 0.08
+JUMP_THRUST_WHEEL_KP_NM_PER_MPS = 1.50
+JUMP_THRUST_WHEEL_LIMIT_NM = 0.80
+JUMP_BRAKE_STABLE_SECONDS = 0.10
+JUMP_BRAKE_MAX_VERTICAL_SPEED_MPS = 0.12
+JUMP_BRAKE_MAX_ANGULAR_SPEED_RAD_S = 0.80
+# Hfield contact manifolds can intermittently report one empty wheel-contact
+# frame even when both wheels remain supported.  This only debounces the
+# state-machine contact predicate; physical jump safety validation remains
+# immediate and independent.
+JUMP_GROUND_CONTACT_GRACE_STEPS = 4
+# Flight must not reuse the launch contact hysteresis: transitioning into
+# ``flight`` resets that counter, so a zero-contact frame would otherwise look
+# grounded for several ticks and immediately skip the retract trajectory.
+# Wait for a short, real two-wheel contact manifold before enabling landing
+# impedance.  Three 1 kHz samples still includes the hfield's impact pulse;
+# Eight samples remains only 8 ms, but covers the full asymmetric impact
+# manifold under the vehicle-only RMUC domain randomization profile.
+JUMP_LANDING_CONTACT_CONFIRM_STEPS = 8
 JUMP_LIFTOFF_STEPS = 3
 JUMP_THRUST_FORCE_LIMIT_N = 240.0
 AIRBORNE_HIP_KP_NM_PER_RAD = 20.0
 AIRBORNE_HIP_KD_NM_PER_RAD_PER_S = 4.0
 AIRBORNE_WHEEL_ATTITUDE_KP_NM_PER_RAD = 6.0
 AIRBORNE_WHEEL_ATTITUDE_KD_NM_PER_RAD_S = 0.48
+# Terrain support is opt-in.  The values below filter externally supplied
+# terrain heights before they become an LQR root-height reference, avoiding a
+# discontinuous vertical position target at an hfield cell boundary.
+TERRAIN_SUPPORT_REFERENCE_FILTER_TIME_CONSTANT_S = 0.08
+TERRAIN_SUPPORT_REFERENCE_MAX_VERTICAL_RATE_MPS = 0.75
 WORLD_UP = np.array((0.0, 0.0, 1.0))
 
 
@@ -137,11 +240,73 @@ def jump_controller_config() -> dict[str, float | int]:
         "jump_landing_rate_mps": JUMP_LANDING_RATE_MPS,
         "jump_landing_force_limit_n": JUMP_LANDING_FORCE_LIMIT_N,
         "jump_landing_stance_guard_scale": JUMP_LANDING_STANCE_GUARD_SCALE,
+        "jump_leg_sync_kp_n_per_m": JUMP_LEG_SYNC_KP_N_PER_M,
+        "jump_leg_sync_kd_ns_per_m": JUMP_LEG_SYNC_KD_NS_PER_M,
+        "jump_leg_sync_force_limit_n": JUMP_LEG_SYNC_FORCE_LIMIT_N,
+        "jump_recovery_leg_rate_mps": JUMP_RECOVERY_LEG_RATE_MPS,
+        "jump_recovery_stable_seconds": JUMP_RECOVERY_STABLE_SECONDS,
+        "jump_recovery_timeout_s": JUMP_RECOVERY_TIMEOUT_S,
+        "jump_recovery_stance_guard_initial_scale": JUMP_RECOVERY_STANCE_GUARD_INITIAL_SCALE,
+        "jump_recovery_stance_guard_ramp_seconds": JUMP_RECOVERY_STANCE_GUARD_RAMP_SECONDS,
+        "jump_recovery_wheel_brake_kp_nm_per_mps": JUMP_RECOVERY_WHEEL_BRAKE_KP_NM_PER_MPS,
+        "jump_recovery_wheel_brake_limit_nm": JUMP_RECOVERY_WHEEL_BRAKE_LIMIT_NM,
+        "jump_recovery_max_pitch_error_rad": JUMP_RECOVERY_MAX_PITCH_ERROR_RAD,
+        "jump_recovery_max_pitch_rate_rad_s": JUMP_RECOVERY_MAX_PITCH_RATE_RAD_S,
+        "jump_recovery_max_vertical_speed_mps": JUMP_RECOVERY_MAX_VERTICAL_SPEED_MPS,
+        "jump_recovery_max_forward_speed_mps": JUMP_RECOVERY_MAX_FORWARD_SPEED_MPS,
+        "jump_recovery_max_leg_difference_m": JUMP_RECOVERY_MAX_LEG_DIFFERENCE_M,
+        "jump_max_launch_speed_mps": JUMP_MAX_LAUNCH_SPEED_MPS,
+        "jump_launch_speed_tolerance_mps": JUMP_LAUNCH_SPEED_TOLERANCE_MPS,
+        "jump_launch_reference_speed_mps": JUMP_LAUNCH_REFERENCE_SPEED_MPS,
+        "jump_rolling_launch_max_speed_mps": JUMP_ROLLING_LAUNCH_MAX_SPEED_MPS,
+        "jump_rolling_launch_tolerance_mps": JUMP_ROLLING_LAUNCH_TOLERANCE_MPS,
+        "jump_thrust_wheel_kp_nm_per_mps": JUMP_THRUST_WHEEL_KP_NM_PER_MPS,
+        "jump_thrust_wheel_limit_nm": JUMP_THRUST_WHEEL_LIMIT_NM,
+        "jump_brake_stable_seconds": JUMP_BRAKE_STABLE_SECONDS,
+        "jump_brake_max_vertical_speed_mps": JUMP_BRAKE_MAX_VERTICAL_SPEED_MPS,
+        "jump_brake_max_angular_speed_rad_s": JUMP_BRAKE_MAX_ANGULAR_SPEED_RAD_S,
+        "jump_ground_contact_grace_steps": JUMP_GROUND_CONTACT_GRACE_STEPS,
+        "jump_landing_contact_confirm_steps": JUMP_LANDING_CONTACT_CONFIRM_STEPS,
         "jump_settle_steps": JUMP_SETTLE_STEPS,
         "airborne_hip_kp_nm_per_rad": AIRBORNE_HIP_KP_NM_PER_RAD,
         "airborne_hip_kd_nm_per_rad_per_s": AIRBORNE_HIP_KD_NM_PER_RAD_PER_S,
         "airborne_wheel_attitude_kp_nm_per_rad": AIRBORNE_WHEEL_ATTITUDE_KP_NM_PER_RAD,
         "airborne_wheel_attitude_kd_nm_per_rad_s": AIRBORNE_WHEEL_ATTITUDE_KD_NM_PER_RAD_S,
+    }
+
+
+def terrain_controller_config() -> dict[str, float]:
+    """Return terrain-specific feedback parameters used for checkpoint identity."""
+    return {
+        "support_reference_filter_time_constant_s": TERRAIN_SUPPORT_REFERENCE_FILTER_TIME_CONSTANT_S,
+        "support_reference_max_vertical_rate_mps": TERRAIN_SUPPORT_REFERENCE_MAX_VERTICAL_RATE_MPS,
+        "yaw_heading_kp_rad_s_per_rad": TERRAIN_YAW_HEADING_KP_RAD_S_PER_RAD,
+        "yaw_rate_kp_motor_nm_per_rad_s": TERRAIN_YAW_RATE_KP_MOTOR_NM_PER_RAD_S,
+        "yaw_governor_limit_motor_nm": TERRAIN_YAW_GOVERNOR_LIMIT_MOTOR_NM,
+        "drop_min_height_m": TERRAIN_DROP_MIN_HEIGHT_M,
+        "drop_max_height_m": TERRAIN_DROP_MAX_HEIGHT_M,
+        "drop_lookahead_m": TERRAIN_DROP_LOOKAHEAD_M,
+        "drop_full_width_tolerance_m": TERRAIN_DROP_FULL_WIDTH_TOLERANCE_M,
+        "drop_arm_min_forward_speed_mps": TERRAIN_DROP_ARM_MIN_FORWARD_SPEED_MPS,
+        "drop_preload_length_m": DROP_PRELOAD_LENGTH_M,
+        "drop_preload_rate_mps": DROP_PRELOAD_RATE_MPS,
+        "drop_preload_force_limit_n": DROP_PRELOAD_FORCE_LIMIT_N,
+        "drop_preload_timeout_s": DROP_PRELOAD_TIMEOUT_S,
+        "drop_flight_entry_confirm_steps": DROP_FLIGHT_ENTRY_CONFIRM_STEPS,
+        "drop_flight_extension_length_m": DROP_FLIGHT_EXTENSION_LENGTH_M,
+        "drop_flight_extension_rate_mps": DROP_FLIGHT_EXTENSION_RATE_MPS,
+        "drop_flight_force_limit_n": DROP_FLIGHT_FORCE_LIMIT_N,
+        "drop_flight_timeout_s": DROP_FLIGHT_TIMEOUT_S,
+        "drop_landing_length_m": DROP_LANDING_LENGTH_M,
+        "drop_landing_rate_mps": DROP_LANDING_RATE_MPS,
+        "drop_landing_force_limit_n": DROP_LANDING_FORCE_LIMIT_N,
+        "drop_landing_contact_confirm_steps": DROP_LANDING_CONTACT_CONFIRM_STEPS,
+        "drop_landing_settle_steps": DROP_LANDING_SETTLE_STEPS,
+        "drop_landing_timeout_s": DROP_LANDING_TIMEOUT_S,
+        "drop_recovery_leg_rate_mps": DROP_RECOVERY_LEG_RATE_MPS,
+        "drop_recovery_stable_seconds": DROP_RECOVERY_STABLE_SECONDS,
+        "drop_recovery_timeout_s": DROP_RECOVERY_TIMEOUT_S,
+        "drop_recovery_max_forward_speed_mps": DROP_RECOVERY_MAX_FORWARD_SPEED_MPS,
     }
 
 
@@ -306,22 +471,40 @@ class JumpSequence:
     phase_name: str | None = None
     phase_start_time: float | None = None
     resume_length: float | None = None
+    resume_speed: float | None = None
+    launch_speed: float = 0.0
     airborne_steps: int = 0
     flight_steps: int = 0
     settled_steps: int = 0
+    recovering: bool = False
+    recovery_start_time: float | None = None
+    recovery_stable_steps: int = 0
+    wheel_contact_loss_steps: tuple[int, int] = (0, 0)
     abort_reason: str = ""
 
     @property
     def active(self) -> bool:
         return self.phase_name is not None
 
-    def start(self, sim_time: float, resume_length: float) -> None:
+    def start(
+        self,
+        sim_time: float,
+        resume_length: float,
+        resume_speed: float | None = None,
+        launch_speed: float = 0.0,
+    ) -> None:
         self.phase_name = "prepare"
         self.phase_start_time = sim_time
         self.resume_length = resume_length
+        self.resume_speed = resume_speed
+        self.launch_speed = float(launch_speed)
         self.airborne_steps = 0
         self.flight_steps = 0
         self.settled_steps = 0
+        self.recovering = False
+        self.recovery_start_time = None
+        self.recovery_stable_steps = 0
+        self.wheel_contact_loss_steps = (0, 0)
         self.abort_reason = ""
 
     def transition(self, phase_name: str, sim_time: float) -> None:
@@ -330,6 +513,23 @@ class JumpSequence:
         self.airborne_steps = 0
         self.flight_steps = 0
         self.settled_steps = 0
+        self.recovering = False
+        self.recovery_start_time = None
+        self.recovery_stable_steps = 0
+        self.wheel_contact_loss_steps = (0, 0)
+
+    def begin_recovery(self, sim_time: float) -> None:
+        self.recovering = True
+        self.recovery_start_time = sim_time
+        self.recovery_stable_steps = 0
+
+    def grounded_with_hysteresis(self, contacts: tuple[int, int]) -> bool:
+        """Debounce independent wheel-contact reports for phase transitions."""
+        self.wheel_contact_loss_steps = tuple(
+            0 if contact_count > 0 else loss_steps + 1
+            for contact_count, loss_steps in zip(contacts, self.wheel_contact_loss_steps)
+        )
+        return max(self.wheel_contact_loss_steps) < JUMP_GROUND_CONTACT_GRACE_STEPS
 
     def elapsed(self, sim_time: float) -> float:
         if self.phase_start_time is None:
@@ -339,9 +539,93 @@ class JumpSequence:
     def finish(self) -> None:
         self.phase_name = None
         self.phase_start_time = None
+        self.resume_length = None
+        self.resume_speed = None
+        self.launch_speed = 0.0
         self.airborne_steps = 0
         self.flight_steps = 0
         self.settled_steps = 0
+        self.recovering = False
+        self.recovery_start_time = None
+        self.recovery_stable_steps = 0
+        self.wheel_contact_loss_steps = (0, 0)
+
+
+@dataclass
+class TerrainDropSequence:
+    """Bounded local down-step transition; deliberately independent of jumps."""
+
+    phase_name: str | None = None
+    phase_start_time: float | None = None
+    resume_length: float | None = None
+    resume_speed: float | None = None
+    drop_height_m: float = 0.0
+    unloaded_steps: int = 0
+    flight_steps: int = 0
+    settled_steps: int = 0
+    recovering: bool = False
+    recovery_start_time: float | None = None
+    recovery_stable_steps: int = 0
+    abort_reason: str = ""
+
+    @property
+    def active(self) -> bool:
+        return self.phase_name is not None
+
+    def start(
+        self,
+        sim_time: float,
+        resume_length: float,
+        resume_speed: float | None,
+        drop_height_m: float,
+    ) -> None:
+        self.phase_name = "preload"
+        self.phase_start_time = sim_time
+        self.resume_length = resume_length
+        self.resume_speed = resume_speed
+        self.drop_height_m = drop_height_m
+        self.unloaded_steps = 0
+        self.flight_steps = 0
+        self.settled_steps = 0
+        self.recovering = False
+        self.recovery_start_time = None
+        self.recovery_stable_steps = 0
+        self.abort_reason = ""
+
+    def transition(self, phase_name: str, sim_time: float) -> None:
+        self.phase_name = phase_name
+        self.phase_start_time = sim_time
+        self.unloaded_steps = 0
+        self.flight_steps = 0
+        self.settled_steps = 0
+        self.recovering = False
+        self.recovery_start_time = None
+        self.recovery_stable_steps = 0
+
+    def begin_recovery(self, sim_time: float) -> None:
+        self.phase_name = "recovery"
+        self.phase_start_time = sim_time
+        self.recovering = True
+        self.recovery_start_time = sim_time
+        self.recovery_stable_steps = 0
+
+    def elapsed(self, sim_time: float) -> float:
+        if self.phase_start_time is None:
+            return 0.0
+        return max(0.0, sim_time - self.phase_start_time)
+
+    def finish(self) -> None:
+        self.phase_name = None
+        self.phase_start_time = None
+        self.resume_length = None
+        self.resume_speed = None
+        self.drop_height_m = 0.0
+        self.unloaded_steps = 0
+        self.flight_steps = 0
+        self.settled_steps = 0
+        self.recovering = False
+        self.recovery_start_time = None
+        self.recovery_stable_steps = 0
 
 
 @dataclass(frozen=True)
@@ -587,6 +871,11 @@ class PhysicalLqr:
         # body kinematics and wheel axle to define the ground-plane heading.
         self._trim_root_quaternion = self.qpos_equilibrium[self.root_qpos + 3 : self.root_qpos + 7].copy()
         self._trim_heading_yaw = self.heading_yaw(data)
+        # ``gain`` is identified in this world-frame heading.  Heading
+        # commands may later rotate the free root, but the state supplied to
+        # that fixed gain must remain expressed in this linearization frame.
+        # Keep this immutable across reset_heading_command calls.
+        self._linearization_heading_yaw = self._trim_heading_yaw
         self.heading_command = HeadingCommand(self._trim_heading_yaw, self._trim_heading_yaw)
         self._last_yaw_measurement = self._trim_heading_yaw
         self._last_yaw_measurement_time = float(data.time)
@@ -603,8 +892,33 @@ class PhysicalLqr:
         self._speed_report_pending = True
         self.speed_error_integral = 0.0
         self.jump = JumpSequence()
+        self.drop = TerrainDropSequence()
+        self._jump_pending = False
+        self._jump_pending_since_s = -np.inf
+        self._jump_pending_resume_length: float | None = None
+        self._jump_pending_resume_speed: float | None = None
+        self._jump_pending_launch_speed = 0.0
+        self._jump_pending_stable_steps = 0
+        self._contact_recovery_braking = False
         self.jump_rejection_reason = ""
         self._last_reference_time = float(data.time)
+        # The LQR trims are intentionally built on a flat temporary support
+        # plane.  A terrain caller can opt into an independent, filtered root
+        # Z reference after it has placed the same physical stance on an
+        # hfield.  No physical qpos is changed by this controller state.
+        self._terrain_support_reference_enabled = False
+        self._terrain_support_height_m = 0.0
+        self._terrain_support_frozen_height_m = 0.0
+        self._terrain_support_was_active = False
+        self._terrain_support_root_z_offset_m = 0.0
+        self._terrain_support_reference_z_m = float(self._reference_qpos[self.root_qpos + 2])
+        self._terrain_support_filter_time_constant_s = TERRAIN_SUPPORT_REFERENCE_FILTER_TIME_CONSTANT_S
+        self._terrain_support_max_vertical_rate_mps = TERRAIN_SUPPORT_REFERENCE_MAX_VERTICAL_RATE_MPS
+        self._terrain_support_last_update_time = float(data.time)
+        self._terrain_heading_stabilization_enabled = False
+        # Allocate once so delay compensation can predict the queued actuator
+        # command without constructing MuJoCo state inside the control loop.
+        self._delay_prediction_data = mujoco.MjData(self.model)
 
     def leg_lengths(self, data: mujoco.MjData) -> np.ndarray:
         return np.array((
@@ -651,11 +965,15 @@ class PhysicalLqr:
         measured = self.forward_speed(data)
         tracking_error = measured - ramped_command
         target_error = measured - target
-        status = speed_tracking_status(
-            target,
-            ramped_command,
-            measured,
-            jump_active=self.jump.active,
+        status = (
+            "JUMP_BRAKING"
+            if self.jump_pending
+            else speed_tracking_status(
+                target,
+                ramped_command,
+                measured,
+                jump_active=self.jump.active,
+            )
         )
         return target, ramped_command, measured, target_error, status
 
@@ -689,6 +1007,169 @@ class PhysicalLqr:
         if trim.speed <= 0.0:
             raise ValueError("forward speed trim must have positive speed")
         self.forward_speed_trim = trim
+
+    def configure_terrain_support_reference(
+        self,
+        data: mujoco.MjData,
+        support_height_m: float,
+        *,
+        filter_time_constant_s: float = TERRAIN_SUPPORT_REFERENCE_FILTER_TIME_CONSTANT_S,
+        maximum_vertical_rate_mps: float = TERRAIN_SUPPORT_REFERENCE_MAX_VERTICAL_RATE_MPS,
+    ) -> float:
+        """Enable terrain-following root-height reference from a spawned stance.
+
+        ``support_height_m`` is the world Z height beneath the supporting
+        wheels.  Call this after the environment has placed and forwarded the
+        physical robot on terrain and selected its reset command/profile.  The
+        current physical root Z is retained as the initial reference, while
+        later profile changes retain their calibrated relative root-height
+        motion.
+        """
+        support_height = float(support_height_m)
+        filter_time_constant = float(filter_time_constant_s)
+        maximum_vertical_rate = float(maximum_vertical_rate_mps)
+        if not np.isfinite(support_height):
+            raise ValueError("terrain support height must be finite")
+        if not np.isfinite(filter_time_constant) or filter_time_constant <= 0.0:
+            raise ValueError("terrain support filter time constant must be positive and finite")
+        if not np.isfinite(maximum_vertical_rate) or maximum_vertical_rate <= 0.0:
+            raise ValueError("terrain support maximum vertical rate must be positive and finite")
+
+        root_z = float(data.qpos[self.root_qpos + 2])
+        profile_root_z = float(self._reference_qpos[self.root_qpos + 2])
+        self._terrain_support_reference_enabled = True
+        self._terrain_support_height_m = support_height
+        self._terrain_support_frozen_height_m = support_height
+        self._terrain_support_was_active = True
+        self._terrain_support_root_z_offset_m = root_z - profile_root_z - support_height
+        self._terrain_support_reference_z_m = root_z
+        self._terrain_support_filter_time_constant_s = filter_time_constant
+        self._terrain_support_max_vertical_rate_mps = maximum_vertical_rate
+        self._terrain_support_last_update_time = float(data.time)
+        return root_z
+
+    def update_terrain_support_reference(self, support_height_m: float) -> float:
+        """Set the latest world-Z support height for an enabled terrain reference."""
+        if not self._terrain_support_reference_enabled:
+            raise RuntimeError(
+                "terrain support reference is disabled; call configure_terrain_support_reference first"
+            )
+        support_height = float(support_height_m)
+        if not np.isfinite(support_height):
+            raise ValueError("terrain support height must be finite")
+        self._terrain_support_height_m = support_height
+        return support_height
+
+    def rebase_terrain_support_reference(
+        self,
+        data: mujoco.MjData,
+        support_height_m: float,
+    ) -> float:
+        """Rebase the filtered terrain reference after a validated step landing."""
+        if not self._terrain_support_reference_enabled:
+            raise RuntimeError(
+                "terrain support reference is disabled; call configure_terrain_support_reference first"
+            )
+        support_height = float(support_height_m)
+        if not np.isfinite(support_height):
+            raise ValueError("terrain support height must be finite")
+        root_z = float(data.qpos[self.root_qpos + 2])
+        profile_root_z = float(self._reference_qpos[self.root_qpos + 2])
+        self._terrain_support_height_m = support_height
+        self._terrain_support_frozen_height_m = support_height
+        self._terrain_support_root_z_offset_m = root_z - profile_root_z - support_height
+        self._terrain_support_reference_z_m = root_z
+        self._terrain_support_was_active = True
+        self._terrain_support_last_update_time = float(data.time)
+        return root_z
+
+    def rebase_locomotion_reference(self, data: mujoco.MjData) -> None:
+        """Remove the one-time horizontal LQR error at a validated step handoff."""
+        self._reference_qpos[self.root_qpos : self.root_qpos + 2] = data.qpos[
+            self.root_qpos : self.root_qpos + 2
+        ]
+        self._reference_qvel[self.root_dof : self.root_dof + 2] = data.qvel[
+            self.root_dof : self.root_dof + 2
+        ]
+
+    def disable_terrain_support_reference(self) -> None:
+        """Return to the original flat-trim root-height reference."""
+        self._terrain_support_reference_enabled = False
+        self._terrain_support_was_active = False
+
+    def configure_terrain_heading_stabilization(self, enabled: bool) -> None:
+        """Select the bounded terrain heading loop without changing yaw commands."""
+        self._terrain_heading_stabilization_enabled = bool(enabled)
+
+    @property
+    def terrain_support_reference_enabled(self) -> bool:
+        return self._terrain_support_reference_enabled
+
+    @property
+    def terrain_heading_stabilization_enabled(self) -> bool:
+        return self._terrain_heading_stabilization_enabled
+
+    def _terrain_support_reference_active(self) -> bool:
+        """Freeze terrain support only during airborne protected transitions."""
+        return bool(
+            self._terrain_support_reference_enabled
+            and not self.jump.active
+            and not self._jump_pending
+            and not self._contact_recovery_braking
+            and (not self.drop.active or self.drop.phase_name != "flight")
+        )
+
+    def _terrain_support_root_z_reference(
+        self,
+        data: mujoco.MjData,
+        profile_root_z: float,
+    ) -> float:
+        """Return a rate-limited root Z target without changing physical state."""
+        sim_time = float(data.time)
+        if not self._terrain_support_reference_active():
+            if not self._terrain_support_reference_enabled:
+                return profile_root_z
+            # Freeze the terrain elevation at the transition into a protected
+            # phase, but retain the current leg-profile root offset.  Freezing
+            # an absolute Z target here used to suppress the crouch/thrust/
+            # flight root motion on RMUC, which reduced liftoff and amplified
+            # asymmetric landing impulses.  The physical support is not
+            # sampled while airborne; only the calibrated profile is allowed
+            # to move this reference until normal walking resumes.
+            if self._terrain_support_was_active:
+                self._terrain_support_frozen_height_m = self._terrain_support_height_m
+                self._terrain_support_was_active = False
+            target_root_z = (
+                float(profile_root_z)
+                + self._terrain_support_frozen_height_m
+                + self._terrain_support_root_z_offset_m
+            )
+            self._terrain_support_reference_z_m = target_root_z
+            self._terrain_support_last_update_time = sim_time
+            return target_root_z
+
+        self._terrain_support_was_active = True
+
+        target_root_z = (
+            float(profile_root_z)
+            + self._terrain_support_height_m
+            + self._terrain_support_root_z_offset_m
+        )
+        elapsed = max(0.0, sim_time - self._terrain_support_last_update_time)
+        if elapsed <= 0.0:
+            return self._terrain_support_reference_z_m
+        low_pass_gain = 1.0 - np.exp(-elapsed / self._terrain_support_filter_time_constant_s)
+        filtered_root_z = self._terrain_support_reference_z_m + low_pass_gain * (
+            target_root_z - self._terrain_support_reference_z_m
+        )
+        maximum_delta = self._terrain_support_max_vertical_rate_mps * elapsed
+        self._terrain_support_reference_z_m += float(np.clip(
+            filtered_root_z - self._terrain_support_reference_z_m,
+            -maximum_delta,
+            maximum_delta,
+        ))
+        self._terrain_support_last_update_time = sim_time
+        return self._terrain_support_reference_z_m
 
     def _forward_speed_schedule_weight(self) -> float:
         if self.forward_speed_trim is None or self.motion.current_speed <= 0.0:
@@ -733,6 +1214,32 @@ class PhysicalLqr:
             self.speed_error_integral = 0.0
         return self.motion.target_speed
 
+    def set_jump_resume_speed(self, speed: float) -> float:
+        """Update the requested post-jump speed without disturbing launch control.
+
+        A high-level locomotion command is normally streamed at the policy or
+        deployment rate.  While a jump is pending, blindly forwarding that
+        speed to ``motion.target_speed`` would overwrite the temporary launch
+        reference and prevent the braking gate from ever settling.  Keep the
+        requested speed as the pending/active sequence's handoff target
+        instead; normal walking commands still take effect immediately.
+        """
+        target = clamp_speed_command(
+            speed,
+            forward_limit=self.max_forward_speed,
+            reverse_limit=self.max_reverse_speed,
+        )
+        if self._jump_pending:
+            self._jump_pending_resume_speed = target
+            return target
+        if self.jump.active:
+            self.jump.resume_speed = target
+            return target
+        if self.drop.active:
+            self.drop.resume_speed = target
+            return target
+        return self.set_target_speed(target)
+
     def adjust_target_speed(self, delta: float) -> float:
         return self.set_target_speed(self.motion.target_speed + delta)
 
@@ -750,6 +1257,29 @@ class PhysicalLqr:
         yaw = self.heading_yaw(data)
         self.heading_command = HeadingCommand(yaw, yaw, self.heading_command.maximum_rate)
         return yaw
+
+    def begin_contact_recovery(self, data: mujoco.MjData, leg_length: float) -> float:
+        """Immediately switch from locomotion tracking to a two-wheel recovery trim."""
+        self._contact_recovery_braking = True
+        self.set_target_speed(0.0)
+        self.motion.current_speed = 0.0
+        self.speed_error_integral = 0.0
+        self.hold_current_yaw(data)
+        return self.set_target_leg_length(leg_length)
+
+    def end_contact_recovery(self) -> None:
+        """Return wheel-speed control to its regular full-support behavior."""
+        self._contact_recovery_braking = False
+
+    @property
+    def jump_pending(self) -> bool:
+        """Whether a requested jump is braking and waiting for a stable stance."""
+        return self._jump_pending
+
+    def jump_pending_elapsed(self, sim_time: float) -> float:
+        if not self._jump_pending:
+            return 0.0
+        return max(0.0, float(sim_time) - self._jump_pending_since_s)
 
     def reset_heading_command(self, data: mujoco.MjData, yaw: float | None = None) -> float:
         measured_yaw = self.heading_yaw(data)
@@ -781,6 +1311,14 @@ class PhysicalLqr:
             )
         self._leg_shape_integral = 0.0
         self.jump = JumpSequence()
+        self.drop = TerrainDropSequence()
+        self._jump_pending = False
+        self._jump_pending_since_s = -np.inf
+        self._jump_pending_resume_length = None
+        self._jump_pending_resume_speed = None
+        self._jump_pending_launch_speed = 0.0
+        self._jump_pending_stable_steps = 0
+        self._contact_recovery_braking = False
         self.reset_heading_command(data, yaw)
         self._last_reference_time = float(data.time)
         self.request_speed_report()
@@ -793,13 +1331,140 @@ class PhysicalLqr:
         for dof_address in self.gas_spring_dofs:
             data.qfrc_applied[dof_address] = -GAS_SPRING_TORQUE_NM
 
-    def request_jump(self, data: mujoco.MjData) -> bool:
-        """Start or restart the jump sequence without software precondition rejects."""
-        self.set_target_speed(0.0)
-        self.jump.start(float(data.time), self.leg_command.target_length)
-        self.set_target_leg_length(JUMP_PREPARE_LENGTH_M, jump=True)
+    def request_jump(
+        self,
+        data: mujoco.MjData,
+        *,
+        launch_speed_mps: float | None = None,
+    ) -> bool:
+        """Queue a jump and regulate into the low-speed launch window.
+
+        This is deliberately not a rejection path: a request stays pending until
+        the robot can launch at a controlled low speed without inheriting a
+        high-speed rolling transient.
+        """
+        if self.drop.active:
+            self.jump_rejection_reason = "terrain drop supervisor active"
+            return False
+        if self.jump.active:
+            # Do not interrupt airborne or landing stabilization with a second
+            # key press.  The accepted request remains the active sequence.
+            self.jump_rejection_reason = ""
+            return True
+        resume_speed = float(self.motion.target_speed)
+        # Keep a small signed counter-command during the braking/settling
+        # phase.  RMUC has a reproducible forward creep at a zero reference;
+        # this produces a roughly 0.10 m/s rolling launch while preserving the
+        # original high-level speed request for post-landing recovery.
+        if launch_speed_mps is None:
+            launch_speed = JUMP_LAUNCH_REFERENCE_SPEED_MPS
+        else:
+            launch_speed = float(launch_speed_mps)
+            if not np.isfinite(launch_speed):
+                raise ValueError("launch_speed_mps must be finite")
+            launch_speed = float(np.clip(
+                launch_speed,
+                -JUMP_ROLLING_LAUNCH_MAX_SPEED_MPS,
+                JUMP_ROLLING_LAUNCH_MAX_SPEED_MPS,
+            ))
+        # Phase remains None while the normal wheel PI is still active.  A
+        # high-speed request is therefore braked into this low-speed launch
+        # window, while an already slow robot continues to roll under control.
+        self.set_target_speed(launch_speed)
+        self.speed_error_integral = 0.0
+        self.hold_current_yaw(data)
+        self.jump.finish()
+        self._jump_pending = True
+        self._jump_pending_since_s = float(data.time)
+        self._jump_pending_resume_length = float(self.leg_command.target_length)
+        self._jump_pending_resume_speed = resume_speed
+        self._jump_pending_launch_speed = launch_speed
+        self._jump_pending_stable_steps = 0
         self.jump_rejection_reason = ""
         return True
+
+    def request_terrain_drop(self, data: mujoco.MjData, drop_height_m: float) -> bool:
+        """Arm a bounded local down-step transition from hfield-only evidence.
+
+        The caller supplies a height difference derived from both wheel tracks,
+        never a route, waypoint, or global map.  This accepts only the RMUC
+        riser envelope and preserves the normal travel command until recovery.
+        """
+        drop_height = float(drop_height_m)
+        if not np.isfinite(drop_height):
+            raise ValueError("drop_height_m must be finite")
+        if not TERRAIN_DROP_MIN_HEIGHT_M <= drop_height <= TERRAIN_DROP_MAX_HEIGHT_M:
+            raise ValueError(
+                "drop_height_m must be within the validated local terrain-drop envelope"
+            )
+        if self.drop.active:
+            return True
+        if self.jump.active or self._jump_pending:
+            return False
+        self.drop.start(
+            float(data.time),
+            float(self.leg_command.target_length),
+            float(self.motion.target_speed),
+            drop_height,
+        )
+        self.set_target_leg_length(DROP_PRELOAD_LENGTH_M, jump=True)
+        self.speed_error_integral = 0.0
+        self.jump_rejection_reason = ""
+        return True
+
+    def _jump_brake_ready(self, data: mujoco.MjData) -> bool:
+        """Return whether the normal stance controller has removed launch momentum."""
+        contacts = tuple(
+            wheel_ground_contacts(data, self.refs, geom_id)
+            for geom_id in self.refs.wheel_geoms
+        )
+        if not self.jump.grounded_with_hysteresis(contacts):
+            return False
+        forward_speed = self.forward_speed(data)
+        vertical_speed = abs(float(data.qvel[self.root_dof + 2]))
+        angular_speed = float(np.linalg.norm(data.qvel[self.root_dof + 3 : self.root_dof + 6]))
+        launch_speed = self._jump_pending_launch_speed
+        if abs(launch_speed) > JUMP_MAX_LAUNCH_SPEED_MPS:
+            speed_ready = abs(forward_speed - launch_speed) <= JUMP_ROLLING_LAUNCH_TOLERANCE_MPS
+        else:
+            speed_ready = abs(forward_speed) <= JUMP_MAX_LAUNCH_SPEED_MPS + JUMP_LAUNCH_SPEED_TOLERANCE_MPS
+        return bool(
+            speed_ready
+            and vertical_speed <= JUMP_BRAKE_MAX_VERTICAL_SPEED_MPS
+            and angular_speed <= JUMP_BRAKE_MAX_ANGULAR_SPEED_RAD_S
+        )
+
+    def _update_pending_jump(self, data: mujoco.MjData) -> None:
+        """Promote a queued jump only after normal rolling control has stopped it."""
+        if not self._jump_pending:
+            return
+        if self._jump_brake_ready(data):
+            self._jump_pending_stable_steps += 1
+        else:
+            self._jump_pending_stable_steps = 0
+        required_steps = max(1, int(np.ceil(JUMP_BRAKE_STABLE_SECONDS / self.dt)))
+        if self._jump_pending_stable_steps < required_steps:
+            return
+        resume_length = self._jump_pending_resume_length
+        if resume_length is None:
+            resume_length = self.leg_command.target_length
+        resume_speed = self._jump_pending_resume_speed
+        self.motion.current_speed = self._jump_pending_launch_speed
+        self.speed_error_integral = 0.0
+        self.jump.start(
+            float(data.time),
+            float(resume_length),
+            resume_speed,
+            self._jump_pending_launch_speed,
+        )
+        self.set_target_leg_length(JUMP_PREPARE_LENGTH_M, jump=True)
+        self._jump_pending = False
+        self._jump_pending_since_s = -np.inf
+        self._jump_pending_resume_length = None
+        self._jump_pending_resume_speed = None
+        self._jump_pending_launch_speed = 0.0
+        self._jump_pending_stable_steps = 0
+        print(f"Jump brake settled: t={float(data.time):.3f}s", flush=True)
 
     def _set_active_profile_reference(self, shape: float) -> None:
         if self.leg_profile is None:
@@ -850,12 +1515,71 @@ class PhysicalLqr:
                 else JUMP_FLIGHT_PRELOAD_RATE_MPS
             )
         if phase == "landing":
-            return JUMP_LANDING_RATE_MPS
+            return (
+                JUMP_RECOVERY_LEG_RATE_MPS
+                if self.jump.recovering
+                else JUMP_LANDING_RATE_MPS
+            )
+        return WALK_LEG_LENGTH_RATE_MPS
+
+    def _drop_rate_limit(self, phase: str | None) -> float:
+        if phase == "preload":
+            return DROP_PRELOAD_RATE_MPS
+        if phase == "flight":
+            return DROP_FLIGHT_EXTENSION_RATE_MPS
+        if phase == "landing":
+            return DROP_LANDING_RATE_MPS
+        if phase == "recovery":
+            return DROP_RECOVERY_LEG_RATE_MPS
         return WALK_LEG_LENGTH_RATE_MPS
 
     def _legs_near_target(self, data: mujoco.MjData, target: float) -> bool:
         lengths = self.leg_lengths(data)
         return bool(np.max(np.abs(lengths - target)) <= JUMP_LENGTH_TOLERANCE_M)
+
+    def _jump_recovery_body_is_stable(
+        self,
+        data: mujoco.MjData,
+        contacts: tuple[int, int],
+    ) -> bool:
+        """Gate the handoff back to walking on a quiet, two-wheel stance."""
+        if not all(contact_count > 0 for contact_count in contacts):
+            return False
+        attitude_error = self.airborne_attitude_error(data)
+        pitch_error = abs(float(attitude_error[0]))
+        pitch_rate = abs(float(data.qvel[self.root_dof + 3]))
+        vertical_speed = abs(float(data.qvel[self.root_dof + 2]))
+        forward_speed = abs(self.forward_speed(data))
+        leg_difference = float(np.ptp(self.leg_lengths(data)))
+        return bool(
+            pitch_error <= JUMP_RECOVERY_MAX_PITCH_ERROR_RAD
+            and pitch_rate <= JUMP_RECOVERY_MAX_PITCH_RATE_RAD_S
+            and vertical_speed <= JUMP_RECOVERY_MAX_VERTICAL_SPEED_MPS
+            and forward_speed <= JUMP_RECOVERY_MAX_FORWARD_SPEED_MPS
+            and leg_difference <= JUMP_RECOVERY_MAX_LEG_DIFFERENCE_M
+        )
+
+    def _drop_recovery_body_is_stable(
+        self,
+        data: mujoco.MjData,
+        contacts: tuple[int, int],
+    ) -> bool:
+        """Use the jump landing checks with a bounded rolling speed allowance."""
+        if not all(contact_count > 0 for contact_count in contacts):
+            return False
+        attitude_error = self.airborne_attitude_error(data)
+        pitch_error = abs(float(attitude_error[0]))
+        pitch_rate = abs(float(data.qvel[self.root_dof + 3]))
+        vertical_speed = abs(float(data.qvel[self.root_dof + 2]))
+        forward_speed = abs(self.forward_speed(data))
+        leg_difference = float(np.ptp(self.leg_lengths(data)))
+        return bool(
+            pitch_error <= DROP_RECOVERY_MAX_PITCH_ERROR_RAD
+            and pitch_rate <= DROP_RECOVERY_MAX_PITCH_RATE_RAD_S
+            and vertical_speed <= DROP_RECOVERY_MAX_VERTICAL_SPEED_MPS
+            and forward_speed <= DROP_RECOVERY_MAX_FORWARD_SPEED_MPS
+            and leg_difference <= DROP_RECOVERY_MAX_LEG_DIFFERENCE_M
+        )
 
     def _abort_jump(self, data: mujoco.MjData, reason: str) -> None:
         self.jump.abort_reason = reason
@@ -868,7 +1592,11 @@ class PhysicalLqr:
         if phase is None:
             return None
         sim_time = float(data.time)
-        grounded = all(wheel_ground_contacts(data, self.refs, geom_id) for geom_id in self.refs.wheel_geoms)
+        contacts = tuple(
+            wheel_ground_contacts(data, self.refs, geom_id)
+            for geom_id in self.refs.wheel_geoms
+        )
+        grounded = self.jump.grounded_with_hysteresis(contacts)
         if phase == "prepare":
             self.set_target_leg_length(JUMP_PREPARE_LENGTH_M, jump=True)
             self.jump.settled_steps = self.jump.settled_steps + 1 if grounded and self._legs_near_target(data, JUMP_PREPARE_LENGTH_M) else 0
@@ -883,6 +1611,7 @@ class PhysicalLqr:
             if self.jump.settled_steps >= JUMP_SETTLE_STEPS:
                 self.jump.transition("thrust", sim_time)
                 self.set_target_leg_length(JUMP_THRUST_LENGTH_M, jump=True)
+                self.speed_error_integral = 0.0
             elif self.jump.elapsed(sim_time) > JUMP_CROUCH_TIMEOUT_S:
                 self._abort_jump(data, "crouch timeout")
         elif phase == "thrust":
@@ -902,26 +1631,189 @@ class PhysicalLqr:
                 else JUMP_FLIGHT_PRELOAD_LENGTH_M
             )
             self.set_target_leg_length(target_length, jump=True)
-            if grounded:
+            # Require actual, consecutive two-wheel contacts before moving to
+            # landing. ``grounded`` is intentionally hysteretic for liftoff,
+            # but it cannot be reused here because the counter was reset when
+            # the flight phase began.
+            landed = all(contact_count > 0 for contact_count in contacts)
+            self.jump.settled_steps = self.jump.settled_steps + 1 if landed else 0
+            if self.jump.settled_steps >= JUMP_LANDING_CONTACT_CONFIRM_STEPS:
                 self.jump.transition("landing", sim_time)
                 self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
             elif self.jump.elapsed(sim_time) > JUMP_FLIGHT_TIMEOUT_S:
                 self._abort_jump(data, "flight timeout")
         elif phase == "landing":
-            self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
-            self.jump.settled_steps = self.jump.settled_steps + 1 if grounded and self._legs_near_target(data, JUMP_LANDING_LENGTH_M) else 0
-            if self.jump.settled_steps >= JUMP_SETTLE_STEPS:
-                resume_length = self.jump.resume_length
-                self.jump.finish()
-                if resume_length is not None:
-                    self.set_target_leg_length(resume_length)
-            elif self.jump.elapsed(sim_time) > JUMP_LANDING_TIMEOUT_S:
-                self.jump.abort_reason = "landing timeout without stable contact"
-                resume_length = self.jump.resume_length
-                self.jump.finish()
-                if resume_length is not None:
-                    self.set_target_leg_length(resume_length)
+            resume_length = self.jump.resume_length
+            if self.jump.recovering:
+                # Keep the jump controller in charge while the compliant
+                # landing target returns to the requested walking length.  A
+                # direct finish here used to restore the full walking trim in
+                # one tick, causing a second bounce after an otherwise stable
+                # high jump.
+                target_length = (
+                    JUMP_LANDING_LENGTH_M
+                    if resume_length is None
+                    else float(resume_length)
+                )
+                recovery_body_stable = self._jump_recovery_body_is_stable(data, contacts)
+                if recovery_body_stable:
+                    self.set_target_leg_length(target_length)
+                    self.jump.recovery_stable_steps = (
+                        self.jump.recovery_stable_steps + 1
+                        if self._legs_near_target(data, target_length)
+                        else 0
+                    )
+                else:
+                    # Arrest the handoff on the impact target whenever the
+                    # body is still pitching, bouncing or unloading a wheel.
+                    # This keeps the closed-chain links synchronized instead
+                    # of forcing them toward the walking target mid-impact.
+                    self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
+                    self.jump.recovery_stable_steps = 0
+                required_steps = max(1, int(np.ceil(JUMP_RECOVERY_STABLE_SECONDS / self.dt)))
+                if self.jump.recovery_stable_steps >= required_steps:
+                    resume_speed = self.jump.resume_speed
+                    self.jump.finish()
+                    if resume_speed is not None:
+                        self.set_target_speed(resume_speed)
+                    self.speed_error_integral = 0.0
+                elif (
+                    self.jump.recovery_start_time is not None
+                    and sim_time - self.jump.recovery_start_time > JUMP_RECOVERY_TIMEOUT_S
+                ):
+                    self.jump.abort_reason = "landing recovery timeout without stable contact"
+                    resume_speed = self.jump.resume_speed
+                    self.jump.finish()
+                    if resume_speed is not None:
+                        self.set_target_speed(resume_speed)
+                    self.speed_error_integral = 0.0
+            else:
+                self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
+                self.jump.settled_steps = (
+                    self.jump.settled_steps + 1
+                    if grounded and self._legs_near_target(data, JUMP_LANDING_LENGTH_M)
+                    else 0
+                )
+                if self.jump.settled_steps >= JUMP_SETTLE_STEPS:
+                    self.jump.begin_recovery(sim_time)
+                    self.motion.current_speed = 0.0
+                    self.set_target_speed(0.0)
+                    self.speed_error_integral = 0.0
+                    self.hold_current_yaw(data)
+                    if resume_length is not None:
+                        self.set_target_leg_length(float(resume_length))
+                elif self.jump.elapsed(sim_time) > JUMP_LANDING_TIMEOUT_S:
+                    self.jump.abort_reason = "landing timeout without stable contact"
+                    resume_speed = self.jump.resume_speed
+                    self.jump.finish()
+                    if resume_length is not None:
+                        self.set_target_leg_length(float(resume_length))
+                    if resume_speed is not None:
+                        self.set_target_speed(resume_speed)
+                    self.speed_error_integral = 0.0
         return self.jump.phase_name
+
+    def _abort_drop(self, data: mujoco.MjData, reason: str) -> None:
+        self.drop.abort_reason = reason
+        self.drop.transition("landing", float(data.time))
+        self.set_target_leg_length(DROP_LANDING_LENGTH_M, jump=True)
+        print(f"Terrain drop recovery: {reason}", flush=True)
+
+    def _finish_drop(self, data: mujoco.MjData) -> None:
+        """Return the nominal locomotion command after a stable down-step."""
+        resume_length = self.drop.resume_length
+        resume_speed = self.drop.resume_speed
+        if self._terrain_support_reference_enabled:
+            # During flight the hfield sample can already switch to the lower
+            # surface, making the old height-delta condition appear false by
+            # recovery completion.  Rebase unconditionally from the settled
+            # physical state so the walking LQR never retains a stale root-Z
+            # target after a real step-down.
+            self.rebase_terrain_support_reference(data, self._terrain_support_height_m)
+            self.rebase_locomotion_reference(data)
+        self.drop.finish()
+        if resume_length is not None:
+            self.set_target_leg_length(float(resume_length))
+        if resume_speed is not None:
+            self.set_target_speed(float(resume_speed))
+        self.speed_error_integral = 0.0
+
+    def _update_drop_state(self, data: mujoco.MjData) -> str | None:
+        """Advance the local down-step state without invoking jump semantics."""
+        phase = self.drop.phase_name
+        if phase is None:
+            return None
+        sim_time = float(data.time)
+        contacts = tuple(
+            wheel_ground_contacts(data, self.refs, geom_id)
+            for geom_id in self.refs.wheel_geoms
+        )
+        full_support = all(contact_count > 0 for contact_count in contacts)
+        if phase == "preload":
+            self.set_target_leg_length(DROP_PRELOAD_LENGTH_M, jump=True)
+            self.drop.unloaded_steps = (
+                self.drop.unloaded_steps + 1 if not any(contacts) else 0
+            )
+            if self.drop.unloaded_steps >= DROP_FLIGHT_ENTRY_CONFIRM_STEPS:
+                self.drop.transition("flight", sim_time)
+                self.set_target_leg_length(DROP_FLIGHT_EXTENSION_LENGTH_M, jump=True)
+                print(
+                    f"Terrain drop flight: t={sim_time:.3f}s height={self.drop.drop_height_m:.3f}m",
+                    flush=True,
+                )
+            elif self.drop.elapsed(sim_time) > DROP_PRELOAD_TIMEOUT_S:
+                # The local preview can see a feature on a parallel lane that
+                # the wheels never cross.  Restore walking rather than holding
+                # a widened stance indefinitely.
+                self._finish_drop(data)
+        elif phase == "flight":
+            self.drop.flight_steps += 1
+            self.set_target_leg_length(DROP_FLIGHT_EXTENSION_LENGTH_M, jump=True)
+            self.drop.settled_steps = self.drop.settled_steps + 1 if full_support else 0
+            if self.drop.settled_steps >= DROP_LANDING_CONTACT_CONFIRM_STEPS:
+                self.drop.transition("landing", sim_time)
+                self.set_target_leg_length(DROP_LANDING_LENGTH_M, jump=True)
+            elif self.drop.elapsed(sim_time) > DROP_FLIGHT_TIMEOUT_S:
+                self._abort_drop(data, "flight timeout without two-wheel landing")
+        elif phase == "landing":
+            self.set_target_leg_length(DROP_LANDING_LENGTH_M, jump=True)
+            self.drop.settled_steps = (
+                self.drop.settled_steps + 1
+                if full_support and self._legs_near_target(data, DROP_LANDING_LENGTH_M)
+                else 0
+            )
+            if self.drop.settled_steps >= DROP_LANDING_SETTLE_STEPS:
+                self.drop.begin_recovery(sim_time)
+                self.motion.current_speed = 0.0
+                self.set_target_speed(0.0)
+                self.speed_error_integral = 0.0
+                self.hold_current_yaw(data)
+            elif self.drop.elapsed(sim_time) > DROP_LANDING_TIMEOUT_S:
+                self._abort_drop(data, "landing timeout without stable contact")
+        elif phase == "recovery":
+            resume_length = self.drop.resume_length
+            target_length = (
+                DROP_LANDING_LENGTH_M if resume_length is None else float(resume_length)
+            )
+            if self._drop_recovery_body_is_stable(data, contacts):
+                self.set_target_leg_length(target_length)
+                self.drop.recovery_stable_steps = (
+                    self.drop.recovery_stable_steps + 1
+                    if self._legs_near_target(data, target_length)
+                    else 0
+                )
+            else:
+                self.set_target_leg_length(DROP_LANDING_LENGTH_M, jump=True)
+                self.drop.recovery_stable_steps = 0
+            required_steps = max(1, int(np.ceil(DROP_RECOVERY_STABLE_SECONDS / self.dt)))
+            if self.drop.recovery_stable_steps >= required_steps:
+                self._finish_drop(data)
+            elif (
+                self.drop.recovery_start_time is not None
+                and sim_time - self.drop.recovery_start_time > DROP_RECOVERY_TIMEOUT_S
+            ):
+                self._abort_drop(data, "landing recovery timeout without stable contact")
+        return self.drop.phase_name
 
     def solve_equilibrium(self, data: mujoco.MjData) -> np.ndarray:
         """Find the real motor torques that balance the assembled model."""
@@ -1028,6 +1920,11 @@ class PhysicalLqr:
         qvel_reference = self._reference_qvel.copy()
         # Do not impose an absolute horizontal position or wheel angle while driving.
         qpos_reference[self.root_qpos : self.root_qpos + 2] = data.qpos[self.root_qpos : self.root_qpos + 2]
+        if self._terrain_support_reference_enabled:
+            qpos_reference[self.root_qpos + 2] = self._terrain_support_root_z_reference(
+                data,
+                float(qpos_reference[self.root_qpos + 2]),
+            )
         qpos_reference[self.root_qpos + 3 : self.root_qpos + 7] = self._heading_reference_quaternion(
             self.heading_yaw(data)
         )
@@ -1062,22 +1959,40 @@ class PhysicalLqr:
         position_error = np.zeros(self.model.nv)
         mujoco.mj_differentiatePos(self.model, position_error, 1.0, qpos_reference, data.qpos)
         velocity_error = data.qvel - qvel_reference
-        if self._forward_speed_schedule_active():
-            return np.concatenate((position_error, velocity_error))
-        # The contact LQR is linearised at walking trim.  Let the outer wheel
-        # PI own high forward speed instead of feeding a multi-m/s error back
-        # through a small-signal gain designed around zero velocity.
-        forward = self.forward_direction(data)
-        root_velocity_error = velocity_error[self.root_dof : self.root_dof + 3]
-        forward_error = float(np.dot(root_velocity_error, forward))
-        root_velocity_error += forward * (
-            float(np.clip(
-                forward_error,
-                -LQR_FORWARD_SPEED_FEEDBACK_LIMIT_MPS,
-                LQR_FORWARD_SPEED_FEEDBACK_LIMIT_MPS,
-            ))
-            - forward_error
-        )
+        if not self._forward_speed_schedule_active():
+            # The contact LQR is linearised at walking trim.  Let the outer wheel
+            # PI own high forward speed instead of feeding a multi-m/s error back
+            # through a small-signal gain designed around zero velocity.
+            forward = self.forward_direction(data)
+            root_velocity_error = velocity_error[self.root_dof : self.root_dof + 3]
+            forward_error = float(np.dot(root_velocity_error, forward))
+            root_velocity_error += forward * (
+                float(np.clip(
+                    forward_error,
+                    -LQR_FORWARD_SPEED_FEEDBACK_LIMIT_MPS,
+                    LQR_FORWARD_SPEED_FEEDBACK_LIMIT_MPS,
+                ))
+                - forward_error
+            )
+
+        # The root's horizontal free-joint coordinates are world-frame, while
+        # the fixed LQR gain was obtained at ``_linearization_heading_yaw``.
+        # Express only those translational error channels in the original
+        # linearization frame.  Joint, vertical and angular channels remain in
+        # their native coordinates.  This preserves yaw-equivariance without
+        # relinearizing on a non-smooth hfield contact at every terrain reset.
+        heading_delta = wrap_to_pi(self.heading_yaw(data) - self._linearization_heading_yaw)
+        cosine = float(np.cos(heading_delta))
+        sine = float(np.sin(heading_delta))
+        for horizontal_error in (
+            position_error[self.root_dof : self.root_dof + 2],
+            velocity_error[self.root_dof : self.root_dof + 2],
+        ):
+            world_x, world_y = float(horizontal_error[0]), float(horizontal_error[1])
+            horizontal_error[:] = (
+                cosine * world_x + sine * world_y,
+                -sine * world_x + cosine * world_y,
+            )
         return np.concatenate((position_error, velocity_error))
 
     def apply_walking_stance_guard(self, data: mujoco.MjData, command: np.ndarray) -> None:
@@ -1107,6 +2022,21 @@ class PhysicalLqr:
             -force_limit,
             force_limit,
         )
+        synchronize_drop_legs = self.drop.phase_name in ("flight", "landing", "recovery")
+        if self.jump.phase_name in ("thrust", "flight", "landing") or synchronize_drop_legs:
+            leg_difference = float(lengths[0] - lengths[1])
+            differential_velocity = float(velocities[0] - velocities[1])
+            synchronization_force = float(np.clip(
+                JUMP_LEG_SYNC_KP_N_PER_M * leg_difference
+                + JUMP_LEG_SYNC_KD_NS_PER_M * differential_velocity,
+                -JUMP_LEG_SYNC_FORCE_LIMIT_N,
+                JUMP_LEG_SYNC_FORCE_LIMIT_N,
+            ))
+            # A positive difference means the left chain is longer; reduce its
+            # extension force and add the same force to the right chain.
+            forces[0] -= synchronization_force
+            forces[1] += synchronization_force
+            forces = np.clip(forces, -force_limit, force_limit)
         jacobian = self.leg_profile.hip_length_jacobian(self._reference_shape)
         command[list(self.hip_actuator_ids)] += jacobian * np.array(
             (-forces[0], -forces[0], forces[1], -forces[1])
@@ -1114,10 +2044,30 @@ class PhysicalLqr:
 
     def apply_wheel_speed_governor(self, data: mujoco.MjData, command: np.ndarray) -> None:
         """World-frame wheel PI with conditional integration and saturation protection."""
-        if not all(wheel_ground_contacts(data, self.refs, geom_id) for geom_id in self.refs.wheel_geoms):
+        contacts = tuple(
+            wheel_ground_contacts(data, self.refs, geom_id) > 0
+            for geom_id in self.refs.wheel_geoms
+        )
+        full_support = all(contacts)
+        if not any(contacts):
             self.speed_error_integral = 0.0
             return
         speed_error = self.motion.current_speed - self.forward_speed(data)
+        # With one supporting wheel, regular locomotion must not accelerate the
+        # robot.  During an explicit recovery, however, retain a bounded P-only
+        # braking torque through the wheel that still has ground contact.
+        if not full_support:
+            self.speed_error_integral = 0.0
+            if not self._contact_recovery_braking:
+                return
+            wheel_command = float(np.clip(
+                WALK_SPEED_KP_MOTOR_NM_PER_MPS * speed_error,
+                -CONTACT_RECOVERY_WHEEL_BRAKE_LIMIT_MOTOR_NM,
+                CONTACT_RECOVERY_WHEEL_BRAKE_LIMIT_MOTOR_NM,
+            ))
+            command[self.refs.actuator_ids[2]] += wheel_command
+            command[self.refs.actuator_ids[5]] += wheel_command
+            return
         proposed_integral = float(np.clip(
             self.speed_error_integral + speed_error * self.dt,
             -WALK_SPEED_INTEGRAL_LIMIT_M,
@@ -1134,21 +2084,56 @@ class PhysicalLqr:
         command[self.refs.actuator_ids[2]] += wheel_command
         command[self.refs.actuator_ids[5]] += wheel_command
 
+    def apply_jump_recovery_wheel_brake(self, data: mujoco.MjData, command: np.ndarray) -> None:
+        """Use bounded common wheel torque to stabilize the post-landing body.
+
+        Differential wheel torque and the normal speed integrator remain off
+        until the recovery gate completes.  The airborne pitch feedback is
+        retained for the first impact window; without it the landing trim's
+        contact impulse can slowly drive the body past the guard threshold.
+        """
+        if not any(
+            wheel_ground_contacts(data, self.refs, geom_id) > 0
+            for geom_id in self.refs.wheel_geoms
+        ):
+            return
+        attitude_error = self.airborne_attitude_error(data)
+        pitch_rate = float(data.qvel[self.root_dof + 3])
+        wheel_command = float(np.clip(
+            AIRBORNE_WHEEL_ATTITUDE_KP_NM_PER_RAD * float(attitude_error[0])
+            + AIRBORNE_WHEEL_ATTITUDE_KD_NM_PER_RAD_S * pitch_rate,
+            -JUMP_RECOVERY_WHEEL_BRAKE_LIMIT_NM,
+            JUMP_RECOVERY_WHEEL_BRAKE_LIMIT_NM,
+        ))
+        # Replace the landing trim's differential wheel terms rather than
+        # adding to them; yaw torque during a partially loaded touchdown can
+        # unload one wheel and defeat the recovery gate.
+        command[self.refs.actuator_ids[2]] = wheel_command
+        command[self.refs.actuator_ids[5]] = wheel_command
+
     def apply_yaw_heading_governor(self, data: mujoco.MjData, command: np.ndarray) -> None:
         """Track command_yaw using bounded differential wheel torque."""
         if not all(wheel_ground_contacts(data, self.refs, geom_id) for geom_id in self.refs.wheel_geoms):
             self._measured_yaw_rate = 0.0
             return
+        if self._terrain_heading_stabilization_enabled:
+            heading_kp = TERRAIN_YAW_HEADING_KP_RAD_S_PER_RAD
+            yaw_rate_kp = TERRAIN_YAW_RATE_KP_MOTOR_NM_PER_RAD_S
+            command_limit = TERRAIN_YAW_GOVERNOR_LIMIT_MOTOR_NM
+        else:
+            heading_kp = YAW_HEADING_KP_RAD_S_PER_RAD
+            yaw_rate_kp = YAW_RATE_KP_MOTOR_NM_PER_RAD_S
+            command_limit = YAW_GOVERNOR_LIMIT_MOTOR_NM
         yaw_error = wrap_to_pi(self.heading_command.reference_yaw - self.heading_yaw(data))
         target_yaw_rate = float(np.clip(
-            YAW_HEADING_KP_RAD_S_PER_RAD * yaw_error,
+            heading_kp * yaw_error,
             -MAX_YAW_RATE_RAD_S,
             MAX_YAW_RATE_RAD_S,
         ))
         differential_command = float(np.clip(
-            YAW_RATE_KP_MOTOR_NM_PER_RAD_S * (target_yaw_rate - self._measured_yaw_rate),
-            -YAW_GOVERNOR_LIMIT_MOTOR_NM,
-            YAW_GOVERNOR_LIMIT_MOTOR_NM,
+            yaw_rate_kp * (target_yaw_rate - self._measured_yaw_rate),
+            -command_limit,
+            command_limit,
         ))
         # Positive yaw is counter-clockwise about +Z.  The measured drivetrain
         # calibration maps a left-minus-right wheel command to negative yaw.
@@ -1176,6 +2161,28 @@ class PhysicalLqr:
         )
         command[self.refs.actuator_ids[2]] = 0.0
         command[self.refs.actuator_ids[5]] = 0.0
+
+    def apply_jump_thrust_wheel_control(self, data: mujoco.MjData, command: np.ndarray) -> None:
+        """Preserve a bounded rolling launch impulse while both wheels support."""
+        # Keep the validated near-static jump trajectory unchanged. This
+        # compensation is only meaningful for an explicit rolling launch
+        # request, where the contact phase must retain forward momentum to
+        # clear a terrain feature.
+        if abs(self.jump.launch_speed) <= JUMP_MAX_LAUNCH_SPEED_MPS:
+            return
+        if not all(
+            wheel_ground_contacts(data, self.refs, geom_id) > 0
+            for geom_id in self.refs.wheel_geoms
+        ):
+            return
+        speed_error = self.jump.launch_speed - self.forward_speed(data)
+        wheel_command = float(np.clip(
+            JUMP_THRUST_WHEEL_KP_NM_PER_MPS * speed_error,
+            -JUMP_THRUST_WHEEL_LIMIT_NM,
+            JUMP_THRUST_WHEEL_LIMIT_NM,
+        ))
+        command[self.refs.actuator_ids[2]] += wheel_command
+        command[self.refs.actuator_ids[5]] += wheel_command
 
     def airborne_attitude_error(self, data: mujoco.MjData) -> np.ndarray:
         """Return body attitude error relative to the yaw-aligned trim frame."""
@@ -1210,25 +2217,64 @@ class PhysicalLqr:
             return JUMP_LANDING_FORCE_LIMIT_N
         return LEG_LENGTH_FORCE_LIMIT_N
 
-    def command(self, data: mujoco.MjData) -> np.ndarray:
-        self.apply_gas_spring_assist(data)
+    def _drop_leg_force_limit(self, phase: str | None) -> float:
+        if phase == "preload":
+            return DROP_PRELOAD_FORCE_LIMIT_N
+        if phase == "flight":
+            return DROP_FLIGHT_FORCE_LIMIT_N
+        if phase in ("landing", "recovery"):
+            return DROP_LANDING_FORCE_LIMIT_N
+        return LEG_LENGTH_FORCE_LIMIT_N
+
+    def _command_after_gas_spring(self, data: mujoco.MjData) -> np.ndarray:
+        """Build a command after the gas-spring generalized force is present."""
         self._advance_motion_reference(data)
         self._update_measured_yaw_rate(data)
+        self._update_pending_jump(data)
         phase = self._update_jump_state(data)
-        self._advance_leg_reference(data, self._jump_rate_limit())
-        if phase == "flight":
+        drop_phase = None if phase is not None else self._update_drop_state(data)
+        leg_rate_limit = (
+            self._jump_rate_limit()
+            if phase is not None
+            else self._drop_rate_limit(drop_phase)
+        )
+        self._advance_leg_reference(data, leg_rate_limit)
+        if phase == "flight" or drop_phase == "flight":
             command = np.zeros(self.model.nu)
             self.apply_airborne_recovery(data, command)
-            self.apply_leg_length_force(data, command, self._jump_leg_force_limit(phase))
+            force_limit = (
+                self._jump_leg_force_limit(phase)
+                if phase is not None
+                else self._drop_leg_force_limit(drop_phase)
+            )
+            self.apply_leg_length_force(data, command, force_limit)
             self.apply_airborne_wheel_attitude_control(data, command)
             return np.clip(command, self.model.actuator_ctrlrange[:, 0], self.model.actuator_ctrlrange[:, 1])
 
         reference_control, reference_gain = self._scheduled_control_and_gain()
         command = reference_control - reference_gain @ self.state_error(data)
-        if phase == "landing":
+        landing_managed = phase == "landing" or drop_phase in ("landing", "recovery")
+        if landing_managed:
+            stance_guard_scale = JUMP_LANDING_STANCE_GUARD_SCALE
+            recovery_start_time = (
+                self.jump.recovery_start_time
+                if phase == "landing" and self.jump.recovering
+                else self.drop.recovery_start_time if drop_phase == "recovery" else None
+            )
+            if recovery_start_time is not None:
+                recovery_progress = float(np.clip(
+                    (float(data.time) - recovery_start_time)
+                    / JUMP_RECOVERY_STANCE_GUARD_RAMP_SECONDS,
+                    0.0,
+                    1.0,
+                ))
+                stance_guard_scale = (
+                    JUMP_RECOVERY_STANCE_GUARD_INITIAL_SCALE
+                    + (1.0 - JUMP_RECOVERY_STANCE_GUARD_INITIAL_SCALE) * recovery_progress
+                )
             position_error = self._reference_hip_qpos - data.qpos[self.hip_qpos_addresses]
             velocity_error = -data.qvel[self.hip_dof_addresses]
-            command[list(self.hip_actuator_ids)] += JUMP_LANDING_STANCE_GUARD_SCALE * (
+            command[list(self.hip_actuator_ids)] += stance_guard_scale * (
                 WALK_STANCE_GUARD_KP_NM_PER_RAD * position_error
                 + WALK_STANCE_GUARD_KD_NM_PER_RAD_PER_S * velocity_error
             )
@@ -1237,15 +2283,62 @@ class PhysicalLqr:
         self.apply_leg_length_force(
             data,
             command,
-            self._jump_leg_force_limit(phase),
+            self._jump_leg_force_limit(phase)
+            if phase is not None
+            else self._drop_leg_force_limit(drop_phase),
         )
-        if phase is None:
-            self.apply_wheel_speed_governor(data, command)
-            self.apply_yaw_heading_governor(data, command)
+        if phase is None or phase in ("prepare", "crouch"):
+            if drop_phase in ("landing", "recovery"):
+                self.apply_jump_recovery_wheel_brake(data, command)
+            else:
+                self.apply_wheel_speed_governor(data, command)
+                self.apply_yaw_heading_governor(data, command)
         elif phase == "thrust":
             command[self.refs.actuator_ids[2]] = 0.0
             command[self.refs.actuator_ids[5]] = 0.0
+            self.apply_jump_thrust_wheel_control(data, command)
+        elif phase == "landing" and self.jump.recovering:
+            self.apply_jump_recovery_wheel_brake(data, command)
         return np.clip(command, self.model.actuator_ctrlrange[:, 0], self.model.actuator_ctrlrange[:, 1])
+
+    def command(self, data: mujoco.MjData) -> np.ndarray:
+        """Build the nominal command from the current measured state."""
+        self.apply_gas_spring_assist(data)
+        return self._command_after_gas_spring(data)
+
+    def command_with_delay_prediction(
+        self,
+        data: mujoco.MjData,
+        delayed_controls: tuple[np.ndarray, ...],
+    ) -> np.ndarray:
+        """Predict through queued controls before computing a delayed command.
+
+        The actuator FIFO is the only source of delay.  This method advances a
+        preallocated shadow state through the controls already waiting in that
+        FIFO, then evaluates the LQR once at the state where its new command
+        will actually take effect.  It is intentionally for normal walking
+        only; jump and contact-recovery phases keep their protected direct
+        control path.
+        """
+        if not delayed_controls:
+            return self.command(data)
+        if any(np.asarray(control, dtype=np.float64).shape != (self.model.nu,) for control in delayed_controls):
+            raise ValueError("each delayed control must have shape (nu,)")
+
+        self.apply_gas_spring_assist(data)
+        prediction = self._delay_prediction_data
+        mujoco.mj_copyData(prediction, self.model, data)
+        for delayed_control in delayed_controls:
+            prediction.ctrl[:] = np.clip(
+                np.asarray(delayed_control, dtype=np.float64),
+                self.model.actuator_ctrlrange[:, 0],
+                self.model.actuator_ctrlrange[:, 1],
+            )
+            # qfrc_applied is a per-step force field.  Reapply it for every
+            # predicted physics tick just as command() does on the real data.
+            self.apply_gas_spring_assist(prediction)
+            mujoco.mj_step(self.model, prediction)
+        return self._command_after_gas_spring(prediction)
 
 
 def validate_standing_contact(data: mujoco.MjData, refs: ModelRefs) -> None:

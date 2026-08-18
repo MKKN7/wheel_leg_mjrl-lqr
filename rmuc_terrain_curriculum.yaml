@@ -1,0 +1,283 @@
+schema_version: 2
+name: rmuc_full_body_locomotion_v2
+limits:
+  max_forward_speed_mps: 2.0
+  max_yaw_rate_rad_s: 0.45
+tasks:
+  - id: flat
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.40
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_distance_m: 0.75
+    completion_tolerance_m: 0.15
+    max_episode_seconds: 14.0
+    routes:
+      - id: origin_flat_positive_y
+        spawn:
+          x_m: 0.0
+          y_m: 0.0
+          yaw_rad: 1.5707963267948966
+        goal:
+          x_m: 0.0
+          y_m: 2.40
+          yaw_rad: 1.5707963267948966
+        corridor_half_width_m: 0.35
+  - id: uphill
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.30
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_distance_m: 2.50
+    completion_tolerance_m: 0.20
+    max_episode_seconds: 40.0
+    routes:
+      - id: rmuc_grade_up_9p6deg
+        spawn:
+          x_m: -18.137
+          y_m: -6.051
+          yaw_rad: -2.6179938779914944
+        goal:
+          x_m: -20.736
+          y_m: -7.551
+          yaw_rad: -2.6179938779914944
+        corridor_half_width_m: 0.25
+  - id: downhill
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.30
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_distance_m: 2.50
+    completion_tolerance_m: 0.20
+    max_episode_seconds: 40.0
+    routes:
+      - id: rmuc_grade_down_9p6deg
+        spawn:
+          x_m: -20.736
+          y_m: -7.551
+          yaw_rad: 0.5235987755982988
+        goal:
+          x_m: -18.137
+          y_m: -6.051
+          yaw_rad: 0.5235987755982988
+        corridor_half_width_m: 0.25
+  - id: stair_up
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.18
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    # Trigger early enough for the prepare/crouch trajectory to complete
+    # before the 0.204 m riser at ~1.45 m.  This is a high-level command edge,
+    # not a route signal exposed to the policy.
+    jump_trigger_progress_m: 0.60
+    jump_launch_speed_mps: 0.30
+    required_distance_m: 1.95
+    completion_tolerance_m: 0.20
+    max_episode_seconds: 36.0
+    routes:
+      - id: rmuc_step_up_204mm
+        spawn:
+          x_m: -17.487
+          y_m: -6.551
+          yaw_rad: -1.5707963267948966
+        goal:
+          x_m: -17.487
+          y_m: -8.951
+          yaw_rad: -1.5707963267948966
+        corridor_half_width_m: 0.22
+  - id: stair_down
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.18
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_distance_m: 1.95
+    completion_tolerance_m: 0.20
+    max_episode_seconds: 36.0
+    routes:
+      - id: rmuc_step_down_204mm
+        spawn:
+          x_m: -17.487
+          y_m: -8.951
+          yaw_rad: 1.5707963267948966
+        goal:
+          x_m: -17.487
+          y_m: -6.551
+          yaw_rad: 1.5707963267948966
+        corridor_half_width_m: 0.22
+  - id: turn_left
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.40
+      yaw_rate_rad_s: 0.12
+      jump_request: false
+    completion_mode: command_tracking_hold
+    command_tracking_hold_seconds: 0.75
+    speed_tracking_tolerance_mps: 0.12
+    yaw_rate_tracking_tolerance_rad_s: 0.060
+    required_distance_m: 3.00
+    completion_tolerance_m: 0.25
+    max_episode_seconds: 16.0
+    routes:
+      - id: origin_turn_left
+        spawn:
+          x_m: 0.0
+          y_m: 0.0
+          yaw_rad: 3.141592653589793
+        goal:
+          x_m: -4.50
+          y_m: -2.00
+          yaw_rad: 1.791592653589793
+        corridor_half_width_m: 1.50
+  - id: turn_right
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.40
+      yaw_rate_rad_s: -0.12
+      jump_request: false
+    completion_mode: command_tracking_hold
+    command_tracking_hold_seconds: 0.75
+    speed_tracking_tolerance_mps: 0.12
+    yaw_rate_tracking_tolerance_rad_s: 0.060
+    required_distance_m: 3.00
+    completion_tolerance_m: 0.25
+    max_episode_seconds: 16.0
+    routes:
+      - id: origin_turn_right
+        spawn:
+          x_m: 0.0
+          y_m: -5.0
+          yaw_rad: 3.141592653589793
+        goal:
+          x_m: -4.50
+          y_m: -3.00
+          yaw_rad: -1.791592653589793
+        corridor_half_width_m: 1.50
+  - id: accel_turn
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 2.00
+      yaw_rate_rad_s: 0.30
+      jump_request: false
+    # This task is a command-tracking evaluation, not route following. The
+    # route only fixes a level RMUC start area for reproducible tests.
+    completion_mode: command_tracking_hold
+    command_tracking_hold_seconds: 1.00
+    speed_tracking_tolerance_mps: 0.12
+    yaw_rate_tracking_tolerance_rad_s: 0.075
+    required_distance_m: 6.00
+    completion_tolerance_m: 0.35
+    max_episode_seconds: 10.0
+    routes:
+      - id: origin_accel_left_turn
+        spawn:
+          x_m: 0.0
+          y_m: 0.0
+          yaw_rad: 3.141592653589793
+        goal:
+          x_m: -8.50
+          y_m: -5.00
+          yaw_rad: -2.709592653589793
+        corridor_half_width_m: 2.00
+  - id: accel_turn_right
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 2.00
+      yaw_rate_rad_s: -0.30
+      jump_request: false
+    # Mirror command-tracking test on a separate level RMUC lane. This route
+    # is reset/evaluation metadata only and is not exposed to the policy.
+    completion_mode: command_tracking_hold
+    command_tracking_hold_seconds: 1.00
+    speed_tracking_tolerance_mps: 0.12
+    yaw_rate_tracking_tolerance_rad_s: 0.075
+    required_distance_m: 6.00
+    completion_tolerance_m: 0.35
+    max_episode_seconds: 10.0
+    routes:
+      - id: origin_accel_right_turn
+        spawn:
+          x_m: 0.0
+          y_m: -5.0
+          yaw_rad: 3.141592653589793
+        goal:
+          x_m: -8.50
+          y_m: 0.0
+          yaw_rad: 1.6415926535897931
+        corridor_half_width_m: 2.00
+stages:
+  - id: flat_balance
+    task_ids:
+      - flat
+    evaluation_episodes: 100
+    maximum_unsafe_rate: 0.10
+    minimum_completion_rate: 0.90
+    command_speed_scale: 0.20
+    command_yaw_rate_scale: 0.35
+  - id: grades
+    task_ids:
+      - flat
+      - uphill
+      - downhill
+    evaluation_episodes: 100
+    maximum_unsafe_rate: 0.10
+    minimum_completion_rate: 0.90
+    command_speed_scale: 0.35
+    command_yaw_rate_scale: 0.45
+  - id: turning
+    task_ids:
+      - flat
+      - turn_left
+      - turn_right
+    evaluation_episodes: 100
+    maximum_unsafe_rate: 0.10
+    minimum_completion_rate: 0.90
+    command_speed_scale: 0.75
+    command_yaw_rate_scale: 0.75
+  - id: high_speed_turn
+    # Isolate the 2 m/s command-tracking contract on the verified flat RMUC
+    # lanes before combining it with terrain transitions. This is still a
+    # locomotion task: the route only fixes the reset area and is never a
+    # policy goal or navigation signal.
+    task_ids:
+      - flat
+      - turn_left
+      - turn_right
+      - accel_turn
+      - accel_turn_right
+    evaluation_episodes: 100
+    maximum_unsafe_rate: 0.10
+    minimum_completion_rate: 0.90
+    command_speed_scale: 1.0
+    command_yaw_rate_scale: 1.0
+  - id: steps
+    task_ids:
+      - uphill
+      - downhill
+      - stair_up
+      - stair_down
+    evaluation_episodes: 100
+    maximum_unsafe_rate: 0.10
+    minimum_completion_rate: 0.90
+    command_speed_scale: 0.50
+    command_yaw_rate_scale: 0.35
+  - id: dynamic_locomotion
+    task_ids:
+      - flat
+      - uphill
+      - downhill
+      - stair_up
+      - stair_down
+      - turn_left
+      - turn_right
+      - accel_turn
+      - accel_turn_right
+    evaluation_episodes: 100
+    maximum_unsafe_rate: 0.10
+    minimum_completion_rate: 0.90
+    command_speed_scale: 1.0
+    command_yaw_rate_scale: 1.0
