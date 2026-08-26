@@ -22,7 +22,12 @@ import numpy as np
 
 import lqr_deploy as lqr
 from lqr_deploy import HeadingCommand, PhysicalLqr, wrap_to_pi
-from terrain_curriculum import TerrainCurriculumConfig, TerrainRoute, TerrainTask
+from terrain_curriculum import (
+    TerrainCurriculumConfig,
+    TerrainRoute,
+    TerrainTask,
+    validate_scene_contract,
+)
 
 
 DEFAULT_EPISODE_SECONDS = 8.0
@@ -36,10 +41,21 @@ CONTACT_RECOVERY_BOTH_WHEELS_TRIGGER_SECONDS = 0.004
 CONTACT_RECOVERY_SINGLE_WHEEL_TRIGGER_SECONDS = 0.025
 CONTACT_RECOVERY_TIMEOUT_SECONDS = 0.180
 CONTACT_RECOVERY_STABLE_SECONDS = 0.080
+# At high speed a compliant hfield contact manifold can omit a few 1 kHz
+# contact reports while the wheel bottom remains within the measured support
+# tolerance. This is only a confidence filter for recovery bookkeeping; a
+# wheel that separates beyond this clearance still uses the normal recovery
+# and hard-safety path.
+WHEEL_NEAR_SUPPORT_CLEARANCE_M = 0.005
+TERRAIN_HIGH_SPEED_COMMAND_MIN_MPS = 1.50
+TERRAIN_HIGH_SPEED_COMMAND_MIN_YAW_RATE_RAD_S = 0.20
+TERRAIN_HIGH_SPEED_ACCELERATION_MPS2 = 0.30
+TERRAIN_HIGH_SPEED_YAW_ACCELERATION_RAD_S2 = 0.15
+TERRAIN_DIRECT_YAW_RATE_MIN_RAD_S = 1e-6
 RL_LEG_LENGTH_COMMAND_RATE_MPS = 0.05
 RL_COMMAND_SPEED_FRACTION = 0.65
-LOCOMOTION_COMMAND_SCHEMA = "speed_yaw_rate_jump_terrain_v7"
-RESIDUAL_AUTHORITY_SCHEMA = "phase_masked_residual_v4"
+LOCOMOTION_COMMAND_SCHEMA = "speed_yaw_rate_jump_terrain_v11"
+RESIDUAL_AUTHORITY_SCHEMA = "phase_masked_residual_v7"
 LEG_DIFF_STRAIGHT_WEIGHT = 2.0
 LEG_DIFF_TURN_WEIGHT = 0.5
 YAW_RATE_TRACKING_WEIGHT = 0.05
@@ -75,6 +91,7 @@ TERRAIN_LOOKAHEAD_DISTANCES_M = (0.10, 0.28, 0.50, 0.76)
 TERRAIN_LOOKAHEAD_LATERAL_OFFSETS_M = (-0.18, 0.0, 0.18)
 TERRAIN_HEIGHT_NORMALIZATION_M = 0.25
 TERRAIN_SLOPE_NORMALIZATION = 0.50
+STATIC_SUPPORT_FOOTPRINT_TOLERANCE_M = 1e-6
 TERRAIN_OBSERVATION_SIZE = (
     len(TERRAIN_LOOKAHEAD_DISTANCES_M) * len(TERRAIN_LOOKAHEAD_LATERAL_OFFSETS_M)
     + 4
@@ -106,6 +123,19 @@ class LocomotionCommand:
     forward_speed_mps: float
     yaw_rate_rad_s: float
     jump_request: bool = False
+
+
+def locomotion_command_conditioning_config() -> dict[str, float]:
+    """Return terrain command-conditioning values used for checkpoint identity."""
+    return {
+        "high_speed_command_min_mps": TERRAIN_HIGH_SPEED_COMMAND_MIN_MPS,
+        "high_speed_command_min_yaw_rate_rad_s": TERRAIN_HIGH_SPEED_COMMAND_MIN_YAW_RATE_RAD_S,
+        "high_speed_acceleration_mps2": TERRAIN_HIGH_SPEED_ACCELERATION_MPS2,
+        "high_speed_yaw_acceleration_rad_s2": TERRAIN_HIGH_SPEED_YAW_ACCELERATION_RAD_S2,
+        "high_speed_direct_yaw_rate_tracking": 1.0,
+        "terrain_direct_yaw_rate_min_rad_s": TERRAIN_DIRECT_YAW_RATE_MIN_RAD_S,
+        "wheel_near_support_clearance_m": WHEEL_NEAR_SUPPORT_CLEARANCE_M,
+    }
 
 
 @dataclass(frozen=True)
@@ -325,6 +355,10 @@ class WheelLegResidualEnv(gym.Env):
             raise ValueError("terrain_evaluation requires terrain_curriculum")
 
         self.xml_path = Path(xml_path) if xml_path is not None else lqr.XML_PATH
+        if terrain_curriculum is not None:
+            # Training scripts validate the same v4 contract before startup;
+            # keep direct Gymnasium construction equally fail-closed.
+            validate_scene_contract(terrain_curriculum, self.xml_path)
         self.model = mujoco.MjModel.from_xml_path(str(self.xml_path))
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
@@ -421,6 +455,11 @@ class WheelLegResidualEnv(gym.Env):
             ),
             None,
         )
+        self._terrain_static_box_geoms = tuple(
+            geom_id
+            for geom_id in self._terrain_support_geoms
+            if self.model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_BOX
+        )
         self._terrain_hfield_id: int | None = None
         self._terrain_hfield_size: np.ndarray | None = None
         self._terrain_hfield_rows = 0
@@ -501,7 +540,9 @@ class WheelLegResidualEnv(gym.Env):
         self._reference_heading_yaw = 0.0
         self._reference_body_height = 0.0
         self._command_speed = 0.0
+        self._lqr_speed_reference_scale = 1.0
         self._command_yaw_rate_rad_s = 0.0
+        self._conditioned_yaw_rate_rad_s = 0.0
         self._jump_command_request = False
         self._jump_request_latched = False
         self._next_command_resample_s = np.inf
@@ -560,6 +601,9 @@ class WheelLegResidualEnv(gym.Env):
         self._terrain_task_has_progress_jump = False
         self._terrain_spawn_surface_height_m = 0.0
         self._terrain_confirmed_support_height_m = 0.0
+        self._terrain_projection_support_height_m = float(
+            self.model.geom_pos[self.refs.ground_geom, 2]
+        )
         self._terrain_drop_latched = False
         self._terrain_drop_last_detected_height_m = 0.0
         self._sensor_noise_standard_deviation = np.zeros(self.model.nsensordata, dtype=np.float64)
@@ -916,7 +960,7 @@ class WheelLegResidualEnv(gym.Env):
         mujoco.mj_forward(self.model, self.data)
 
     def _prepare_lqr_projection_support(self) -> None:
-        """Use the inherited plane while building an LQR trim for an hfield scene."""
+        """Use the inherited plane while building an LQR trim for a terrain scene."""
         if not self._terrain_support_geoms:
             return
         self.model.geom_contype[self.refs.ground_geom] = self._nominal_geom_contype[self.refs.ground_geom]
@@ -925,9 +969,14 @@ class WheelLegResidualEnv(gym.Env):
             self.model.geom_contype[geom_id] = 0
             self.model.geom_conaffinity[geom_id] = 0
         mujoco.mj_forward(self.model, self.data)
+        # The cached LQR stance is projected against this plane, not against
+        # whichever static support happens to overlap its world XY coordinate.
+        self._terrain_projection_support_height_m = float(
+            self.data.geom_xpos[self.refs.ground_geom, 2]
+        )
 
     def _activate_terrain_support(self) -> None:
-        """Replace the temporary LQR projection plane with the scene hfield."""
+        """Replace the temporary LQR projection plane with the scene supports."""
         if not self._terrain_support_geoms:
             return
         self.model.geom_contype[self.refs.ground_geom] = 0
@@ -942,7 +991,7 @@ class WheelLegResidualEnv(gym.Env):
             raise RuntimeError("LQR controller is not available")
         self._controller.reset_commands(
             self.data,
-            self._command_speed,
+            self._lqr_speed_reference_for_command(self._command_speed),
             leg_length=self._command_leg_length,
             yaw=command_yaw,
         )
@@ -1047,8 +1096,7 @@ class WheelLegResidualEnv(gym.Env):
         """
         if self._controller is None or self._stance_qpos is None or self._stance_qvel is None:
             raise RuntimeError("low-centre stance has not been projected")
-        source_xy = self._stance_qpos[self._root_qpos_address : self._root_qpos_address + 2]
-        source_height = self.terrain_surface_height_m(source_xy)
+        source_height = self._terrain_projection_support_height_m
         spawn_xy = np.asarray(route.spawn.xy(), dtype=np.float64)
         spawn_height = self.terrain_surface_height_m(spawn_xy)
         self.data.qpos[:] = self._stance_qpos
@@ -1085,6 +1133,7 @@ class WheelLegResidualEnv(gym.Env):
     def _clear_terrain_route_state(self) -> None:
         self._active_terrain_task = None
         self._active_terrain_route = None
+        self._lqr_speed_reference_scale = 1.0
         self._terrain_task_deadline_s = self.episode_seconds
         self._terrain_start_xy.fill(0.0)
         self._terrain_progress_m = 0.0
@@ -1173,13 +1222,18 @@ class WheelLegResidualEnv(gym.Env):
     def _clamp_command_speed(self, speed: float) -> float:
         forward_limit = min(self.max_forward_speed, self.command_speed_limit_mps)
         reverse_limit = min(self.max_reverse_speed, forward_limit)
-        return float(
-            lqr.clamp_speed_command(
-                speed,
-                forward_limit=forward_limit,
-                reverse_limit=reverse_limit,
-            )
-        )
+        value = float(speed)
+        if not np.isfinite(value):
+            raise ValueError("command_speed must be finite")
+        # ``lqr.validate_forward_speed_limit`` describes the physical model
+        # envelope (currently >=1 m/s), whereas a curriculum command limit may
+        # intentionally be a conservative value such as 0.20 m/s.  Apply the
+        # high-level envelope locally and leave the physical LQR limit intact.
+        return float(np.clip(value, -reverse_limit, forward_limit))
+
+    def _lqr_speed_reference_for_command(self, high_level_speed_mps: float) -> float:
+        """Map a terrain task's high-level speed into its LQR reference."""
+        return float(high_level_speed_mps) * self._lqr_speed_reference_scale
 
     def _clamp_command_yaw_rate(self, yaw_rate_rad_s: float) -> float:
         value = float(yaw_rate_rad_s)
@@ -1190,6 +1244,44 @@ class WheelLegResidualEnv(gym.Env):
             -self.max_command_yaw_rate_rad_s,
             self.max_command_yaw_rate_rad_s,
         ))
+
+    def _uses_high_speed_command_conditioning(self) -> bool:
+        """Whether the current terrain command needs a gradual high-speed turn-in."""
+        return bool(
+            self._terrain_hfield_geom is not None
+            and abs(self._command_speed) >= TERRAIN_HIGH_SPEED_COMMAND_MIN_MPS
+            and abs(self._command_yaw_rate_rad_s)
+            >= TERRAIN_HIGH_SPEED_COMMAND_MIN_YAW_RATE_RAD_S
+        )
+
+    def _uses_terrain_direct_yaw_rate_tracking(self) -> bool:
+        """Whether a routed terrain task has an explicit nonzero yaw-rate command."""
+        return bool(
+            self._controller is not None
+            and self._controller.terrain_heading_stabilization_enabled
+            and abs(self._command_yaw_rate_rad_s) >= TERRAIN_DIRECT_YAW_RATE_MIN_RAD_S
+        )
+
+    def _apply_command_conditioning(self) -> None:
+        """Keep high-speed command entry inside the verified terrain envelope."""
+        if self._controller is None:
+            return
+        self._controller.motion.acceleration_limit = (
+            TERRAIN_HIGH_SPEED_ACCELERATION_MPS2
+            if self._uses_high_speed_command_conditioning()
+            else self.acceleration_limit
+        )
+
+    def _sync_terrain_yaw_rate_command(self) -> None:
+        """Route the conditioned terrain yaw request to the LQR."""
+        if self._controller is None:
+            return
+        if self._uses_terrain_direct_yaw_rate_tracking():
+            self._controller.set_terrain_yaw_rate_command(
+                self._conditioned_yaw_rate_rad_s
+            )
+        else:
+            self._controller.set_terrain_yaw_rate_command(None)
 
     def reset(
         self,
@@ -1202,6 +1294,9 @@ class WheelLegResidualEnv(gym.Env):
         self._clear_terrain_route_state()
         terrain_task, terrain_route = self._select_terrain_task(options)
         terrain_command = self._terrain_task_command(terrain_task)
+        self._lqr_speed_reference_scale = (
+            1.0 if terrain_task is None else terrain_task.lqr_speed_reference_scale
+        )
         if terrain_command is not None and any(
             key in options
             for key in (
@@ -1299,6 +1394,7 @@ class WheelLegResidualEnv(gym.Env):
             self._command_yaw_rate_rad_s = self.sample_command_yaw_rate(self.np_random)
         else:
             self._command_yaw_rate_rad_s = 0.0
+        self._conditioned_yaw_rate_rad_s = 0.0
         if "command_leg_length" in options:
             command_leg_length = float(options["command_leg_length"])
         elif self.randomize_leg_length:
@@ -1348,6 +1444,7 @@ class WheelLegResidualEnv(gym.Env):
                     self.max_command_yaw_delta_rad,
                 )))
         self._reset_lqr_command(command_yaw)
+        self._apply_command_conditioning()
         if terrain_route is not None:
             self._validate_terrain_route_spawn(terrain_route)
             self._controller.configure_terrain_support_reference(
@@ -1365,6 +1462,7 @@ class WheelLegResidualEnv(gym.Env):
         else:
             self._controller.disable_terrain_support_reference()
             self._controller.configure_terrain_heading_stabilization(False)
+        self._sync_terrain_yaw_rate_command()
 
         self._reference_quaternion = self.data.xquat[self._robot_body].copy()
         self._reference_heading_yaw = self._controller.heading_yaw(self.data)
@@ -1454,6 +1552,21 @@ class WheelLegResidualEnv(gym.Env):
             for geom_id in self.refs.wheel_geoms
         )
 
+    def _wheel_support_confidence(self) -> np.ndarray:
+        """Return per-wheel support confidence without changing raw telemetry.
+
+        MuJoCo's hfield contact manifold can be momentarily absent under a
+        high-speed rolling wheel even though its bottom remains within a few
+        millimetres of the sampled support. Keep the geometry exception scoped
+        to the explicitly conditioned high-speed task: ordinary walking,
+        jump, and drop phases retain raw-contact safety semantics.
+        """
+        contacts = np.asarray(self._wheel_contacts(), dtype=bool)
+        if self._terrain_hfield_geom is None or not self._uses_high_speed_command_conditioning():
+            return contacts
+        near_support = self._wheel_ground_clearances_m() <= WHEEL_NEAR_SUPPORT_CLEARANCE_M
+        return np.logical_or(contacts, near_support)
+
     def _contact_loss_duration_s(self) -> float:
         """Return the longest current per-wheel contact-loss duration."""
         return float(np.max(self._wheel_contact_loss_steps)) * self.model.opt.timestep
@@ -1495,7 +1608,14 @@ class WheelLegResidualEnv(gym.Env):
         self._cancel_contact_recovery()
         self._controller.set_target_leg_length(self._contact_recovery_saved_leg_length)
         self._controller.set_command_yaw(self._contact_recovery_saved_yaw)
-        self._controller.set_target_speed(self._contact_recovery_saved_speed)
+        self._controller.set_target_speed(
+            self._lqr_speed_reference_for_command(self._contact_recovery_saved_speed)
+        )
+        # begin_contact_recovery deliberately freezes the direct yaw-rate
+        # loop while braking.  Once the two-wheel stability gate passes,
+        # restore the still-active high-level rate request in this same
+        # control interval instead of waiting for the next policy step.
+        self._sync_terrain_yaw_rate_command()
 
     def _update_wheel_contact_recovery(self) -> str | None:
         """Track wheel contacts independently and recover before declaring a fall."""
@@ -1505,9 +1625,9 @@ class WheelLegResidualEnv(gym.Env):
             # the ordinary recovery timeout resumes only after handoff.
             self._wheel_contact_loss_steps.fill(0)
             return None
-        contacts = np.asarray(self._wheel_contacts(), dtype=bool)
+        supports = self._wheel_support_confidence()
         self._wheel_contact_loss_steps = np.where(
-            contacts,
+            supports,
             0,
             self._wheel_contact_loss_steps + 1,
         ).astype(np.int32)
@@ -1515,14 +1635,14 @@ class WheelLegResidualEnv(gym.Env):
         if not self._contact_recovery_active:
             recovery_trigger = (
                 CONTACT_RECOVERY_BOTH_WHEELS_TRIGGER_SECONDS
-                if not bool(np.any(contacts))
+                if not bool(np.any(supports))
                 else CONTACT_RECOVERY_SINGLE_WHEEL_TRIGGER_SECONDS
             )
             if self._contact_loss_duration_s() >= recovery_trigger:
                 self._start_contact_recovery()
             return None
 
-        if bool(np.all(contacts)):
+        if bool(np.all(supports)):
             self._contact_recovery_stable_steps += 1
             stable_duration_s = (
                 self._contact_recovery_stable_steps * self.model.opt.timestep
@@ -1537,48 +1657,106 @@ class WheelLegResidualEnv(gym.Env):
             return "wheel_contact_loss_timeout"
         return None
 
+    def _static_box_support_height_m(
+        self,
+        geom_id: int,
+        world_xy: np.ndarray,
+    ) -> float | None:
+        """Return the upward-facing top height of one static support box at XY."""
+        center = self.data.geom_xpos[geom_id]
+        rotation = self.data.geom_xmat[geom_id].reshape(3, 3)
+        half_x, half_y, half_z = self.model.geom_size[geom_id, :3]
+
+        # The world-XY projection of the local top face is invertible whenever
+        # that face has a nonzero vertical normal.  Select its upward-facing
+        # side so this also remains correct for an accidentally inverted box.
+        face_sign = 1.0 if rotation[2, 2] >= 0.0 else -1.0
+        face_local_z = face_sign * half_z
+        xy_basis = rotation[:2, :2]
+        if abs(float(np.linalg.det(xy_basis))) <= STATIC_SUPPORT_FOOTPRINT_TOLERANCE_M:
+            return None
+        top_origin_xy = center[:2] + rotation[:2, 2] * face_local_z
+        local_xy = np.linalg.solve(xy_basis, world_xy - top_origin_xy)
+        if (
+            abs(float(local_xy[0])) > half_x + STATIC_SUPPORT_FOOTPRINT_TOLERANCE_M
+            or abs(float(local_xy[1])) > half_y + STATIC_SUPPORT_FOOTPRINT_TOLERANCE_M
+        ):
+            return None
+        return float(
+            center[2]
+            + rotation[2, 0] * local_xy[0]
+            + rotation[2, 1] * local_xy[1]
+            + rotation[2, 2] * face_local_z
+        )
+
     def _terrain_surface_height_and_validity(
         self,
         world_xy: np.ndarray | tuple[float, float],
     ) -> tuple[float, bool]:
-        """Return hfield support height and whether the query lies inside it."""
+        """Return the highest active support surface and its footprint validity."""
         xy = np.asarray(world_xy, dtype=np.float64)
         if xy.shape != (2,):
             raise ValueError(f"expected world XY shape (2,), got {xy.shape}")
-        if (
-            self._terrain_hfield_geom is None
-            or self._terrain_hfield_size is None
-            or self._terrain_hfield_samples is None
-        ):
-            return float(self.data.geom_xpos[self.refs.ground_geom, 2]), True
-        geom_id = self._terrain_hfield_geom
-        center = self.data.geom_xpos[geom_id]
-        rotation = self.data.geom_xmat[geom_id].reshape(3, 3)
-        local = rotation.T @ np.array((xy[0] - center[0], xy[1] - center[1], 0.0))
-        half_x, half_y, height_scale, _ = self._terrain_hfield_size
-        normalized_x = (local[0] + half_x) / (2.0 * half_x)
-        normalized_y = (local[1] + half_y) / (2.0 * half_y)
-        if not (0.0 <= normalized_x <= 1.0 and 0.0 <= normalized_y <= 1.0):
-            return float(center[2] - self._terrain_hfield_size[3]), False
-        column = normalized_x * (self._terrain_hfield_columns - 1)
-        row = normalized_y * (self._terrain_hfield_rows - 1)
-        column0 = int(np.floor(column))
-        row0 = int(np.floor(row))
-        column1 = min(column0 + 1, self._terrain_hfield_columns - 1)
-        row1 = min(row0 + 1, self._terrain_hfield_rows - 1)
-        row_fraction = row - row0
-        column_fraction = column - column0
-        samples = self._terrain_hfield_samples
-        lower = (
-            (1.0 - column_fraction) * samples[row0, column0]
-            + column_fraction * samples[row0, column1]
+        ground_height = float(self.data.geom_xpos[self.refs.ground_geom, 2])
+        hfield_height = ground_height
+        hfield_valid = False
+        hfield_available = (
+            self._terrain_hfield_geom is not None
+            and self._terrain_hfield_size is not None
+            and self._terrain_hfield_samples is not None
         )
-        upper = (
-            (1.0 - column_fraction) * samples[row1, column0]
-            + column_fraction * samples[row1, column1]
-        )
-        local_height = ((1.0 - row_fraction) * lower + row_fraction * upper) * height_scale
-        return float(center[2] + local_height), True
+        if hfield_available:
+            geom_id = self._terrain_hfield_geom
+            center = self.data.geom_xpos[geom_id]
+            rotation = self.data.geom_xmat[geom_id].reshape(3, 3)
+            local = rotation.T @ np.array((xy[0] - center[0], xy[1] - center[1], 0.0))
+            half_x, half_y, height_scale, _ = self._terrain_hfield_size
+            normalized_x = (local[0] + half_x) / (2.0 * half_x)
+            normalized_y = (local[1] + half_y) / (2.0 * half_y)
+            if 0.0 <= normalized_x <= 1.0 and 0.0 <= normalized_y <= 1.0:
+                column = normalized_x * (self._terrain_hfield_columns - 1)
+                row = normalized_y * (self._terrain_hfield_rows - 1)
+                column0 = int(np.floor(column))
+                row0 = int(np.floor(row))
+                column1 = min(column0 + 1, self._terrain_hfield_columns - 1)
+                row1 = min(row0 + 1, self._terrain_hfield_rows - 1)
+                row_fraction = row - row0
+                column_fraction = column - column0
+                samples = self._terrain_hfield_samples
+                lower = (
+                    (1.0 - column_fraction) * samples[row0, column0]
+                    + column_fraction * samples[row0, column1]
+                )
+                upper = (
+                    (1.0 - column_fraction) * samples[row1, column0]
+                    + column_fraction * samples[row1, column1]
+                )
+                local_height = (
+                    (1.0 - row_fraction) * lower + row_fraction * upper
+                ) * height_scale
+                hfield_height = float(center[2] + local_height)
+                hfield_valid = True
+            else:
+                hfield_height = float(center[2] - self._terrain_hfield_size[3])
+
+        # Preserve the established RMUC hfield path byte-for-byte in behavior
+        # when no static terrain has been registered.
+        if not self._terrain_static_box_geoms:
+            if hfield_available:
+                return hfield_height, hfield_valid
+            return ground_height, True
+
+        candidate_heights: list[float] = [hfield_height] if hfield_valid else []
+        for geom_id in self._terrain_static_box_geoms:
+            height = self._static_box_support_height_m(geom_id, xy)
+            if height is not None:
+                candidate_heights.append(height)
+        if candidate_heights:
+            return float(max(candidate_heights)), True
+        # Terrain routes deliberately disable the flat projection plane.  An
+        # XY point outside every declared support must remain invalid even
+        # though a numerical fallback height is still useful to callers.
+        return hfield_height if self._terrain_hfield_geom is not None else ground_height, False
 
     def terrain_surface_height_m(self, world_xy: np.ndarray | tuple[float, float]) -> float:
         """Return the active support height under a world XY point."""
@@ -1702,7 +1880,7 @@ class WheelLegResidualEnv(gym.Env):
         )
 
     def _terrain_wheel_support_state(self) -> tuple[float, bool]:
-        """Return wheel support height and hfield validity without using contact force."""
+        """Return wheel support height and terrain-footprint validity without contact force."""
         heights: list[float] = []
         valid = True
         for geom_id in self.refs.wheel_geoms:
@@ -1728,7 +1906,7 @@ class WheelLegResidualEnv(gym.Env):
     def _body_height_reference_m(self) -> float:
         """Return the support-relative body-height floor for a terrain task.
 
-        The physical safety check must follow a verified hfield support when a
+        The physical safety check must follow a verified terrain support when a
         route descends from a platform.  This does not alter the physical root
         pose; it only prevents a legitimate terrain height change from being
         classified as a fall against the spawn-height reference.
@@ -1777,17 +1955,11 @@ class WheelLegResidualEnv(gym.Env):
         return float(np.min(self._wheel_ground_clearances_m()))
 
     def _ground_has_nonwheel_contact(self) -> bool:
-        support_geoms = set(self.refs.ground_geoms)
-        for contact in self.data.contact[: self.data.ncon]:
-            if contact.geom1 in support_geoms:
-                other_geom = contact.geom2
-            elif contact.geom2 in support_geoms:
-                other_geom = contact.geom1
-            else:
-                continue
-            if other_geom not in self.refs.wheel_geoms:
-                return True
-        return False
+        """Return whether a body/link hit a support or declared obstacle."""
+        support_contacts, obstacle_contacts = lqr.nonwheel_static_contact_counts(
+            self.data, self.refs
+        )
+        return bool(support_contacts or obstacle_contacts)
 
     def _jump_observation(self) -> np.ndarray:
         phase_features = np.zeros(len(JUMP_PHASE_NAMES) + 2, dtype=np.float64)
@@ -2054,6 +2226,19 @@ class WheelLegResidualEnv(gym.Env):
             return 0.0
         return self._controller.forward_speed(self.data)
 
+    def _speed_status(self, forward_speed: float, ramped_speed: float, *, jump_active: bool) -> str:
+        """Report high-level tracking while retaining the internal LQR ramp state."""
+        lqr_target = self._lqr_speed_reference_for_command(self._command_speed)
+        if jump_active:
+            return "JUMP"
+        if abs(lqr_target - ramped_speed) > lqr.speed_tracking_tolerance(lqr_target):
+            return "RAMPING"
+        return lqr.speed_tracking_status(
+            self._command_speed,
+            self._command_speed,
+            forward_speed,
+        )
+
     @property
     def lqr_controller(self) -> PhysicalLqr:
         """Expose the active LQR instance for environment-side heading control."""
@@ -2112,7 +2297,10 @@ class WheelLegResidualEnv(gym.Env):
             self._contact_recovery_saved_speed = target
             return target
         controller = self.lqr_controller
-        self._command_speed = float(controller.set_jump_resume_speed(target))
+        self._command_speed = target
+        controller.set_jump_resume_speed(self._lqr_speed_reference_for_command(target))
+        self._apply_command_conditioning()
+        self._sync_terrain_yaw_rate_command()
         return self._command_speed
 
     def set_locomotion_command(self, command: LocomotionCommand) -> LocomotionCommand:
@@ -2141,13 +2329,14 @@ class WheelLegResidualEnv(gym.Env):
             # controlled rolling launch on RMUC, while ``speed`` is retained
             # as the post-landing resume command by set_jump_resume_speed().
             self.request_lqr_jump()
+        self._apply_command_conditioning()
+        self._sync_terrain_yaw_rate_command()
         return LocomotionCommand(speed, yaw_rate, jump_request)
 
     def _advance_locomotion_command(self) -> None:
         """Integrate the high-level yaw-rate command at policy-rate boundaries."""
         if (
             self._controller is None
-            or abs(self._command_yaw_rate_rad_s) <= 1e-12
             or self._controller.jump.active
             or self._controller.jump_pending
             or self._controller.drop.active
@@ -2156,8 +2345,20 @@ class WheelLegResidualEnv(gym.Env):
         ):
             return
         elapsed = self.control_decimation * self.model.opt.timestep
+        if self._uses_high_speed_command_conditioning():
+            maximum_change = TERRAIN_HIGH_SPEED_YAW_ACCELERATION_RAD_S2 * elapsed
+            self._conditioned_yaw_rate_rad_s += float(np.clip(
+                self._command_yaw_rate_rad_s - self._conditioned_yaw_rate_rad_s,
+                -maximum_change,
+                maximum_change,
+            ))
+        else:
+            self._conditioned_yaw_rate_rad_s = self._command_yaw_rate_rad_s
+        self._sync_terrain_yaw_rate_command()
+        if abs(self._conditioned_yaw_rate_rad_s) <= 1e-12:
+            return
         self.set_command_yaw(
-            self._controller.command_yaw + self._command_yaw_rate_rad_s * elapsed
+            self._controller.command_yaw + self._conditioned_yaw_rate_rad_s * elapsed
         )
 
     def _maybe_resample_locomotion_command(self) -> None:
@@ -2309,11 +2510,7 @@ class WheelLegResidualEnv(gym.Env):
         reference_yaw = float(heading_command.reference_yaw)
         yaw_error = wrap_to_pi(reference_yaw - true_yaw)
         pending_yaw_error = wrap_to_pi(command_yaw - reference_yaw)
-        target_yaw_rate = float(np.clip(
-            lqr.YAW_HEADING_KP_RAD_S_PER_RAD * yaw_error,
-            -lqr.MAX_YAW_RATE_RAD_S,
-            lqr.MAX_YAW_RATE_RAD_S,
-        ))
+        target_yaw_rate = self._controller.yaw_rate_target(self.data)
         measured_yaw_rate = float(self._controller._measured_yaw_rate)
         measured_yaw_rate_normalized = float(np.clip(
             measured_yaw_rate / lqr.MAX_YAW_RATE_RAD_S,
@@ -2354,7 +2551,16 @@ class WheelLegResidualEnv(gym.Env):
     ) -> float:
         forward_speed = self._forward_speed()
         ramped_speed = float(self._controller.motion.current_speed)
-        speed_error = forward_speed - ramped_speed
+        # Terrain tasks are explicit high-level locomotion commands.  Their
+        # completion gate already compares against ``_command_speed``; use the
+        # same target for the dense policy reward so PPO cannot optimize the
+        # LQR's internal acceleration ramp while missing the requested speed.
+        tracking_speed = (
+            self._command_speed
+            if self._active_terrain_task is not None
+            else ramped_speed
+        )
+        speed_error = forward_speed - tracking_speed
         jump_active = self._controller.jump.active
         yaw_state = self.yaw_state()
         attitude_cost = float(np.dot(self._orientation_error(), self._orientation_error()))
@@ -2491,10 +2697,9 @@ class WheelLegResidualEnv(gym.Env):
             if jump_pending
             else "TERRAIN_DROP"
             if drop_active
-            else lqr.speed_tracking_status(
-                self._command_speed,
-                ramped_speed,
+            else self._speed_status(
                 forward_speed,
+                ramped_speed,
                 jump_active=jump_active,
             )
         )
@@ -2507,9 +2712,15 @@ class WheelLegResidualEnv(gym.Env):
             "locomotion_command_schema": LOCOMOTION_COMMAND_SCHEMA,
             "residual_authority_schema": RESIDUAL_AUTHORITY_SCHEMA,
             "command_speed_mps": self._command_speed,
+            "lqr_nominal_speed_reference_mps": self._lqr_speed_reference_for_command(
+                self._command_speed
+            ),
+            "lqr_speed_reference_scale": self._lqr_speed_reference_scale,
             "command_speed_limit_mps": self.command_speed_limit_mps,
             "command_resample_seconds": self.command_resample_seconds,
             "command_yaw_rate_rad_s": self._command_yaw_rate_rad_s,
+            "conditioned_yaw_rate_rad_s": self._conditioned_yaw_rate_rad_s,
+            "locomotion_command_conditioning": locomotion_command_conditioning_config(),
             "command_speed_deferred": locomotion_command_deferred,
             "command_yaw_rate_deferred": locomotion_command_deferred,
             "jump_request": self._jump_command_request,
@@ -2526,6 +2737,26 @@ class WheelLegResidualEnv(gym.Env):
             "jump_active": jump_active,
             "jump_phase": jump_phase,
             "jump_elapsed_s": jump_elapsed,
+            "jump_impact_active": (
+                False if self._controller is None else self._controller.jump.impact_active
+            ),
+            "jump_impact_elapsed_s": (
+                0.0
+                if self._controller is None
+                or not self._controller.jump.impact_active
+                or self._controller.jump.impact_start_time is None
+                else max(0.0, float(self.data.time) - self._controller.jump.impact_start_time)
+            ),
+            "jump_impact_first_contact": (
+                np.zeros(2, dtype=np.int32)
+                if self._controller is None
+                else np.asarray(self._controller.jump.impact_first_contact, dtype=np.int32)
+            ),
+            "jump_impact_max_leg_difference_m": (
+                0.0
+                if self._controller is None
+                else self._controller.jump.impact_max_leg_difference_m
+            ),
             "jump_succeeded": self._jump_succeeded,
             "jump_landing_stable": self._jump_landing_stable,
             "jump_landing_pending": self._jump_landing_pending,
@@ -2563,6 +2794,11 @@ class WheelLegResidualEnv(gym.Env):
                 False
                 if self._controller is None
                 else self._controller.terrain_heading_stabilization_enabled
+            ),
+            "terrain_direct_yaw_rate_tracking": (
+                False
+                if self._controller is None
+                else self._controller.terrain_yaw_rate_command_active
             ),
             "terrain_progress_m": self._terrain_progress_m,
             "terrain_max_progress_m": self._terrain_max_progress_m,
@@ -2649,9 +2885,8 @@ class WheelLegResidualEnv(gym.Env):
 
         The policy action layout follows the MJCF actuator layout plus the
         common leg-length rate.  During contact-critical jump phases, only
-        symmetric hip residuals are admitted at a small fraction of their
-        normal limit.  Wheels and the common leg command stay owned by the
-        validated LQR jump trajectory.
+        small per-hip residuals are admitted.  Wheels and the common leg
+        command stay owned by the validated LQR jump trajectory.
         """
         mask = np.zeros(self.action_space.shape, dtype=np.float64)
         scale = np.zeros(self.action_space.shape, dtype=np.float64)
@@ -2674,6 +2909,8 @@ class WheelLegResidualEnv(gym.Env):
         elif phase == "thrust":
             hip_scale = JUMP_THRUST_RESIDUAL_SCALE
         elif phase == "flight":
+            if self._controller.jump.impact_active:
+                return mask, scale
             hip_scale = JUMP_FLIGHT_RESIDUAL_SCALE
         elif phase == "landing":
             hip_scale = JUMP_LANDING_RESIDUAL_SCALE
@@ -2697,6 +2934,8 @@ class WheelLegResidualEnv(gym.Env):
             return "contact_recovery"
         if self._controller.jump_pending:
             return "jump_pending"
+        if self._controller.jump.impact_active:
+            return "jump_impact"
         if self._controller.drop.active:
             return "terrain_drop_" + str(self._controller.drop.phase_name)
         if self._jump_landing_pending:
@@ -2819,8 +3058,18 @@ class WheelLegResidualEnv(gym.Env):
             # command() may promote a pending jump or cross a phase boundary.
             # Re-evaluate torque authority after that transition so an action
             # never leaks from thrust into flight or recovery.
-            torque_mask, torque_scale = self._policy_action_authority()
-            torque_phase = self._policy_action_authority_phase()
+            jump_finished_this_tick = was_jump_active and current_jump_phase is None
+            if jump_finished_this_tick:
+                # The controller has just completed landing recovery, but the
+                # environment records the post-landing guard after mj_step.
+                # Keep this handoff tick LQR-owned so a landing-phase action
+                # cannot briefly regain all six residual torque channels.
+                torque_mask = np.zeros(self.action_space.shape, dtype=np.float64)
+                torque_scale = np.zeros(self.action_space.shape, dtype=np.float64)
+                torque_phase = "jump_handoff"
+            else:
+                torque_mask, torque_scale = self._policy_action_authority()
+                torque_phase = self._policy_action_authority_phase()
             effective_substep_action = np.zeros(self.action_space.shape, dtype=np.float64)
             effective_substep_action[: self.model.nu] = (
                 action_array[: self.model.nu]

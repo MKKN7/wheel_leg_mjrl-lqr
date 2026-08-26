@@ -1,0 +1,12 @@
+# Use a supported CPython build (3.10-3.13). The workspace Python 3.14
+# installation is incomplete and cannot load _ctypes or binary packages.
+numpy>=1.26
+scipy>=1.11
+mujoco==3.11.0
+gymnasium>=0.29
+torch>=2.0
+PyYAML>=6.0
+# GPU batch preflight uses the matching CUDA runtime installed in robot7.
+warp-lang==1.16.0
+# MuJoCo-Warp 3.11.0 is installed from its upstream source checkout rather
+# than fetched during this CPU-compatible requirements install.

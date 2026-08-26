@@ -37,6 +37,12 @@ ASSET_NAMES = (
 TERRAIN_HFIELD_POS = (-12.112445, -2.726397, -0.196745)
 VISUAL_SCENE_POS = (-27.013445, -10.751400, -0.200000)
 HFIELD_SIZE = (14.525, 8.025, 1.730, 0.100)
+# The collision hfield needs a contact time constant large enough to keep the
+# two wheel manifolds continuous at the 1 kHz controller rate and symmetric
+# through a high-jump landing.  Values below 0.12 s amplified the two closed
+# chain impact mismatch.  This remains stiffer than the former 0.20 s setting
+# while preserving the validated RMUC landing envelope.
+TERRAIN_CONTACT_SOLREF = "0.150 1"
 # The Y-up Blender OBJ assets need a +90 degree X input rotation. MuJoCo's
 # internal mesh principal-axis transform is accounted for by this calibrated
 # input quaternion, yielding world coordinates (source_x, -source_z, source_y).
@@ -122,7 +128,7 @@ def terrain_world_block(newline: bytes) -> bytes:
             b"    <!-- The original flat plane is enabled only while Env projects the LQR working point. -->",
             b'    <geom name="ground" type="plane" pos="0 0 0" size="100 100 0.1" material="ground_black_mat" friction="1.10 0.05 0.01" contype="2" conaffinity="1" rgba="0 0 0 0" />',
             b"    <!-- Env activates this co-located RMUC collision hfield immediately after LQR projection. -->",
-            f'    <geom name="rmuc_terrain" type="hfield" hfield="rmuc_training_hfield" pos="{terrain_pos}" friction="1.10 0.05 0.01" solref="0.20 1" contype="2" conaffinity="1" rgba="0.20 0.26 0.20 0" />'.encode(),
+            f'    <geom name="rmuc_terrain" type="hfield" hfield="rmuc_training_hfield" pos="{terrain_pos}" friction="1.10 0.05 0.01" solref="{TERRAIN_CONTACT_SOLREF}" contype="2" conaffinity="1" rgba="0.20 0.26 0.20 0" />'.encode(),
             b"    <!-- Source OBJ meshes are rendering-only and never participate in RL collision queries. -->",
             f'    <geom name="rmuc_floor_visual_geom" type="mesh" mesh="rmuc_floor_visual" pos="{visual_pos}" quat="{visual_quat}" contype="0" conaffinity="0" group="0" rgba="0.48 0.51 0.47 1" />'.encode(),
             f'    <geom name="rmuc_building_visual_geom" type="mesh" mesh="rmuc_building_visual" pos="{visual_pos}" quat="{visual_quat}" contype="0" conaffinity="0" group="0" rgba="0.72 0.72 0.72 1" />'.encode(),

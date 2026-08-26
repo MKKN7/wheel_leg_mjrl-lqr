@@ -48,6 +48,13 @@ YAW_GOVERNOR_LIMIT_MOTOR_NM = 0.45
 TERRAIN_YAW_HEADING_KP_RAD_S_PER_RAD = 3.00
 TERRAIN_YAW_RATE_KP_MOTOR_NM_PER_RAD_S = 3.00
 TERRAIN_YAW_GOVERNOR_LIMIT_MOTOR_NM = 2.50
+# High-speed terrain commands carry an explicit yaw-rate request.  Tracking it
+# directly avoids relying on a large heading lag to synthesize the desired
+# rate, which made the two turning directions load the closed chains
+# differently on the RMUC hfield.
+TERRAIN_RATE_COMMAND_HEADING_KP_RAD_S_PER_RAD = 0.30
+TERRAIN_RATE_COMMAND_KP_MOTOR_NM_PER_RAD_S = 1.50
+TERRAIN_RATE_COMMAND_LIMIT_MOTOR_NM = 1.20
 YAW_RATE_FILTER_TIME_CONSTANT_S = 0.02
 GLFW_KEY_RIGHT = 262
 GLFW_KEY_LEFT = 263
@@ -98,7 +105,12 @@ JUMP_CROUCH_RATE_MPS = 0.15
 # MJCF.  The flight phase folds both legs to raise the wheel bottoms, then
 # preloads them before contact so touchdown does not drive a link below its
 # hard length limit.
-JUMP_THRUST_RATE_MPS = 1.35
+# A 1.35 m/s extension produces enough vertical height on the nominal model,
+# but the resulting touchdown impulse saturates one hip branch under the RMUC
+# jump vehicle-randomization profile.  1.225 m/s keeps the required 20--25 cm
+# mean clearance while preserving landing torque headroom for both closed
+# chains across the jump vehicle-randomization regression.
+JUMP_THRUST_RATE_MPS = 1.225
 JUMP_FLIGHT_RETRACT_LENGTH_M = 0.205
 JUMP_FLIGHT_RETRACT_RATE_MPS = 2.00
 JUMP_FLIGHT_RETRACT_STEPS = 150
@@ -114,6 +126,13 @@ JUMP_FLIGHT_PRELOAD_FORCE_LIMIT_N = 90.0
 JUMP_LANDING_LENGTH_M = 0.285
 JUMP_LANDING_RATE_MPS = 0.40
 JUMP_LANDING_FORCE_LIMIT_N = 80.0
+# Do not wait for the two-wheel touchdown debounce before cancelling flight
+# preloading.  An asymmetric first wheel contact can otherwise keep extending
+# the unloaded chain for up to eight simulation ticks and exceed the hard
+# leg-difference protection.  This overlay is compression-only and remains
+# active only until the existing two-wheel landing confirmation completes.
+JUMP_IMPACT_MIN_DESCENT_SPEED_MPS = 0.30
+JUMP_IMPACT_FORCE_LIMIT_N = JUMP_LANDING_FORCE_LIMIT_N
 JUMP_LANDING_STANCE_GUARD_SCALE = 0.30
 # The two closed chains see slightly different hfield contact impulses.  A
 # bounded differential force keeps their lengths synchronized during impact;
@@ -178,6 +197,11 @@ DROP_RECOVERY_MAX_PITCH_RATE_RAD_S = JUMP_RECOVERY_MAX_PITCH_RATE_RAD_S
 DROP_RECOVERY_MAX_VERTICAL_SPEED_MPS = JUMP_RECOVERY_MAX_VERTICAL_SPEED_MPS
 DROP_RECOVERY_MAX_FORWARD_SPEED_MPS = 0.55
 DROP_RECOVERY_MAX_LEG_DIFFERENCE_M = JUMP_RECOVERY_MAX_LEG_DIFFERENCE_M
+# Hfield wheel manifolds can omit one 1 kHz contact sample while the wheel is
+# still physically supported.  This debounce is only for the post-drop
+# recovery handoff; a sustained loss remains visible to the normal safety
+# recovery as soon as the drop sequence finishes.
+DROP_RECOVERY_CONTACT_GRACE_STEPS = 4
 # A requested jump first uses the normal two-wheel controller to regulate into
 # a measured low-speed rolling window.  The RMUC hfield has a small persistent
 # creep at a zero wheel reference, so this deliberately allows a controlled
@@ -220,6 +244,22 @@ TERRAIN_SUPPORT_REFERENCE_FILTER_TIME_CONSTANT_S = 0.08
 TERRAIN_SUPPORT_REFERENCE_MAX_VERTICAL_RATE_MPS = 0.75
 WORLD_UP = np.array((0.0, 0.0, 1.0))
 
+# The four 40 mm guide rollers are passive chassis hardware.  These names are
+# intentionally exact rather than prefix-matched: a partial or miswired guide
+# package must not silently alter collision safety or the LQR state.
+GUIDE_WHEEL_CONTACT_NAMES = (
+    "guide_wheel_front_left_contact",
+    "guide_wheel_front_right_contact",
+    "guide_wheel_rear_left_contact",
+    "guide_wheel_rear_right_contact",
+)
+GUIDE_WHEEL_JOINT_NAMES = (
+    "guide_wheel_front_left_spin",
+    "guide_wheel_front_right_spin",
+    "guide_wheel_rear_left_spin",
+    "guide_wheel_rear_right_spin",
+)
+
 
 def jump_controller_config() -> dict[str, float | int]:
     """Return every trajectory parameter that changes jump behavior."""
@@ -239,6 +279,8 @@ def jump_controller_config() -> dict[str, float | int]:
         "jump_landing_length_m": JUMP_LANDING_LENGTH_M,
         "jump_landing_rate_mps": JUMP_LANDING_RATE_MPS,
         "jump_landing_force_limit_n": JUMP_LANDING_FORCE_LIMIT_N,
+        "jump_impact_min_descent_speed_mps": JUMP_IMPACT_MIN_DESCENT_SPEED_MPS,
+        "jump_impact_force_limit_n": JUMP_IMPACT_FORCE_LIMIT_N,
         "jump_landing_stance_guard_scale": JUMP_LANDING_STANCE_GUARD_SCALE,
         "jump_leg_sync_kp_n_per_m": JUMP_LEG_SYNC_KP_N_PER_M,
         "jump_leg_sync_kd_ns_per_m": JUMP_LEG_SYNC_KD_NS_PER_M,
@@ -283,6 +325,9 @@ def terrain_controller_config() -> dict[str, float]:
         "yaw_heading_kp_rad_s_per_rad": TERRAIN_YAW_HEADING_KP_RAD_S_PER_RAD,
         "yaw_rate_kp_motor_nm_per_rad_s": TERRAIN_YAW_RATE_KP_MOTOR_NM_PER_RAD_S,
         "yaw_governor_limit_motor_nm": TERRAIN_YAW_GOVERNOR_LIMIT_MOTOR_NM,
+        "rate_command_heading_kp_rad_s_per_rad": TERRAIN_RATE_COMMAND_HEADING_KP_RAD_S_PER_RAD,
+        "rate_command_kp_motor_nm_per_rad_s": TERRAIN_RATE_COMMAND_KP_MOTOR_NM_PER_RAD_S,
+        "rate_command_limit_motor_nm": TERRAIN_RATE_COMMAND_LIMIT_MOTOR_NM,
         "drop_min_height_m": TERRAIN_DROP_MIN_HEIGHT_M,
         "drop_max_height_m": TERRAIN_DROP_MAX_HEIGHT_M,
         "drop_lookahead_m": TERRAIN_DROP_LOOKAHEAD_M,
@@ -307,6 +352,7 @@ def terrain_controller_config() -> dict[str, float]:
         "drop_recovery_stable_seconds": DROP_RECOVERY_STABLE_SECONDS,
         "drop_recovery_timeout_s": DROP_RECOVERY_TIMEOUT_S,
         "drop_recovery_max_forward_speed_mps": DROP_RECOVERY_MAX_FORWARD_SPEED_MPS,
+        "drop_recovery_contact_grace_steps": DROP_RECOVERY_CONTACT_GRACE_STEPS,
     }
 
 
@@ -374,11 +420,14 @@ class ModelRefs:
     robot_body: int
     ground_geom: int
     ground_geoms: tuple[int, ...]
+    obstacle_geoms: tuple[int, ...]
     wheel_geoms: tuple[int, int]
+    guide_wheel_geoms: tuple[int, ...]
     base_geoms: tuple[int, int]
     linkage_collision_geoms: tuple[int, ...]
     actuator_ids: tuple[int, int, int, int, int, int]
     wheel_joints: tuple[int, int]
+    guide_wheel_joints: tuple[int, ...]
     stance_passive_joints: tuple[int, int, int, int, int, int, int, int]
     stance_closure_sites: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]
     sensor_refs: dict[str, tuple[int, int]]
@@ -480,6 +529,10 @@ class JumpSequence:
     recovery_start_time: float | None = None
     recovery_stable_steps: int = 0
     wheel_contact_loss_steps: tuple[int, int] = (0, 0)
+    impact_active: bool = False
+    impact_start_time: float | None = None
+    impact_first_contact: tuple[int, int] = (0, 0)
+    impact_max_leg_difference_m: float = 0.0
     abort_reason: str = ""
 
     @property
@@ -505,6 +558,10 @@ class JumpSequence:
         self.recovery_start_time = None
         self.recovery_stable_steps = 0
         self.wheel_contact_loss_steps = (0, 0)
+        self.impact_active = False
+        self.impact_start_time = None
+        self.impact_first_contact = (0, 0)
+        self.impact_max_leg_difference_m = 0.0
         self.abort_reason = ""
 
     def transition(self, phase_name: str, sim_time: float) -> None:
@@ -517,6 +574,22 @@ class JumpSequence:
         self.recovery_start_time = None
         self.recovery_stable_steps = 0
         self.wheel_contact_loss_steps = (0, 0)
+        if phase_name != "flight":
+            self.impact_active = False
+
+    def begin_impact(self, sim_time: float, contacts: tuple[int, int]) -> None:
+        """Enter the bounded first-touchdown overlay during flight."""
+        if self.impact_active:
+            return
+        self.impact_active = True
+        self.impact_start_time = sim_time
+        self.impact_first_contact = contacts
+
+    def update_impact_leg_difference(self, difference_m: float) -> None:
+        self.impact_max_leg_difference_m = max(
+            self.impact_max_leg_difference_m,
+            abs(float(difference_m)),
+        )
 
     def begin_recovery(self, sim_time: float) -> None:
         self.recovering = True
@@ -549,6 +622,10 @@ class JumpSequence:
         self.recovery_start_time = None
         self.recovery_stable_steps = 0
         self.wheel_contact_loss_steps = (0, 0)
+        self.impact_active = False
+        self.impact_start_time = None
+        self.impact_first_contact = (0, 0)
+        self.impact_max_leg_difference_m = 0.0
 
 
 @dataclass
@@ -566,6 +643,7 @@ class TerrainDropSequence:
     recovering: bool = False
     recovery_start_time: float | None = None
     recovery_stable_steps: int = 0
+    wheel_contact_loss_steps: tuple[int, int] = (0, 0)
     abort_reason: str = ""
 
     @property
@@ -590,6 +668,7 @@ class TerrainDropSequence:
         self.recovering = False
         self.recovery_start_time = None
         self.recovery_stable_steps = 0
+        self.wheel_contact_loss_steps = (0, 0)
         self.abort_reason = ""
 
     def transition(self, phase_name: str, sim_time: float) -> None:
@@ -601,6 +680,7 @@ class TerrainDropSequence:
         self.recovering = False
         self.recovery_start_time = None
         self.recovery_stable_steps = 0
+        self.wheel_contact_loss_steps = (0, 0)
 
     def begin_recovery(self, sim_time: float) -> None:
         self.phase_name = "recovery"
@@ -608,6 +688,15 @@ class TerrainDropSequence:
         self.recovering = True
         self.recovery_start_time = sim_time
         self.recovery_stable_steps = 0
+        self.wheel_contact_loss_steps = (0, 0)
+
+    def grounded_with_hysteresis(self, contacts: tuple[int, int]) -> bool:
+        """Debounce isolated hfield wheel-contact omissions during recovery."""
+        self.wheel_contact_loss_steps = tuple(
+            0 if contact_count > 0 else loss_steps + 1
+            for contact_count, loss_steps in zip(contacts, self.wheel_contact_loss_steps)
+        )
+        return max(self.wheel_contact_loss_steps) < DROP_RECOVERY_CONTACT_GRACE_STEPS
 
     def elapsed(self, sim_time: float) -> float:
         if self.phase_start_time is None:
@@ -626,6 +715,7 @@ class TerrainDropSequence:
         self.recovering = False
         self.recovery_start_time = None
         self.recovery_stable_steps = 0
+        self.wheel_contact_loss_steps = (0, 0)
 
 
 @dataclass(frozen=True)
@@ -717,6 +807,62 @@ def object_id(model: mujoco.MjModel, object_type: mujoco.mjtObj, name: str) -> i
     return result
 
 
+def optional_guide_wheel_refs(model: mujoco.MjModel) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Resolve a complete passive-guide package or leave a legacy MJCF unchanged.
+
+    The baseline robot intentionally has no guide joints.  Once any guide
+    object is present, however, every named contact geom and passive hinge must
+    exist on the same body and no guide hinge may be actuated.
+    """
+
+    geom_ids = tuple(
+        int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name))
+        for name in GUIDE_WHEEL_CONTACT_NAMES
+    )
+    joint_ids = tuple(
+        int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name))
+        for name in GUIDE_WHEEL_JOINT_NAMES
+    )
+    any_present = any(identifier >= 0 for identifier in (*geom_ids, *joint_ids))
+    if not any_present:
+        return (), ()
+    missing = [
+        name
+        for name, identifier in zip(GUIDE_WHEEL_CONTACT_NAMES, geom_ids)
+        if identifier < 0
+    ] + [
+        name
+        for name, identifier in zip(GUIDE_WHEEL_JOINT_NAMES, joint_ids)
+        if identifier < 0
+    ]
+    if missing:
+        raise ValueError(
+            "guide-wheel MJCF package is incomplete; missing " + ", ".join(missing)
+        )
+    if len(set(geom_ids)) != len(geom_ids) or len(set(joint_ids)) != len(joint_ids):
+        raise ValueError("guide-wheel MJCF package contains duplicate contact or joint ids")
+
+    joint_transmission = int(mujoco.mjtTrn.mjTRN_JOINT)
+    hinge_type = int(mujoco.mjtJoint.mjJNT_HINGE)
+    actuator_types = np.asarray(model.actuator_trntype, dtype=np.int32)
+    actuator_targets = np.asarray(model.actuator_trnid[:, 0], dtype=np.int32)
+    for contact_name, joint_name, geom_id, joint_id in zip(
+        GUIDE_WHEEL_CONTACT_NAMES,
+        GUIDE_WHEEL_JOINT_NAMES,
+        geom_ids,
+        joint_ids,
+    ):
+        if int(model.jnt_type[joint_id]) != hinge_type:
+            raise ValueError(f"guide joint {joint_name!r} must be a scalar hinge")
+        if int(model.geom_bodyid[geom_id]) != int(model.jnt_bodyid[joint_id]):
+            raise ValueError(
+                f"guide contact {contact_name!r} must share a body with {joint_name!r}"
+            )
+        if np.any((actuator_types == joint_transmission) & (actuator_targets == joint_id)):
+            raise ValueError(f"guide joint {joint_name!r} must remain passive and unactuated")
+    return geom_ids, joint_ids
+
+
 def build_refs(model: mujoco.MjModel) -> ModelRefs:
     sensor_names = (
         "world_horizontal_position_xy", "world_horizontal_velocity_xy",
@@ -737,21 +883,36 @@ def build_refs(model: mujoco.MjModel) -> ModelRefs:
     )
     ground_geom = object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "ground")
     ground_geoms = [ground_geom]
-    # ``ground`` remains the mandatory flat LQR trim surface.  Terrain scenes
-    # can declare one of these optional support geoms for the rest of the map.
+    # ``ground`` remains the mandatory flat LQR trim surface.  Existing
+    # hfield scenes use their historical names, while static terrain scenes
+    # register only collision supports through the explicit ``support_``
+    # prefix.  Visual-only geoms therefore never become wheel support.
     for terrain_name in ("terrain", "rmuc_terrain"):
         terrain_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, terrain_name)
         if terrain_geom >= 0:
             ground_geoms.append(int(terrain_geom))
+    obstacle_geoms: list[int] = []
+    for geom_id in range(model.ngeom):
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if geom_name is None:
+            continue
+        if geom_name.startswith("support_"):
+            ground_geoms.append(int(geom_id))
+        elif geom_name.startswith("obstacle_"):
+            obstacle_geoms.append(int(geom_id))
+    ground_geoms = list(dict.fromkeys(ground_geoms))
+    guide_wheel_geoms, guide_wheel_joints = optional_guide_wheel_refs(model)
     return ModelRefs(
         root_joint=object_id(model, mujoco.mjtObj.mjOBJ_JOINT, "robot_free"),
         robot_body=object_id(model, mujoco.mjtObj.mjOBJ_BODY, "robot"),
         ground_geom=ground_geom,
         ground_geoms=tuple(ground_geoms),
+        obstacle_geoms=tuple(obstacle_geoms),
         wheel_geoms=(
             object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "left_wheel_contact"),
             object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "right_wheel_contact"),
         ),
+        guide_wheel_geoms=guide_wheel_geoms,
         base_geoms=(
             object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "base_contact"),
             object_id(model, mujoco.mjtObj.mjOBJ_GEOM, "base_collision"),
@@ -772,6 +933,7 @@ def build_refs(model: mujoco.MjModel) -> ModelRefs:
             object_id(model, mujoco.mjtObj.mjOBJ_JOINT, "left_wheel_spin"),
             object_id(model, mujoco.mjtObj.mjOBJ_JOINT, "right_wheel_spin"),
         ),
+        guide_wheel_joints=guide_wheel_joints,
         stance_passive_joints=tuple(
             object_id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
             for name in (
@@ -816,6 +978,82 @@ def wheel_ground_contacts(data: mujoco.MjData, refs: ModelRefs, wheel_geom: int)
     )
 
 
+def nonwheel_static_contact_counts(
+    data: mujoco.MjData,
+    refs: ModelRefs,
+) -> tuple[int, int]:
+    """Count unsafe contacts while allowing passive rollers only on supports."""
+    support_geoms = set(refs.ground_geoms)
+    obstacle_geoms = set(refs.obstacle_geoms)
+    driven_wheel_geoms = set(refs.wheel_geoms)
+    support_allowed_geoms = driven_wheel_geoms | set(refs.guide_wheel_geoms)
+    nonwheel_support_contacts = 0
+    nonwheel_obstacle_contacts = 0
+    for contact in data.contact[: data.ncon]:
+        if contact.geom1 in support_geoms:
+            nonwheel_support_contacts += contact.geom2 not in support_allowed_geoms
+        elif contact.geom2 in support_geoms:
+            nonwheel_support_contacts += contact.geom1 not in support_allowed_geoms
+        if contact.geom1 in obstacle_geoms:
+            nonwheel_obstacle_contacts += contact.geom2 not in driven_wheel_geoms
+        elif contact.geom2 in obstacle_geoms:
+            nonwheel_obstacle_contacts += contact.geom1 not in driven_wheel_geoms
+    return nonwheel_support_contacts, nonwheel_obstacle_contacts
+
+
+def passive_guide_dof_addresses(model: mujoco.MjModel, refs: ModelRefs) -> np.ndarray:
+    """Return the scalar DOFs of validated passive guide hinges."""
+
+    if not refs.guide_wheel_joints:
+        return np.empty(0, dtype=np.int64)
+    addresses = np.asarray(
+        [int(model.jnt_dofadr[joint_id]) for joint_id in refs.guide_wheel_joints],
+        dtype=np.int64,
+    )
+    if (
+        np.any(addresses < 0)
+        or np.any(addresses >= model.nv)
+        or np.unique(addresses).size != addresses.size
+    ):
+        raise ValueError("guide-wheel passive hinge DOF addresses are invalid")
+    return addresses
+
+
+def lqr_state_indices(
+    model: mujoco.MjModel,
+    excluded_dof_addresses: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select LQR states while leaving passive guide dynamics in physics.
+
+    A passive roller angle is cyclic and unactuated.  It belongs in MuJoCo's
+    state but not in the DARE system, where its uncontrollable unit mode makes
+    the Riccati solve ill-conditioned.
+    """
+
+    excluded = np.asarray(excluded_dof_addresses, dtype=np.int64)
+    if excluded.ndim != 1:
+        raise ValueError("excluded LQR DOF addresses must be one-dimensional")
+    if (
+        np.any(excluded < 0)
+        or np.any(excluded >= model.nv)
+        or np.unique(excluded).size != excluded.size
+    ):
+        raise ValueError("excluded LQR DOF addresses are invalid")
+    retained_dofs = np.setdiff1d(
+        np.arange(model.nv, dtype=np.int64),
+        excluded,
+        assume_unique=True,
+    )
+    state_indices = np.concatenate(
+        (
+            retained_dofs,
+            model.nv + retained_dofs,
+            2 * model.nv + np.arange(model.na, dtype=np.int64),
+        )
+    )
+    return retained_dofs, state_indices
+
+
 class PhysicalLqr:
     def __init__(
         self,
@@ -851,6 +1089,28 @@ class PhysicalLqr:
             int(model.jnt_dofadr[object_id(model, mujoco.mjtObj.mjOBJ_JOINT, "right_hip_pitch")]),
             int(model.jnt_dofadr[object_id(model, mujoco.mjtObj.mjOBJ_JOINT, "right_active_link_pitch")]),
         ))
+        self.guide_wheel_dof_addresses = passive_guide_dof_addresses(model, refs)
+        self.lqr_dof_addresses, self._lqr_state_indices = lqr_state_indices(
+            model,
+            self.guide_wheel_dof_addresses,
+        )
+        self._lqr_position_state_indices = np.full(model.nv, -1, dtype=np.int64)
+        self._lqr_position_state_indices[self.lqr_dof_addresses] = np.arange(
+            self.lqr_dof_addresses.size,
+            dtype=np.int64,
+        )
+        self._lqr_velocity_state_indices = np.full(model.nv, -1, dtype=np.int64)
+        self._lqr_velocity_state_indices[self.lqr_dof_addresses] = (
+            self.lqr_dof_addresses.size + np.arange(self.lqr_dof_addresses.size, dtype=np.int64)
+        )
+        required_lqr_dofs = np.concatenate(
+            (
+                np.arange(self.root_dof, self.root_dof + 6, dtype=np.int64),
+                self.hip_dof_addresses,
+            )
+        )
+        if np.any(self._lqr_position_state_indices[required_lqr_dofs] < 0):
+            raise ValueError("passive guide-wheel state exclusion overlaps a required LQR DOF")
         self.qpos_equilibrium = data.qpos.copy()
         self.qvel_equilibrium = np.zeros(model.nv)
         self.hip_qpos_equilibrium = self.qpos_equilibrium[self.hip_qpos_addresses].copy()
@@ -916,6 +1176,12 @@ class PhysicalLqr:
         self._terrain_support_max_vertical_rate_mps = TERRAIN_SUPPORT_REFERENCE_MAX_VERTICAL_RATE_MPS
         self._terrain_support_last_update_time = float(data.time)
         self._terrain_heading_stabilization_enabled = False
+        # A high-speed terrain command is expressed as a yaw rate by the
+        # locomotion interface.  Keep that explicit request separate from the
+        # ordinary heading-only terrain loop so low-speed walking behavior is
+        # unchanged.
+        self._terrain_yaw_rate_command_active = False
+        self._terrain_yaw_rate_command_rad_s = 0.0
         # Allocate once so delay compensation can predict the queued actuator
         # command without constructing MuJoCo state inside the control loop.
         self._delay_prediction_data = mujoco.MjData(self.model)
@@ -1100,6 +1366,31 @@ class PhysicalLqr:
     def configure_terrain_heading_stabilization(self, enabled: bool) -> None:
         """Select the bounded terrain heading loop without changing yaw commands."""
         self._terrain_heading_stabilization_enabled = bool(enabled)
+        if not self._terrain_heading_stabilization_enabled:
+            self.set_terrain_yaw_rate_command(None)
+
+    def set_terrain_yaw_rate_command(self, yaw_rate_rad_s: float | None) -> float:
+        """Enable or clear bounded direct yaw-rate tracking on terrain.
+
+        The caller supplies a high-level rate command only when terrain
+        heading stabilization is active.  Heading error remains a small
+        correction around that feedforward rate, rather than generating the
+        entire turn through heading lag.
+        """
+        if yaw_rate_rad_s is None:
+            self._terrain_yaw_rate_command_active = False
+            self._terrain_yaw_rate_command_rad_s = 0.0
+            return 0.0
+        yaw_rate = float(yaw_rate_rad_s)
+        if not np.isfinite(yaw_rate):
+            raise ValueError("terrain yaw-rate command must be finite")
+        self._terrain_yaw_rate_command_active = True
+        self._terrain_yaw_rate_command_rad_s = float(np.clip(
+            yaw_rate,
+            -MAX_YAW_RATE_RAD_S,
+            MAX_YAW_RATE_RAD_S,
+        ))
+        return self._terrain_yaw_rate_command_rad_s
 
     @property
     def terrain_support_reference_enabled(self) -> bool:
@@ -1108,6 +1399,10 @@ class PhysicalLqr:
     @property
     def terrain_heading_stabilization_enabled(self) -> bool:
         return self._terrain_heading_stabilization_enabled
+
+    @property
+    def terrain_yaw_rate_command_active(self) -> bool:
+        return self._terrain_yaw_rate_command_active
 
     def _terrain_support_reference_active(self) -> bool:
         """Freeze terrain support only during airborne protected transitions."""
@@ -1256,6 +1551,7 @@ class PhysicalLqr:
     def hold_current_yaw(self, data: mujoco.MjData) -> float:
         yaw = self.heading_yaw(data)
         self.heading_command = HeadingCommand(yaw, yaw, self.heading_command.maximum_rate)
+        self.set_terrain_yaw_rate_command(None)
         return yaw
 
     def begin_contact_recovery(self, data: mujoco.MjData, leg_length: float) -> float:
@@ -1290,6 +1586,7 @@ class PhysicalLqr:
         self._last_yaw_measurement = measured_yaw
         self._last_yaw_measurement_time = float(data.time)
         self._measured_yaw_rate = 0.0
+        self.set_terrain_yaw_rate_command(None)
         return target_yaw
 
     def reset_commands(
@@ -1509,6 +1806,8 @@ class PhysicalLqr:
         if phase == "thrust":
             return JUMP_THRUST_RATE_MPS
         if phase == "flight":
+            if self.jump.impact_active:
+                return JUMP_LANDING_RATE_MPS
             return (
                 JUMP_FLIGHT_RETRACT_RATE_MPS
                 if self.jump.flight_steps < JUMP_FLIGHT_RETRACT_STEPS
@@ -1562,10 +1861,10 @@ class PhysicalLqr:
     def _drop_recovery_body_is_stable(
         self,
         data: mujoco.MjData,
-        contacts: tuple[int, int],
+        grounded: bool,
     ) -> bool:
         """Use the jump landing checks with a bounded rolling speed allowance."""
-        if not all(contact_count > 0 for contact_count in contacts):
+        if not grounded:
             return False
         attitude_error = self.airborne_attitude_error(data)
         pitch_error = abs(float(attitude_error[0]))
@@ -1625,12 +1924,25 @@ class PhysicalLqr:
                 self._abort_jump(data, "thrust timeout without liftoff")
         elif phase == "flight":
             self.jump.flight_steps += 1
-            target_length = (
+            target_length = JUMP_LANDING_LENGTH_M if self.jump.impact_active else (
                 JUMP_FLIGHT_RETRACT_LENGTH_M
                 if self.jump.flight_steps < JUMP_FLIGHT_RETRACT_STEPS
                 else JUMP_FLIGHT_PRELOAD_LENGTH_M
             )
             self.set_target_leg_length(target_length, jump=True)
+            vertical_speed = float(data.qvel[self.root_dof + 2])
+            if (
+                not self.jump.impact_active
+                and self.jump.flight_steps >= JUMP_FLIGHT_RETRACT_STEPS
+                and any(contact_count > 0 for contact_count in contacts)
+                and vertical_speed <= -JUMP_IMPACT_MIN_DESCENT_SPEED_MPS
+            ):
+                self.jump.begin_impact(sim_time, contacts)
+                self.set_target_leg_length(JUMP_LANDING_LENGTH_M, jump=True)
+            if self.jump.impact_active:
+                self.jump.update_impact_leg_difference(
+                    float(np.ptp(self.leg_lengths(data)))
+                )
             # Require actual, consecutive two-wheel contacts before moving to
             # landing. ``grounded`` is intentionally hysteretic for liftoff,
             # but it cannot be reused here because the counter was reset when
@@ -1749,6 +2061,7 @@ class PhysicalLqr:
             for geom_id in self.refs.wheel_geoms
         )
         full_support = all(contact_count > 0 for contact_count in contacts)
+        grounded = self.drop.grounded_with_hysteresis(contacts)
         if phase == "preload":
             self.set_target_leg_length(DROP_PRELOAD_LENGTH_M, jump=True)
             self.drop.unloaded_steps = (
@@ -1795,7 +2108,7 @@ class PhysicalLqr:
             target_length = (
                 DROP_LANDING_LENGTH_M if resume_length is None else float(resume_length)
             )
-            if self._drop_recovery_body_is_stable(data, contacts):
+            if self._drop_recovery_body_is_stable(data, grounded):
                 self.set_target_leg_length(target_length)
                 self.drop.recovery_stable_steps = (
                     self.drop.recovery_stable_steps + 1
@@ -1849,22 +2162,36 @@ class PhysicalLqr:
         return drive_matrix
 
     def linear_lqr(self, data: mujoco.MjData) -> np.ndarray:
-        state_size = 2 * self.model.nv + self.model.na
-        a_matrix = np.zeros((state_size, state_size))
-        b_matrix = np.zeros((state_size, self.model.nu))
-        c_matrix = np.zeros((self.model.nsensordata, state_size))
+        full_state_size = 2 * self.model.nv + self.model.na
+        a_matrix_full = np.zeros((full_state_size, full_state_size))
+        b_matrix_full = np.zeros((full_state_size, self.model.nu))
+        c_matrix_full = np.zeros((self.model.nsensordata, full_state_size))
         d_matrix = np.zeros((self.model.nsensordata, self.model.nu))
         mujoco.mjd_transitionFD(
-            self.model, data, LINEARIZATION_EPSILON, 1, a_matrix, b_matrix, c_matrix, d_matrix
+            self.model,
+            data,
+            LINEARIZATION_EPSILON,
+            1,
+            a_matrix_full,
+            b_matrix_full,
+            c_matrix_full,
+            d_matrix,
         )
-        q_matrix = np.eye(state_size)
-        q_matrix[self.root_dof : self.root_dof + 3, self.root_dof : self.root_dof + 3] *= 40.0
-        q_matrix[self.root_dof + 3 : self.root_dof + 6, self.root_dof + 3 : self.root_dof + 6] *= 900.0
-        velocity_offset = self.model.nv
-        q_matrix[velocity_offset + self.root_dof : velocity_offset + self.root_dof + 3,
-                 velocity_offset + self.root_dof : velocity_offset + self.root_dof + 3] *= 80.0
-        q_matrix[velocity_offset + self.root_dof + 3 : velocity_offset + self.root_dof + 6,
-                 velocity_offset + self.root_dof + 3 : velocity_offset + self.root_dof + 6] *= 200.0
+        state_indices = self._lqr_state_indices
+        a_matrix = a_matrix_full[np.ix_(state_indices, state_indices)]
+        b_matrix = b_matrix_full[state_indices, :]
+        c_matrix = c_matrix_full[:, state_indices]
+        q_matrix = np.eye(state_indices.size)
+        root_position_indices = self._lqr_position_state_indices[
+            self.root_dof : self.root_dof + 6
+        ]
+        root_velocity_indices = self._lqr_velocity_state_indices[
+            self.root_dof : self.root_dof + 6
+        ]
+        q_matrix[root_position_indices[:3], root_position_indices[:3]] *= 40.0
+        q_matrix[root_position_indices[3:], root_position_indices[3:]] *= 900.0
+        q_matrix[root_velocity_indices[:3], root_velocity_indices[:3]] *= 80.0
+        q_matrix[root_velocity_indices[3:], root_velocity_indices[3:]] *= 200.0
         for sensor_name, weight in (
             ("left_leg_length", LEG_LENGTH_LQR_WEIGHT),
             ("right_leg_length", LEG_LENGTH_LQR_WEIGHT),
@@ -1875,8 +2202,10 @@ class PhysicalLqr:
             output_row = c_matrix[sensor_address]
             q_matrix += weight * np.outer(output_row, output_row)
         for dof_address in self.hip_dof_addresses:
-            q_matrix[dof_address, dof_address] += WALK_STANCE_HIP_LQR_WEIGHT
-            q_matrix[velocity_offset + dof_address, velocity_offset + dof_address] += WALK_STANCE_HIP_VELOCITY_LQR_WEIGHT
+            position_index = self._lqr_position_state_indices[dof_address]
+            velocity_index = self._lqr_velocity_state_indices[dof_address]
+            q_matrix[position_index, position_index] += WALK_STANCE_HIP_LQR_WEIGHT
+            q_matrix[velocity_index, velocity_index] += WALK_STANCE_HIP_VELOCITY_LQR_WEIGHT
         r_matrix = np.diag((12.0, 12.0, 0.08, 12.0, 12.0, 0.08))
         try:
             solution = scipy.linalg.solve_discrete_are(a_matrix, b_matrix, q_matrix, r_matrix)
@@ -1993,7 +2322,8 @@ class PhysicalLqr:
                 cosine * world_x + sine * world_y,
                 -sine * world_x + cosine * world_y,
             )
-        return np.concatenate((position_error, velocity_error))
+        full_error = np.concatenate((position_error, velocity_error))
+        return full_error[self._lqr_state_indices]
 
     def apply_walking_stance_guard(self, data: mujoco.MjData, command: np.ndarray) -> None:
         """Track the scheduled closed-chain branch without changing MJCF topology."""
@@ -2041,6 +2371,54 @@ class PhysicalLqr:
         command[list(self.hip_actuator_ids)] += jacobian * np.array(
             (-forces[0], -forces[0], forces[1], -forces[1])
         )
+
+    def apply_jump_impact_leg_force(
+        self,
+        data: mujoco.MjData,
+        command: np.ndarray,
+    ) -> None:
+        """Apply compression-only leg impedance after the first touchdown.
+
+        Flight preload is useful before contact, but it becomes unsafe when
+        one chain touches down a few milliseconds before the other.  The
+        existing landing debounce remains in charge of the phase transition;
+        this short overlay merely prevents either chain from receiving a new
+        extension force while that debounce is collecting two-wheel contact.
+        """
+        if self.leg_profile is None:
+            return
+        lengths = self.leg_lengths(data)
+        velocities = self.leg_length_velocities(data)
+        force_limit = JUMP_IMPACT_FORCE_LIMIT_N
+        forces = np.clip(
+            LEG_LENGTH_FORCE_KP_N_PER_M * (JUMP_LANDING_LENGTH_M - lengths)
+            - LEG_LENGTH_FORCE_KD_NS_PER_M * velocities,
+            -force_limit,
+            0.0,
+        )
+        leg_difference = float(lengths[0] - lengths[1])
+        differential_velocity = float(velocities[0] - velocities[1])
+        synchronization_force = float(np.clip(
+            JUMP_LEG_SYNC_KP_N_PER_M * leg_difference
+            + JUMP_LEG_SYNC_KD_NS_PER_M * differential_velocity,
+            -JUMP_LEG_SYNC_FORCE_LIMIT_N,
+            JUMP_LEG_SYNC_FORCE_LIMIT_N,
+        ))
+        forces[0] = float(np.clip(
+            forces[0] - synchronization_force,
+            -force_limit,
+            0.0,
+        ))
+        forces[1] = float(np.clip(
+            forces[1] + synchronization_force,
+            -force_limit,
+            0.0,
+        ))
+        jacobian = self.leg_profile.hip_length_jacobian(self._reference_shape)
+        command[list(self.hip_actuator_ids)] += jacobian * np.array(
+            (-forces[0], -forces[0], forces[1], -forces[1])
+        )
+        self.jump.update_impact_leg_difference(float(np.ptp(lengths)))
 
     def apply_wheel_speed_governor(self, data: mujoco.MjData, command: np.ndarray) -> None:
         """World-frame wheel PI with conditional integration and saturation protection."""
@@ -2111,25 +2489,48 @@ class PhysicalLqr:
         command[self.refs.actuator_ids[2]] = wheel_command
         command[self.refs.actuator_ids[5]] = wheel_command
 
-    def apply_yaw_heading_governor(self, data: mujoco.MjData, command: np.ndarray) -> None:
-        """Track command_yaw using bounded differential wheel torque."""
-        if not all(wheel_ground_contacts(data, self.refs, geom_id) for geom_id in self.refs.wheel_geoms):
-            self._measured_yaw_rate = 0.0
-            return
-        if self._terrain_heading_stabilization_enabled:
+    def yaw_rate_target(self, data: mujoco.MjData) -> float:
+        """Return the bounded yaw-rate target for telemetry and wheel control."""
+        if (
+            self._terrain_heading_stabilization_enabled
+            and self._terrain_yaw_rate_command_active
+        ):
+            heading_kp = TERRAIN_RATE_COMMAND_HEADING_KP_RAD_S_PER_RAD
+            target_yaw_rate = self._terrain_yaw_rate_command_rad_s
+        elif self._terrain_heading_stabilization_enabled:
             heading_kp = TERRAIN_YAW_HEADING_KP_RAD_S_PER_RAD
-            yaw_rate_kp = TERRAIN_YAW_RATE_KP_MOTOR_NM_PER_RAD_S
-            command_limit = TERRAIN_YAW_GOVERNOR_LIMIT_MOTOR_NM
+            target_yaw_rate = 0.0
         else:
             heading_kp = YAW_HEADING_KP_RAD_S_PER_RAD
-            yaw_rate_kp = YAW_RATE_KP_MOTOR_NM_PER_RAD_S
-            command_limit = YAW_GOVERNOR_LIMIT_MOTOR_NM
+            target_yaw_rate = 0.0
         yaw_error = wrap_to_pi(self.heading_command.reference_yaw - self.heading_yaw(data))
-        target_yaw_rate = float(np.clip(
-            heading_kp * yaw_error,
+        return float(np.clip(
+            target_yaw_rate + heading_kp * yaw_error,
             -MAX_YAW_RATE_RAD_S,
             MAX_YAW_RATE_RAD_S,
         ))
+
+    def apply_yaw_heading_governor(self, data: mujoco.MjData, command: np.ndarray) -> None:
+        """Track command_yaw using bounded differential wheel torque."""
+        if not all(wheel_ground_contacts(data, self.refs, geom_id) for geom_id in self.refs.wheel_geoms):
+            # Preserve the IMU-derived filtered yaw estimate through a brief
+            # hfield manifold gap. Resetting it here created a false yaw-rate
+            # measurement and an unnecessary recovery during fast terrain
+            # turns. Torque is still withheld until both raw contacts return.
+            return
+        if (
+            self._terrain_heading_stabilization_enabled
+            and self._terrain_yaw_rate_command_active
+        ):
+            yaw_rate_kp = TERRAIN_RATE_COMMAND_KP_MOTOR_NM_PER_RAD_S
+            command_limit = TERRAIN_RATE_COMMAND_LIMIT_MOTOR_NM
+        elif self._terrain_heading_stabilization_enabled:
+            yaw_rate_kp = TERRAIN_YAW_RATE_KP_MOTOR_NM_PER_RAD_S
+            command_limit = TERRAIN_YAW_GOVERNOR_LIMIT_MOTOR_NM
+        else:
+            yaw_rate_kp = YAW_RATE_KP_MOTOR_NM_PER_RAD_S
+            command_limit = YAW_GOVERNOR_LIMIT_MOTOR_NM
+        target_yaw_rate = self.yaw_rate_target(data)
         differential_command = float(np.clip(
             yaw_rate_kp * (target_yaw_rate - self._measured_yaw_rate),
             -command_limit,
@@ -2242,13 +2643,17 @@ class PhysicalLqr:
         if phase == "flight" or drop_phase == "flight":
             command = np.zeros(self.model.nu)
             self.apply_airborne_recovery(data, command)
-            force_limit = (
-                self._jump_leg_force_limit(phase)
-                if phase is not None
-                else self._drop_leg_force_limit(drop_phase)
-            )
-            self.apply_leg_length_force(data, command, force_limit)
-            self.apply_airborne_wheel_attitude_control(data, command)
+            if phase == "flight" and self.jump.impact_active:
+                self.apply_jump_impact_leg_force(data, command)
+                self.apply_jump_recovery_wheel_brake(data, command)
+            else:
+                force_limit = (
+                    self._jump_leg_force_limit(phase)
+                    if phase is not None
+                    else self._drop_leg_force_limit(drop_phase)
+                )
+                self.apply_leg_length_force(data, command, force_limit)
+                self.apply_airborne_wheel_attitude_control(data, command)
             return np.clip(command, self.model.actuator_ctrlrange[:, 0], self.model.actuator_ctrlrange[:, 1])
 
         reference_control, reference_gain = self._scheduled_control_and_gain()
@@ -2344,18 +2749,20 @@ class PhysicalLqr:
 def validate_standing_contact(data: mujoco.MjData, refs: ModelRefs) -> None:
     wheel_contacts = tuple(wheel_ground_contacts(data, refs, geom_id) for geom_id in refs.wheel_geoms)
     protected_contacts = sum(contacts_for_geom(data, geom_id) for geom_id in refs.base_geoms)
-    support_geoms = set(refs.ground_geoms)
-    nonwheel_ground_contacts = 0
-    for contact in data.contact[: data.ncon]:
-        if contact.geom1 in support_geoms:
-            nonwheel_ground_contacts += contact.geom2 not in refs.wheel_geoms
-        elif contact.geom2 in support_geoms:
-            nonwheel_ground_contacts += contact.geom1 not in refs.wheel_geoms
-    if not all(wheel_contacts) or protected_contacts or nonwheel_ground_contacts:
+    nonwheel_ground_contacts, nonwheel_obstacle_contacts = nonwheel_static_contact_counts(
+        data, refs
+    )
+    if (
+        not all(wheel_contacts)
+        or protected_contacts
+        or nonwheel_ground_contacts
+        or nonwheel_obstacle_contacts
+    ):
         raise RuntimeError(
             f"Invalid standing contact: wheels={wheel_contacts}, "
             f"protected_contacts={protected_contacts}, "
-            f"nonwheel_ground_contacts={nonwheel_ground_contacts}. "
+            f"nonwheel_ground_contacts={nonwheel_ground_contacts}, "
+            f"nonwheel_obstacle_contacts={nonwheel_obstacle_contacts}. "
             "Check the physical MJCF stance before enabling LQR."
         )
 
@@ -2405,16 +2812,13 @@ def validate_leg_length_state(data: mujoco.MjData, refs: ModelRefs) -> None:
 def validate_jump_contacts(data: mujoco.MjData, refs: ModelRefs) -> None:
     """Allow wheel liftoff during a jump, but reject unsafe body/leg impacts."""
     protected_contacts = sum(contacts_for_geom(data, geom_id) for geom_id in refs.base_geoms)
-    support_geoms = set(refs.ground_geoms)
-    for contact in data.contact[: data.ncon]:
-        if contact.geom1 in support_geoms:
-            nonwheel_ground_contact = contact.geom2 not in refs.wheel_geoms
-        elif contact.geom2 in support_geoms:
-            nonwheel_ground_contact = contact.geom1 not in refs.wheel_geoms
-        else:
-            continue
-        if nonwheel_ground_contact:
-            raise RuntimeError("Unsafe jump contact: a body other than a wheel touched the ground.")
+    nonwheel_ground_contacts, nonwheel_obstacle_contacts = nonwheel_static_contact_counts(
+        data, refs
+    )
+    if nonwheel_ground_contacts or nonwheel_obstacle_contacts:
+        raise RuntimeError(
+            "Unsafe jump contact: a body other than a wheel touched a terrain support or obstacle."
+        )
     if protected_contacts:
         raise RuntimeError("Unsafe jump contact: protected chassis collision geometry is in contact.")
     validate_linkage_clearance(data, refs)

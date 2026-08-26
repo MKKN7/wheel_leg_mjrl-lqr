@@ -80,7 +80,7 @@
     <!-- The original flat plane is enabled only while Env projects the LQR working point. -->
     <geom name="ground" type="plane" pos="0 0 0" size="100 100 0.1" material="ground_black_mat" friction="1.10 0.05 0.01" contype="2" conaffinity="1" rgba="0 0 0 0" />
     <!-- Env activates this co-located RMUC collision hfield immediately after LQR projection. -->
-    <geom name="rmuc_terrain" type="hfield" hfield="rmuc_training_hfield" pos="-12.112445 -2.726397 -0.196745" friction="1.10 0.05 0.01" solref="0.20 1" contype="2" conaffinity="1" rgba="0.20 0.26 0.20 0" />
+    <geom name="rmuc_terrain" type="hfield" hfield="rmuc_training_hfield" pos="-12.112445 -2.726397 -0.196745" friction="1.10 0.05 0.01" solref="0.150 1" contype="2" conaffinity="1" rgba="0.20 0.26 0.20 0" />
     <!-- Source OBJ meshes are rendering-only and never participate in RL collision queries. -->
     <geom name="rmuc_floor_visual_geom" type="mesh" mesh="rmuc_floor_visual" pos="-27.013445 -10.751400 -0.200000" quat="0.707107 0.707107 0.000000 0.000000" contype="0" conaffinity="0" group="0" rgba="0.48 0.51 0.47 1" />
     <geom name="rmuc_building_visual_geom" type="mesh" mesh="rmuc_building_visual" pos="-27.013445 -10.751400 -0.200000" quat="0.707107 0.707107 0.000000 0.000000" contype="0" conaffinity="0" group="0" rgba="0.72 0.72 0.72 1" />
@@ -188,6 +188,29 @@
           </body>
         </body>
       </body>
+      <!-- GUIDE_WHEEL_TRAINING_BEGIN -->
+      <!-- Passive 40x10 mm guide rollers; no actuator or public sensor. -->
+      <body name="guide_wheel_front_left" pos="0.1165009 -0.1251068 -0.2744901">
+        <joint name="guide_wheel_front_left_spin" type="hinge" axis="1.0000000 0.0000000 0.0000000" damping="0.0002000" armature="0.0000000" />
+        <site name="guide_wheel_front_left_site" pos="0 0 0" size="0.004" rgba="0.0600000 0.2800000 0.8500000 1.0000000" />
+        <geom name="guide_wheel_front_left_contact" type="cylinder" size="0.0200000 0.0050000" quat="0.7071068 0.0000000 0.7071068 0.0000000" density="1450.0000000" friction="1.1000000 0.0050000 0.0001000" condim="3" contype="1" conaffinity="2" rgba="0.0600000 0.2800000 0.8500000 1.0000000" />
+      </body>
+      <body name="guide_wheel_front_right" pos="-0.1165001 -0.1251068 -0.2744901">
+        <joint name="guide_wheel_front_right_spin" type="hinge" axis="1.0000000 0.0000000 0.0000000" damping="0.0002000" armature="0.0000000" />
+        <site name="guide_wheel_front_right_site" pos="0 0 0" size="0.004" rgba="0.0600000 0.2800000 0.8500000 1.0000000" />
+        <geom name="guide_wheel_front_right_contact" type="cylinder" size="0.0200000 0.0050000" quat="0.7071068 0.0000000 0.7071068 0.0000000" density="1450.0000000" friction="1.1000000 0.0050000 0.0001000" condim="3" contype="1" conaffinity="2" rgba="0.0600000 0.2800000 0.8500000 1.0000000" />
+      </body>
+      <body name="guide_wheel_rear_left" pos="0.1165009 -0.1251068 0.2744593">
+        <joint name="guide_wheel_rear_left_spin" type="hinge" axis="1.0000000 0.0000000 0.0000000" damping="0.0002000" armature="0.0000000" />
+        <site name="guide_wheel_rear_left_site" pos="0 0 0" size="0.004" rgba="0.0600000 0.2800000 0.8500000 1.0000000" />
+        <geom name="guide_wheel_rear_left_contact" type="cylinder" size="0.0200000 0.0050000" quat="0.7071068 0.0000000 0.7071068 0.0000000" density="1450.0000000" friction="1.1000000 0.0050000 0.0001000" condim="3" contype="1" conaffinity="2" rgba="0.0600000 0.2800000 0.8500000 1.0000000" />
+      </body>
+      <body name="guide_wheel_rear_right" pos="-0.1165001 -0.1251068 0.2744593">
+        <joint name="guide_wheel_rear_right_spin" type="hinge" axis="1.0000000 0.0000000 0.0000000" damping="0.0002000" armature="0.0000000" />
+        <site name="guide_wheel_rear_right_site" pos="0 0 0" size="0.004" rgba="0.0600000 0.2800000 0.8500000 1.0000000" />
+        <geom name="guide_wheel_rear_right_contact" type="cylinder" size="0.0200000 0.0050000" quat="0.7071068 0.0000000 0.7071068 0.0000000" density="1450.0000000" friction="1.1000000 0.0050000 0.0001000" condim="3" contype="1" conaffinity="2" rgba="0.0600000 0.2800000 0.8500000 1.0000000" />
+      </body>
+      <!-- GUIDE_WHEEL_TRAINING_END -->
     </body>
   </worldbody>
   <sensor>

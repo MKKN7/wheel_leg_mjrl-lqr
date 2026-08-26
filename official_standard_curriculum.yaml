@@ -1,0 +1,458 @@
+schema_version: 4
+name: official_standard_full_body_locomotion_v1
+scene_id: official_standard_v1
+scene_contract:
+  mjcf_filename: official_standard_ground.xml
+  mjcf_model: official_standard_ground
+  terrain_spec_filename: official_terrain_geometry.yaml
+  support_geoms:
+    - support_grade15_lead
+    - support_grade15_ramp
+    - support_grade15_platform
+    - support_grade20_lead
+    - support_grade20_ramp
+    - support_grade20_platform
+    - support_step150_lead
+    - support_step150_platform
+    - support_stair2x100_lead
+    - support_stair2x100_lower
+    - support_stair2x100_upper
+    - support_step200_lab_lead
+    - support_step200_lab_platform
+    - support_fly17_lead
+    - support_fly17_ramp
+    - support_fly17_landing
+    - support_doghole_floor
+  obstacle_geoms:
+    - obstacle_doghole_roof
+    - obstacle_doghole_left_wall
+    - obstacle_doghole_right_wall
+  route_bindings:
+    - task_id: grade15_up
+      route_id: official_grade15_up
+      support_geoms:
+        - support_grade15_lead
+        - support_grade15_ramp
+        - support_grade15_platform
+      obstacle_geoms: []
+    - task_id: grade15_down
+      route_id: official_grade15_down
+      support_geoms:
+        - support_grade15_lead
+        - support_grade15_ramp
+        - support_grade15_platform
+      obstacle_geoms: []
+    - task_id: grade20_up
+      route_id: official_grade20_up
+      support_geoms:
+        - support_grade20_lead
+        - support_grade20_ramp
+        - support_grade20_platform
+      obstacle_geoms: []
+    - task_id: grade20_down
+      route_id: official_grade20_down
+      support_geoms:
+        - support_grade20_lead
+        - support_grade20_ramp
+        - support_grade20_platform
+      obstacle_geoms: []
+    - task_id: fly17_jump
+      route_id: official_fly17_jump
+      support_geoms:
+        - support_fly17_lead
+        - support_fly17_ramp
+        - support_fly17_landing
+      obstacle_geoms: []
+    - task_id: step150_up
+      route_id: official_step150_up
+      support_geoms:
+        - support_step150_lead
+        - support_step150_platform
+      obstacle_geoms: []
+    - task_id: step150_down
+      route_id: official_step150_down
+      support_geoms:
+        - support_step150_lead
+        - support_step150_platform
+      obstacle_geoms: []
+    - task_id: stair2x100_up
+      route_id: official_stair2x100_up
+      support_geoms:
+        - support_stair2x100_lead
+        - support_stair2x100_lower
+        - support_stair2x100_upper
+      obstacle_geoms: []
+    - task_id: stair2x100_down
+      route_id: official_stair2x100_down
+      support_geoms:
+        - support_stair2x100_lead
+        - support_stair2x100_lower
+        - support_stair2x100_upper
+      obstacle_geoms: []
+    - task_id: step200_lab
+      route_id: official_step200_lab_up
+      support_geoms:
+        - support_step200_lab_lead
+        - support_step200_lab_platform
+      obstacle_geoms: []
+    - task_id: doghole450
+      route_id: official_doghole450_forward
+      support_geoms:
+        - support_doghole_floor
+      obstacle_geoms:
+        - obstacle_doghole_roof
+        - obstacle_doghole_left_wall
+        - obstacle_doghole_right_wall
+limits:
+  max_forward_speed_mps: 0.60
+  max_yaw_rate_rad_s: 0.35
+# Route coordinates, corridor widths, task speeds, trigger positions, and
+# episode horizons below are training-fixture values, not official dimensions.
+# The authoritative terrain dimensions are in official_terrain_geometry.yaml.
+tasks:
+  - id: grade15_up
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.30
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 36.0
+    routes:
+      - id: official_grade15_up
+        spawn:
+          x_m: -6.0
+          y_m: 6.0
+          yaw_rad: 0.0
+        goal:
+          x_m: 1.4
+          y_m: 6.0
+          yaw_rad: 0.0
+        corridor_half_width_m: 0.30
+  - id: grade15_down
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.30
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 36.0
+    routes:
+      - id: official_grade15_down
+        spawn:
+          x_m: 0.8
+          y_m: 6.0
+          yaw_rad: 3.141592653589793
+        goal:
+          x_m: -6.0
+          y_m: 6.0
+          yaw_rad: 3.141592653589793
+        corridor_half_width_m: 0.30
+  - id: grade20_up
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.26
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 40.0
+    routes:
+      - id: official_grade20_up
+        spawn:
+          x_m: -6.0
+          y_m: 4.0
+          yaw_rad: 0.0
+        goal:
+          x_m: 1.4
+          y_m: 4.0
+          yaw_rad: 0.0
+        corridor_half_width_m: 0.30
+  - id: grade20_down
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.26
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 40.0
+    routes:
+      - id: official_grade20_down
+        spawn:
+          x_m: 0.8
+          y_m: 4.0
+          yaw_rad: 3.141592653589793
+        goal:
+          x_m: -6.0
+          y_m: 4.0
+          yaw_rad: 3.141592653589793
+        corridor_half_width_m: 0.30
+  - id: fly17_jump
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.40
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    jump_trigger_progress_m: 1.20
+    jump_launch_speed_mps: 0.40
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.35
+    max_episode_seconds: 28.0
+    routes:
+      - id: official_fly17_jump
+        spawn:
+          x_m: -6.0
+          y_m: 2.0
+          yaw_rad: 0.0
+        goal:
+          x_m: 1.4
+          y_m: 2.0
+          yaw_rad: 0.0
+        corridor_half_width_m: 0.32
+  - id: step150_up
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.22
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    jump_trigger_progress_m: 1.00
+    jump_launch_speed_mps: 0.30
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 36.0
+    routes:
+      - id: official_step150_up
+        spawn:
+          x_m: -6.0
+          y_m: 0.0
+          yaw_rad: 0.0
+        goal:
+          x_m: 1.4
+          y_m: 0.0
+          yaw_rad: 0.0
+        corridor_half_width_m: 0.30
+  - id: step150_down
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.20
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 36.0
+    routes:
+      - id: official_step150_down
+        spawn:
+          x_m: 0.8
+          y_m: 0.0
+          yaw_rad: 3.141592653589793
+        goal:
+          x_m: -6.0
+          y_m: 0.0
+          yaw_rad: 3.141592653589793
+        corridor_half_width_m: 0.30
+  - id: stair2x100_up
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.20
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    jump_trigger_progress_m: 1.00
+    jump_launch_speed_mps: 0.30
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 40.0
+    routes:
+      - id: official_stair2x100_up
+        spawn:
+          x_m: -6.0
+          y_m: -2.0
+          yaw_rad: 0.0
+        goal:
+          x_m: 1.4
+          y_m: -2.0
+          yaw_rad: 0.0
+        corridor_half_width_m: 0.30
+  - id: stair2x100_down
+    sampling_weight: 1.0
+    command:
+      forward_speed_mps: 0.20
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 40.0
+    routes:
+      - id: official_stair2x100_down
+        spawn:
+          x_m: 0.8
+          y_m: -2.0
+          yaw_rad: 3.141592653589793
+        goal:
+          x_m: -6.0
+          y_m: -2.0
+          yaw_rad: 3.141592653589793
+        corridor_half_width_m: 0.30
+  - id: step200_lab
+    sampling_weight: 0.75
+    command:
+      forward_speed_mps: 0.18
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    jump_trigger_progress_m: 1.00
+    jump_launch_speed_mps: 0.32
+    required_consecutive_successes: 3
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 44.0
+    routes:
+      - id: official_step200_lab_up
+        spawn:
+          x_m: -6.0
+          y_m: -4.0
+          yaw_rad: 0.0
+        goal:
+          x_m: 1.4
+          y_m: -4.0
+          yaw_rad: 0.0
+        corridor_half_width_m: 0.30
+  - id: doghole450
+    sampling_weight: 0.75
+    command:
+      forward_speed_mps: 0.16
+      yaw_rate_rad_s: 0.0
+      jump_request: false
+    required_consecutive_successes: 1
+    required_distance_m: 6.80
+    completion_tolerance_m: 0.30
+    max_episode_seconds: 44.0
+    routes:
+      - id: official_doghole450_forward
+        spawn:
+          x_m: -6.0
+          y_m: -6.0
+          yaw_rad: 0.0
+        goal:
+          x_m: 1.4
+          y_m: -6.0
+          yaw_rad: 0.0
+        corridor_half_width_m: 0.28
+stages:
+  - id: grade15
+    task_ids:
+      - grade15_up
+      - grade15_down
+    evaluation_episodes: 60
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    maximum_speed_mae_mps: 0.10
+    maximum_yaw_mae_rad: 0.15
+    command_speed_scale: 0.65
+    command_yaw_rate_scale: 1.0
+  - id: grade20
+    task_ids:
+      - grade15_up
+      - grade15_down
+      - grade20_up
+      - grade20_down
+    evaluation_episodes: 60
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    maximum_speed_mae_mps: 0.10
+    maximum_yaw_mae_rad: 0.15
+    command_speed_scale: 0.75
+    command_yaw_rate_scale: 1.0
+  - id: step150
+    task_ids:
+      - grade15_up
+      - grade15_down
+      - step150_up
+      - step150_down
+    evaluation_episodes: 60
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    maximum_speed_mae_mps: 0.10
+    maximum_yaw_mae_rad: 0.15
+    command_speed_scale: 0.70
+    command_yaw_rate_scale: 1.0
+  - id: stair2x100
+    task_ids:
+      - step150_up
+      - step150_down
+      - stair2x100_up
+      - stair2x100_down
+    evaluation_episodes: 60
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    maximum_speed_mae_mps: 0.10
+    maximum_yaw_mae_rad: 0.15
+    command_speed_scale: 0.80
+    command_yaw_rate_scale: 1.0
+  - id: step200_lab
+    task_ids:
+      - stair2x100_up
+      - stair2x100_down
+      - step200_lab
+    evaluation_episodes: 60
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    maximum_speed_mae_mps: 0.10
+    maximum_yaw_mae_rad: 0.15
+    command_speed_scale: 0.90
+    command_yaw_rate_scale: 1.0
+  - id: fly17
+    task_ids:
+      - grade15_up
+      - grade15_down
+      - fly17_jump
+    evaluation_episodes: 60
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    maximum_speed_mae_mps: 0.10
+    maximum_yaw_mae_rad: 0.15
+    command_speed_scale: 0.90
+    command_yaw_rate_scale: 1.0
+  - id: doghole450
+    task_ids:
+      - grade15_up
+      - grade15_down
+      - doghole450
+    evaluation_episodes: 60
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    maximum_speed_mae_mps: 0.10
+    maximum_yaw_mae_rad: 0.15
+    command_speed_scale: 0.80
+    command_yaw_rate_scale: 1.0
+  - id: official_full
+    task_ids:
+      - grade15_up
+      - grade15_down
+      - grade20_up
+      - grade20_down
+      - fly17_jump
+      - step150_up
+      - step150_down
+      - stair2x100_up
+      - stair2x100_down
+      - step200_lab
+      - doghole450
+    evaluation_episodes: 90
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    maximum_speed_mae_mps: 0.10
+    maximum_yaw_mae_rad: 0.15
+    command_speed_scale: 1.0
+    command_yaw_rate_scale: 1.0

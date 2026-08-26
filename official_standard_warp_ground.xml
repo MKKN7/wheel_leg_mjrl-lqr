@@ -1,6 +1,6 @@
-<mujoco model="wheeled_infantry">
+<mujoco model="official_standard_ground">
   <compiler angle="radian" meshdir="meshes_mj" inertiafromgeom="auto" balanceinertia="true" />
-  <statistic center="0 0 0.25" extent="1.5" />
+  <statistic center="-4 0 0.35" extent="18" />
   <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast" iterations="100" ls_iterations="50" />
   <visual>
     <headlight ambient="0.18 0.18 0.18" diffuse="0.40 0.40 0.40" specular="0.05 0.05 0.05" />
@@ -73,8 +73,37 @@
   </contact>
   <worldbody>
     <light name="sun" pos="0 0 6" dir="0 0 -1" directional="true" diffuse="0.55 0.55 0.55" specular="0.05 0.05 0.05" />
-    <!-- Static ground: collision group 2 accepts contacts from dynamic group 1. -->
-    <geom name="ground" type="plane" pos="0 0 0" size="100 100 0.1" material="ground_black_mat" friction="1.10 0.05 0.01" contype="2" conaffinity="1" />
+    <!-- The inherited plane is used only during LQR trim projection. -->
+    <geom name="ground" type="plane" pos="0 0 0" size="100.000 100.000 0.1" material="ground_black_mat" friction="1.100000000 0.050000000 0.010000000" contype="0" conaffinity="0" rgba="0 0 0 0" />
+    <!-- support_* are collision surfaces; obstacle_* are non-support collisions. -->
+    <!-- grade15: official ramp angle/height/run from geometry YAML. -->
+    <geom name="support_grade15_lead" type="box" pos="-6.000000000 6.000000000 -0.400000000" size="1.000000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <geom name="support_grade15_ramp" type="box" pos="-4.150062220 6.000000000 -0.186370331" size="0.772740661 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" quat="0.991444861 0.000000000 -0.130526192 0.000000000" />
+    <geom name="support_grade15_platform" type="box" pos="-1.007179677 6.000000000 0.000000000" size="2.500000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <!-- grade20: official ramp angle/height/run from geometry YAML. -->
+    <geom name="support_grade20_lead" type="box" pos="-6.000000000 4.000000000 -0.400000000" size="1.000000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <geom name="support_grade20_ramp" type="box" pos="-4.313696335 4.000000000 -0.175877061" size="0.584761030 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" quat="0.984807761 0.000000000 -0.173648132 0.000000000" />
+    <geom name="support_grade20_platform" type="box" pos="-1.201008714 4.000000000 0.000000000" size="2.700000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <!-- step150: official vertical rises; tread lengths are fixture-only. -->
+    <geom name="support_step150_lead" type="box" pos="-6.000000000 0.000000000 -0.400000000" size="1.000000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <geom name="support_step150_platform" type="box" pos="-1.750000000 0.000000000 -0.250000000" size="3.250000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <!-- stair2x100: official vertical rises; tread lengths are fixture-only. -->
+    <geom name="support_stair2x100_lead" type="box" pos="-6.000000000 -2.000000000 -0.400000000" size="1.000000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <geom name="support_stair2x100_lower" type="box" pos="-4.825000000 -2.000000000 -0.300000000" size="0.175000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <geom name="support_stair2x100_upper" type="box" pos="-1.575000000 -2.000000000 -0.200000000" size="3.075000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <!-- step200_lab: official vertical rises; tread lengths are fixture-only. -->
+    <geom name="support_step200_lab_lead" type="box" pos="-6.000000000 -4.000000000 -0.400000000" size="1.000000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <geom name="support_step200_lab_platform" type="box" pos="-1.750000000 -4.000000000 -0.200000000" size="3.250000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <!-- fly17: official ramp angle/height/run from geometry YAML. -->
+    <geom name="support_fly17_lead" type="box" pos="-5.250000000 2.000000000 -0.400000000" size="1.250000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <geom name="support_fly17_ramp" type="box" pos="-3.310652110 2.000000000 -0.207521902" size="0.598553133 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" quat="0.989015863 0.000000000 -0.147809411 0.000000000" />
+    <geom name="support_fly17_landing" type="box" pos="-0.355201584 2.000000000 -0.400000000" size="1.850000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <!-- Doghole roof/walls are true collision obstacles, not hfield support. -->
+    <geom name="support_doghole_floor" type="box" pos="-2.750000000 -6.000000000 -0.400000000" size="4.250000000 0.750000000 0.400000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="1" rgba="0.32 0.38 0.32 1" />
+    <geom name="obstacle_doghole_roof" type="box" pos="-4.000000000 -6.000000000 0.475000000" size="1.500000000 0.450000000 0.025000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="5" rgba="0.42 0.25 0.18 1" margin="0"/>
+    <geom name="obstacle_doghole_left_wall" type="box" pos="-4.000000000 -6.450000000 0.200000000" size="1.500000000 0.050000000 0.250000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="5" rgba="0.42 0.25 0.18 1" margin="0"/>
+    <geom name="obstacle_doghole_right_wall" type="box" pos="-4.000000000 -5.550000000 0.200000000" size="1.500000000 0.050000000 0.250000000" friction="1.100000000 0.050000000 0.010000000" solref="0.150000000 1.000000000" contype="2" conaffinity="5" rgba="0.42 0.25 0.18 1" margin="0"/>
+    <camera name="official_follow_camera" mode="trackcom" target="robot" pos="-2.8 -2.8 1.6" fovy="55" />
     <body name="robot" pos="0 0 0.400" quat="0.70710678 0.70710678 0 0">
       <freejoint name="robot_free" />
       <!--6DOF瀹炵幇鐩稿鑵块儴杞姩-->
@@ -87,7 +116,7 @@
       <!-- Dynamic collision group 1 only collides with the ground group 2. -->
       <geom name="base_contact" type="sphere" pos="0 0 0" size="0.045" mass="0" friction="0.80 0.005 0.0001" contype="4" conaffinity="0" rgba="0 0 0 0" />
       <!-- Chassis collision proxy used by explicit wheel/leg self-contact pairs. -->
-      <geom name="base_collision" type="box" pos="0 0 0" size="0.160 0.070 0.070" mass="0" contype="4" conaffinity="0" rgba="0 0 0 0" />
+      <geom name="base_collision" type="box" pos="0 0 0" size="0.160 0.070 0.070" mass="0" contype="4" conaffinity="0" rgba="0 0 0 0" margin="0"/>
       <geom type="mesh" mesh="base_visual_aluminum_part1" mass="0" rgba="0.74 0.76 0.79 1" contype="0" conaffinity="0" group="0" />
       <geom type="mesh" mesh="base_visual_aluminum_part2" mass="0" rgba="0.74 0.76 0.79 1" contype="0" conaffinity="0" group="0" />
       <geom type="mesh" mesh="base_visual_aluminum_part3" mass="0" rgba="0.74 0.76 0.79 1" contype="0" conaffinity="0" group="0" />

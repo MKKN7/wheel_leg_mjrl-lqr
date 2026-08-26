@@ -540,6 +540,9 @@ def generate_outputs():
     xml = build_xml(body_geom_map)
     with open(XML_OUT, "w", encoding="utf-8") as f:
         f.write(xml)
+    from guide_wheel_mjcf import apply_guide_wheel_block
+
+    apply_guide_wheel_block(XML_OUT, os.path.join(ROOT, "configs", "guide_wheel_training_model.yaml"))
 
 
 def build_body_geom_xml(body_key, indent="      "):

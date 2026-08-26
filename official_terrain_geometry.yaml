@@ -1,0 +1,147 @@
+# Synthetic RM2025/2026 standard-terrain training fixture.
+#
+# Official dimensions below are stored in SI units.  Values labelled
+# "fixture" define only the surrounding test jig because the supplied rule
+# reference does not prescribe them.  They must not be reported as official
+# field dimensions.
+schema_version: 1
+scene:
+  id: official_standard_v1
+  mjcf_model: official_standard_ground
+  output_xml: official_standard_ground.xml
+  # MuJoCo-Warp 3.11 currently rejects non-zero collision margins on the
+  # doghole's box-to-box chassis proxy contacts while MULTICCD is enabled.
+  # The canonical CPU scene above remains the source of truth.  The generated
+  # Warp variant preserves every terrain dimension and collision mask, and
+  # changes only these GPU-incompatible proxy margins to zero.
+  warp_compatibility:
+    output_xml: official_standard_warp_ground.xml
+    disable_collision_geoms:
+      - ground
+    zero_margin_geoms:
+      - base_collision
+      - obstacle_doghole_roof
+      - obstacle_doghole_left_wall
+      - obstacle_doghole_right_wall
+  follow_camera: official_follow_camera
+  support_prefix: support_
+  obstacle_prefix: obstacle_
+  collision:
+    friction: [1.10, 0.05, 0.01]
+    solref: [0.150, 1.0]
+    track_width_m: 1.50
+    support_thickness_m: 0.40
+    projection_plane_size_m: 100.0
+official_tolerances:
+  dimension_fraction: 0.10
+  slope_deg: 3.0
+features:
+  grade15:
+    kind: ramp
+    official:
+      angle_deg: 15.0
+      vertical_height_m: 0.400
+      horizontal_run_m: 1.492820323
+    fixture:
+      x_start_m: -5.000
+      y_m: 6.000
+      lead_length_m: 2.000
+      platform_length_m: 5.000
+    support_geoms: [support_grade15_lead, support_grade15_ramp, support_grade15_platform]
+
+  grade20:
+    kind: ramp
+    official:
+      angle_deg: 20.0
+      vertical_height_m: 0.400
+      horizontal_run_m: 1.098991286
+    fixture:
+      x_start_m: -5.000
+      y_m: 4.000
+      lead_length_m: 2.000
+      platform_length_m: 5.400
+    support_geoms: [support_grade20_lead, support_grade20_ramp, support_grade20_platform]
+
+  step150:
+    kind: stepped_platform
+    official:
+      step_height_m: 0.150
+      step_count: 1
+    fixture:
+      x_start_m: -5.000
+      y_m: 0.000
+      lead_length_m: 2.000
+      platform_length_m: 6.500
+    segments:
+      - name: platform
+        top_height_m: 0.150
+        length_m: 6.500
+    support_geoms: [support_step150_lead, support_step150_platform]
+
+  stair2x100:
+    kind: stepped_platform
+    official:
+      step_height_m: 0.100
+      step_count: 2
+      total_height_m: 0.200
+    fixture:
+      x_start_m: -5.000
+      y_m: -2.000
+      lead_length_m: 2.000
+      # The rule reference specifies the rises but not the tread depth.
+      tread_depth_m: 0.350
+      upper_platform_length_m: 6.150
+    segments:
+      - name: lower
+        top_height_m: 0.100
+        length_m: 0.350
+      - name: upper
+        top_height_m: 0.200
+        length_m: 6.150
+    support_geoms: [support_stair2x100_lead, support_stair2x100_lower, support_stair2x100_upper]
+
+  step200_lab:
+    kind: stepped_platform
+    official:
+      step_height_m: 0.200
+      required_consecutive_successes: 3
+    fixture:
+      x_start_m: -5.000
+      y_m: -4.000
+      lead_length_m: 2.000
+      platform_length_m: 6.500
+    segments:
+      - name: platform
+        top_height_m: 0.200
+        length_m: 6.500
+    support_geoms: [support_step200_lab_lead, support_step200_lab_platform]
+
+  fly17:
+    kind: fly_ramp
+    official:
+      angle_deg: 17.0
+      vertical_height_m: 0.350
+      horizontal_run_m: 1.144798416
+      minimum_landing_distance_m: 0.650
+    fixture:
+      x_start_m: -4.000
+      y_m: 2.000
+      lead_length_m: 2.500
+      landing_platform_length_m: 3.700
+    support_geoms: [support_fly17_lead, support_fly17_ramp, support_fly17_landing]
+
+  doghole450:
+    kind: doghole
+    official:
+      clear_height_m: 0.450
+    fixture:
+      x_start_m: -7.000
+      y_m: -6.000
+      floor_length_m: 8.500
+      tunnel_length_m: 3.000
+      tunnel_start_offset_m: 1.500
+      clear_width_m: 0.800
+      wall_thickness_m: 0.050
+      roof_thickness_m: 0.050
+    support_geoms: [support_doghole_floor]
+    obstacle_geoms: [obstacle_doghole_roof, obstacle_doghole_left_wall, obstacle_doghole_right_wall]

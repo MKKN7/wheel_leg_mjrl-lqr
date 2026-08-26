@@ -24,11 +24,12 @@ from terrain_curriculum import (
     TerrainCurriculumConfig,
     TerrainCurriculumError,
     load_terrain_curriculum,
+    validate_scene_contract,
 )
 
 
-CHECKPOINT_FORMAT_VERSION = 12
-REWARD_SCHEMA = "command_tracking_jump_clearance_terrain_safe_terminal_v12"
+CHECKPOINT_FORMAT_VERSION = 21
+REWARD_SCHEMA = "command_tracking_jump_clearance_terrain_command_speed_v13"
 
 
 class BehaviorCloningPolicy(nn.Module):
@@ -63,14 +64,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "MJCF scene to train in; defaults to wheeled_infantry.xml, or "
-            "rm_train_ground.xml when --terrain-curriculum is supplied."
+            "the curriculum-bound scene when --terrain-curriculum is supplied."
         ),
     )
     parser.add_argument(
         "--terrain-curriculum",
         type=Path,
         help=(
-            "Strict RMUC terrain curriculum YAML. When supplied, --terrain-stage selects the "
+            "Strict scene-bound terrain curriculum YAML. When supplied, --terrain-stage selects the "
             "fixed non-navigating task stage used at environment reset."
         ),
     )
@@ -216,7 +217,7 @@ def command_resample_seconds_for_args(args: argparse.Namespace) -> float | None:
 
 
 def resolve_terrain_curriculum_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    """Load and validate an optional fixed-stage RMUC curriculum before training starts."""
+    """Load and validate an optional fixed-stage terrain curriculum before training starts."""
     if args.terrain_curriculum is None:
         if args.terrain_stage is not None:
             parser.error("--terrain-stage requires --terrain-curriculum")
@@ -267,11 +268,24 @@ def resolve_terrain_curriculum_args(args: argparse.Namespace, parser: argparse.A
     args.terrain_curriculum_config = curriculum
     args.terrain_stage_id = stage.stage_id
     if args.xml_path is None:
-        rmuc_xml_path = Path(__file__).with_name("rm_train_ground.xml")
-        if rmuc_xml_path.is_file():
-            # A terrain curriculum is explicitly an RMUC-scene training run;
-            # avoid silently falling back to the flat wheeled XML.
-            args.xml_path = rmuc_xml_path.resolve()
+        scene_filename = (
+            curriculum.scene_contract.mjcf_filename
+            if curriculum.scene_contract is not None
+            else "rm_train_ground.xml"
+        )
+        scene_xml_path = Path(__file__).with_name(scene_filename)
+        if scene_xml_path.is_file():
+            args.xml_path = scene_xml_path.resolve()
+    if args.xml_path is None:
+        parser.error("terrain curriculum scene XML could not be resolved")
+    try:
+        validate_scene_contract(
+            curriculum,
+            args.xml_path,
+            curriculum_path=curriculum_path,
+        )
+    except TerrainCurriculumError as error:
+        parser.error(str(error))
 
 
 def terrain_curriculum_metadata_for_args(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -286,12 +300,28 @@ def terrain_curriculum_metadata_for_args(args: argparse.Namespace) -> dict[str, 
     if not isinstance(curriculum_path, Path):
         raise ValueError("terrain curriculum path is unavailable")
     stage = curriculum.stage(stage_id)
-    return {
+    metadata = {
         "yaml_sha256": hashlib.sha256(curriculum_path.read_bytes()).hexdigest(),
         "schema_version": int(curriculum.schema_version),
         "stage_id": stage.stage_id,
         "stage_task_ids": list(stage.task_ids),
+        "stage_gate": {
+            "maximum_unsafe_rate": stage.maximum_unsafe_rate,
+            "minimum_completion_rate": stage.minimum_completion_rate,
+            "maximum_speed_mae_mps": stage.maximum_speed_mae_mps,
+            "maximum_yaw_mae_rad": stage.maximum_yaw_mae_rad,
+        },
     }
+    if curriculum.scene_contract is not None:
+        metadata["scene_id"] = curriculum.scene_id
+        metadata["scene_contract"] = {
+            "mjcf_filename": curriculum.scene_contract.mjcf_filename,
+            "mjcf_model": curriculum.scene_contract.mjcf_model,
+            "terrain_spec_filename": curriculum.scene_contract.terrain_spec_filename,
+            "support_geoms": list(curriculum.scene_contract.support_geoms),
+            "obstacle_geoms": list(curriculum.scene_contract.obstacle_geoms),
+        }
+    return metadata
 
 
 def episode_seconds_for_args(args: argparse.Namespace) -> float:
@@ -305,20 +335,6 @@ def episode_seconds_for_args(args: argparse.Namespace) -> float:
     return max(float(DEFAULT_EPISODE_SECONDS), float(curriculum.stage_max_episode_seconds(stage_id)))
 
 
-def terrain_stage_uses_progress_jump(args: argparse.Namespace) -> bool:
-    """Whether a selected fixed terrain stage issues a future jump edge."""
-    curriculum = getattr(args, "terrain_curriculum_config", None)
-    stage_id = getattr(args, "terrain_stage_id", None)
-    if curriculum is None:
-        return False
-    if not isinstance(curriculum, TerrainCurriculumConfig) or not isinstance(stage_id, str):
-        raise ValueError("terrain curriculum arguments were not resolved before jump-profile selection")
-    return any(
-        curriculum.task(task_id).has_progress_jump_trigger
-        for task_id in curriculum.stage(stage_id).task_ids
-    )
-
-
 def domain_randomization_for_args(
     args: argparse.Namespace,
 ) -> tuple[DomainRandomizationConfig, DomainRandomizationConfig | None]:
@@ -327,15 +343,14 @@ def domain_randomization_for_args(
     if getattr(args, "terrain_curriculum_config", None) is not None:
         walking = DomainRandomizationConfig.terrain_vehicle_only_defaults()
         jumping = DomainRandomizationConfig.jump_vehicle_only_defaults()
+        return walking, jumping
     elif args.vehicle_only_domain_randomization:
         walking = DomainRandomizationConfig.vehicle_only_defaults()
         jumping = DomainRandomizationConfig.jump_vehicle_only_defaults()
     else:
         walking = DomainRandomizationConfig.training_defaults()
         jumping = DomainRandomizationConfig.jump_training_defaults()
-    return walking, jumping if (
-        args.jump_probability > 0.0 or terrain_stage_uses_progress_jump(args)
-    ) else None
+    return walking, jumping if args.jump_probability > 0.0 else None
 
 
 def collect_demonstrations(
@@ -460,6 +475,7 @@ def main() -> None:
         "jump_probability": float(args.jump_probability),
         "jump_at_s": float(args.jump_at),
         "terrain_curriculum": terrain_curriculum,
+        "locomotion_command_conditioning": environment_definition.locomotion_command_conditioning_config(),
         "locomotion_command_schema": environment_definition.LOCOMOTION_COMMAND_SCHEMA,
         "residual_authority_schema": environment_definition.RESIDUAL_AUTHORITY_SCHEMA,
         "reward_schema": REWARD_SCHEMA,
@@ -506,6 +522,7 @@ def main() -> None:
             "lqr_source_sha256": hashlib.sha256(Path(lqr.__file__).read_bytes()).hexdigest(),
             "jump_controller": lqr.jump_controller_config(),
             "terrain_controller": lqr.terrain_controller_config(),
+            "locomotion_command_conditioning": environment_definition.locomotion_command_conditioning_config(),
             "locomotion_command_schema": environment_definition.LOCOMOTION_COMMAND_SCHEMA,
             "residual_authority_schema": environment_definition.RESIDUAL_AUTHORITY_SCHEMA,
             "domain_randomization": domain_randomization.as_dict(),
