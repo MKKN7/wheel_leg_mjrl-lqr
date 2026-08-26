@@ -32,6 +32,7 @@ from typing import Any, Mapping
 import numpy as np
 import yaml
 
+from guide_wheel_mjcf import guide_wheel_runtime_contract
 from warp_env import WarpBatchError, WarpBatchStep, WarpPhysicsBatch
 from warp_safety import (
     SAFETY_REASON_NONFINITE_CONTROL,
@@ -59,15 +60,12 @@ DEFAULT_WHEEL_CLEARANCE_NORMALIZATION_M = 0.25
 DEFAULT_BODY_RISE_NORMALIZATION_M = 0.25
 DEFAULT_RESIDUAL_LIMITS = (8.0, 8.0, 0.75, 8.0, 8.0, 0.75, 1.0)
 
-# All four names are a single MJCF contract. The order is front-left,
-# front-right, rear-left, rear-right; public observations still expose only
-# the two active-wheel contacts.
-GUIDE_WHEEL_CONTACT_GEOM_NAMES = (
-    "guide_wheel_front_left_contact",
-    "guide_wheel_front_right_contact",
-    "guide_wheel_rear_left_contact",
-    "guide_wheel_rear_right_contact",
-)
+# Exact lower-guide names and side membership come from the YAML contract.
+# Public observations still expose only the two active-wheel contacts.
+_GUIDE_WHEEL_CONTRACT = guide_wheel_runtime_contract()
+GUIDE_WHEEL_CONTACT_GEOM_NAMES = _GUIDE_WHEEL_CONTRACT.contact_names
+GUIDE_WHEEL_LEFT_INDICES = _GUIDE_WHEEL_CONTRACT.left_indices
+GUIDE_WHEEL_RIGHT_INDICES = _GUIDE_WHEEL_CONTRACT.right_indices
 
 
 @dataclass(frozen=True)
@@ -401,13 +399,19 @@ def combine_side_support_contacts(
     torch: Any,
     active_contacts: Any,
     guide_contacts: Any,
+    left_indices: Any,
+    right_indices: Any,
+    left_contact_values: Any,
+    right_contact_values: Any,
     guide_side_out: Any,
     support_out: Any,
 ) -> Any:
     """Write per-side active-or-guide support into resident caller buffers."""
 
-    torch.logical_or(guide_contacts[:, 0], guide_contacts[:, 2], out=guide_side_out[:, 0])
-    torch.logical_or(guide_contacts[:, 1], guide_contacts[:, 3], out=guide_side_out[:, 1])
+    torch.index_select(guide_contacts, 1, left_indices, out=left_contact_values)
+    torch.index_select(guide_contacts, 1, right_indices, out=right_contact_values)
+    torch.any(left_contact_values, dim=1, out=guide_side_out[:, 0])
+    torch.any(right_contact_values, dim=1, out=guide_side_out[:, 1])
     torch.logical_or(active_contacts[:, 0], guide_side_out[:, 0], out=support_out[:, 0])
     torch.logical_or(active_contacts[:, 1], guide_side_out[:, 1], out=support_out[:, 1])
     return support_out
@@ -514,6 +518,14 @@ class WarpFlatWalkingTask:
         self._guide_wheel_geom_gpu = torch.as_tensor(
             self._guide_wheel_geom_ids, dtype=torch.long, device=self.device
         )
+        self._guide_left_indices = torch.as_tensor(
+            GUIDE_WHEEL_LEFT_INDICES, dtype=torch.long, device=self.device
+        )
+        self._guide_right_indices = torch.as_tensor(
+            GUIDE_WHEEL_RIGHT_INDICES, dtype=torch.long, device=self.device
+        )
+        if self._guide_left_indices.numel() == 0 or self._guide_right_indices.numel() == 0:
+            raise WarpBatchError("guide-wheel configuration must include support on both sides")
         self._guide_wheel_radius = torch.as_tensor(
             np.maximum(
                 np.asarray(model.geom_size[self._guide_wheel_geom_ids, 0], dtype=np.float32),
@@ -557,6 +569,12 @@ class WarpFlatWalkingTask:
             (self.num_worlds, len(GUIDE_WHEEL_CONTACT_GEOM_NAMES)),
             dtype=torch.bool,
             device=self.device,
+        )
+        self._guide_left_contact_values = torch.empty(
+            (self.num_worlds, self._guide_left_indices.numel()), dtype=torch.bool, device=self.device
+        )
+        self._guide_right_contact_values = torch.empty(
+            (self.num_worlds, self._guide_right_indices.numel()), dtype=torch.bool, device=self.device
         )
         self._guide_side_contacts = torch.empty((self.num_worlds, 2), dtype=torch.bool, device=self.device)
         self._support_contacts = torch.empty((self.num_worlds, 2), dtype=torch.bool, device=self.device)
@@ -1001,6 +1019,10 @@ class WarpFlatWalkingTask:
             self.torch,
             active_contacts,
             guide_contacts,
+            self._guide_left_indices,
+            self._guide_right_indices,
+            self._guide_left_contact_values,
+            self._guide_right_contact_values,
             self._guide_side_contacts,
             self._support_contacts,
         )
@@ -1437,6 +1459,8 @@ class WarpFlatWalkingTask:
 __all__ = [
     "ACTION_SIZE",
     "GUIDE_WHEEL_CONTACT_GEOM_NAMES",
+    "GUIDE_WHEEL_LEFT_INDICES",
+    "GUIDE_WHEEL_RIGHT_INDICES",
     "OBSERVATION_SIZE",
     "OBS_LAYOUT",
     "WarpFlatWalkingConfig",

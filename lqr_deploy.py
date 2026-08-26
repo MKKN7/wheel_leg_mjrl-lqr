@@ -17,6 +17,8 @@ import numpy as np
 import scipy.linalg
 from scipy.optimize import least_squares
 
+from guide_wheel_mjcf import guide_wheel_runtime_contract
+
 
 ROOT = Path(__file__).resolve().parent
 XML_PATH = ROOT / "wheeled_infantry.xml"
@@ -244,21 +246,12 @@ TERRAIN_SUPPORT_REFERENCE_FILTER_TIME_CONSTANT_S = 0.08
 TERRAIN_SUPPORT_REFERENCE_MAX_VERTICAL_RATE_MPS = 0.75
 WORLD_UP = np.array((0.0, 0.0, 1.0))
 
-# The four 40 mm guide rollers are passive chassis hardware.  These names are
-# intentionally exact rather than prefix-matched: a partial or miswired guide
-# package must not silently alter collision safety or the LQR state.
-GUIDE_WHEEL_CONTACT_NAMES = (
-    "guide_wheel_front_left_contact",
-    "guide_wheel_front_right_contact",
-    "guide_wheel_rear_left_contact",
-    "guide_wheel_rear_right_contact",
-)
-GUIDE_WHEEL_JOINT_NAMES = (
-    "guide_wheel_front_left_spin",
-    "guide_wheel_front_right_spin",
-    "guide_wheel_rear_left_spin",
-    "guide_wheel_rear_right_spin",
-)
+# These exact lower-guide names are loaded from the MJCF configuration rather
+# than prefix-matched. A partial or miswired package must not silently alter
+# collision safety or the LQR state.
+_GUIDE_WHEEL_CONTRACT = guide_wheel_runtime_contract()
+GUIDE_WHEEL_CONTACT_NAMES = _GUIDE_WHEEL_CONTRACT.contact_names
+GUIDE_WHEEL_JOINT_NAMES = _GUIDE_WHEEL_CONTRACT.joint_names
 
 
 def jump_controller_config() -> dict[str, float | int]:
@@ -1094,6 +1087,11 @@ class PhysicalLqr:
             model,
             self.guide_wheel_dof_addresses,
         )
+        # Public immutable index contracts are carried into the CUDA fixed-gain
+        # controller. Physics retains every passive guide state; the LQR gain
+        # receives only the baseline controlled tangent state.
+        self.controlled_dof_indices = self.lqr_dof_addresses.copy()
+        self.controlled_state_indices = self._lqr_state_indices.copy()
         self._lqr_position_state_indices = np.full(model.nv, -1, dtype=np.int64)
         self._lqr_position_state_indices[self.lqr_dof_addresses] = np.arange(
             self.lqr_dof_addresses.size,

@@ -201,6 +201,7 @@ class WarpFlatControllerCalibration:
     hip_actuator_ids: np.ndarray
     wheel_qpos_addresses: np.ndarray
     wheel_dof_addresses: np.ndarray
+    controlled_dof_indices: np.ndarray
     leg_jacobian: float
     leg_length_m: float
     gas_spring_dofs: np.ndarray
@@ -220,13 +221,14 @@ class WarpFlatControllerCalibration:
             "hip_actuator_ids",
             "wheel_qpos_addresses",
             "wheel_dof_addresses",
+            "controlled_dof_indices",
             "gas_spring_dofs",
         )
         for name in vectors:
             value = np.asarray(getattr(self, name))
             if value.ndim != 1:
                 raise ValueError(f"{name} must be a vector")
-            if name not in {"hip_qpos_addresses", "hip_dof_addresses", "hip_actuator_ids", "wheel_qpos_addresses", "wheel_dof_addresses", "gas_spring_dofs"}:
+            if name not in {"hip_qpos_addresses", "hip_dof_addresses", "hip_actuator_ids", "wheel_qpos_addresses", "wheel_dof_addresses", "controlled_dof_indices", "gas_spring_dofs"}:
                 if not np.isfinite(value).all():
                     raise ValueError(f"{name} contains non-finite values")
         gain = np.asarray(self.gain)
@@ -238,7 +240,7 @@ class WarpFlatControllerCalibration:
             raise ValueError("state_digest must be a SHA-256 hex digest")
         for name in vectors:
             value = np.asarray(getattr(self, name))
-            dtype = np.int64 if name in {"hip_qpos_addresses", "hip_dof_addresses", "hip_actuator_ids", "wheel_qpos_addresses", "wheel_dof_addresses", "gas_spring_dofs"} else np.float32
+            dtype = np.int64 if name in {"hip_qpos_addresses", "hip_dof_addresses", "hip_actuator_ids", "wheel_qpos_addresses", "wheel_dof_addresses", "controlled_dof_indices", "gas_spring_dofs"} else np.float32
             object.__setattr__(self, name, np.ascontiguousarray(value, dtype=dtype))
         object.__setattr__(self, "gain", np.ascontiguousarray(np.asarray(self.gain, dtype=np.float32)))
         object.__setattr__(self, "leg_jacobian", float(self.leg_jacobian))
@@ -339,6 +341,7 @@ def calibrate_flat_controller(
         wheel_joints = np.asarray(cpu_controller.refs.wheel_joints, dtype=np.int64)
         wheel_qpos = np.asarray(model.jnt_qposadr[wheel_joints], dtype=np.int64)
         wheel_dof = np.asarray(model.jnt_dofadr[wheel_joints], dtype=np.int64)
+        controlled_dofs = np.asarray(cpu_controller.controlled_dof_indices, dtype=np.int64)
         gas_dofs = np.asarray(cpu_controller.gas_spring_dofs, dtype=np.int64)
         leg_profile = cpu_controller.leg_profile
         leg_jacobian = (
@@ -348,14 +351,24 @@ def calibrate_flat_controller(
         )
         leg_length = float(cpu_controller._reference_leg_length)
         heading = float(cpu_controller._linearization_heading_yaw)
-        arrays = (qpos, qvel, nominal, gain, reference_qpos, reference_qvel, reference_hip)
+        arrays = (qpos, qvel, nominal, gain, reference_qpos, reference_qvel, reference_hip, controlled_dofs)
         if any(not np.isfinite(array).all() for array in arrays):
             raise RuntimeError("CPU flat calibration produced non-finite values")
         if qpos.shape != (model.nq,) or qvel.shape != (model.nv,) or nominal.shape != (model.nu,):
             raise RuntimeError("CPU flat calibration dimensions do not match the MJCF model")
         if gain.shape != (ACTION_SIZE, STATE_SIZE):
             raise RuntimeError(f"CPU LQR gain has unexpected shape {gain.shape}")
-        digest = hashlib.sha256(qpos.tobytes() + qvel.tobytes() + nominal.tobytes() + gain.tobytes()).hexdigest()
+        if (
+            controlled_dofs.ndim != 1
+            or controlled_dofs.size * 2 != STATE_SIZE
+            or np.any(controlled_dofs < 0)
+            or np.any(controlled_dofs >= model.nv)
+            or np.unique(controlled_dofs).size != controlled_dofs.size
+        ):
+            raise RuntimeError("CPU LQR controlled DOF contract does not preserve the 40-D baseline state")
+        digest = hashlib.sha256(
+            qpos.tobytes() + qvel.tobytes() + nominal.tobytes() + gain.tobytes() + controlled_dofs.tobytes()
+        ).hexdigest()
         return WarpFlatControllerCalibration(
             qpos=qpos,
             qvel=qvel,
@@ -369,6 +382,7 @@ def calibrate_flat_controller(
             hip_actuator_ids=hip_actuator,
             wheel_qpos_addresses=wheel_qpos,
             wheel_dof_addresses=wheel_dof,
+            controlled_dof_indices=controlled_dofs,
             leg_jacobian=leg_jacobian,
             leg_length_m=leg_length,
             gas_spring_dofs=gas_dofs,
@@ -435,6 +449,15 @@ class FixedGainFlatController:
             raise ValueError("calibration state dimensions do not match the Warp model")
         if calibration.nominal_control.shape != (ACTION_SIZE,):
             raise ValueError("calibration actuator dimension must be six")
+        controlled_dofs = np.asarray(calibration.controlled_dof_indices, dtype=np.int64)
+        if (
+            controlled_dofs.ndim != 1
+            or controlled_dofs.size * 2 != STATE_SIZE
+            or np.any(controlled_dofs < 0)
+            or np.any(controlled_dofs >= int(model.nv))
+            or np.unique(controlled_dofs).size != controlled_dofs.size
+        ):
+            raise ValueError("calibration controlled_dof_indices do not preserve the 40-D LQR state")
         self._qpos_reference = torch.as_tensor(calibration.reference_qpos, dtype=torch.float32, device=self.device).unsqueeze(0).repeat(self.num_worlds, 1)
         self._qvel_reference = torch.as_tensor(calibration.reference_qvel, dtype=torch.float32, device=self.device).unsqueeze(0).repeat(self.num_worlds, 1)
         self._nominal_control = torch.as_tensor(calibration.nominal_control, dtype=torch.float32, device=self.device).unsqueeze(0).repeat(self.num_worlds, 1)
@@ -458,6 +481,7 @@ class FixedGainFlatController:
         self._wheel_actuator = torch.as_tensor(wheel_ids, dtype=torch.long, device=self.device)
         self._wheel_qpos = torch.as_tensor(calibration.wheel_qpos_addresses, dtype=torch.long, device=self.device)
         self._wheel_dof = torch.as_tensor(calibration.wheel_dof_addresses, dtype=torch.long, device=self.device)
+        self._controlled_dofs = torch.as_tensor(controlled_dofs, dtype=torch.long, device=self.device)
         self._gas_dofs = torch.as_tensor(calibration.gas_spring_dofs, dtype=torch.long, device=self.device)
         self._leg_jacobian = torch.as_tensor(float(calibration.leg_jacobian), dtype=torch.float32, device=self.device)
         self._leg_virtual_work_enabled = bool(self._hip_actuator.numel() == 4 and abs(calibration.leg_jacobian) > 0.0)
@@ -765,8 +789,19 @@ class FixedGainFlatController:
                 error[:, 0] = cosine * x + sine * y
                 error[:, 1] = -sine * x + cosine * y
 
-        self._state_error[:, : int(self.batch.host_model.nv)] = self._position_error
-        self._state_error[:, int(self.batch.host_model.nv) :] = self._velocity_error
+        controlled_count = self._controlled_dofs.numel()
+        torch.index_select(
+            self._position_error,
+            1,
+            self._controlled_dofs,
+            out=self._state_error[:, :controlled_count],
+        )
+        torch.index_select(
+            self._velocity_error,
+            1,
+            self._controlled_dofs,
+            out=self._state_error[:, controlled_count:],
+        )
         return self._state_error
 
     def _write_gas_spring(self, task: Any, safe_controls: Any | None = None) -> Any:

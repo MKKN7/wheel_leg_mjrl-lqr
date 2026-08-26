@@ -738,6 +738,7 @@ class StaticBoxTerrain16D:
 
     @property
     def wheel_support_valid(self) -> Any:
+        """Per-side active-or-lower-guide terrain coverage on CUDA."""
         return self._support_valid
 
     @property
@@ -772,6 +773,39 @@ class StaticBoxTerrain16D:
         self._lateral[:, 0] = -self._forward[:, 1]
         self._lateral[:, 1] = self._forward[:, 0]
 
+    def _update_guide_support_samples(self) -> None:
+        """Refresh private lower-guide support data without changing observations."""
+
+        torch = self.torch
+        task = self.task
+        torch.index_select(
+            task._geom_xpos,
+            1,
+            task._guide_wheel_geom_gpu,
+            out=task._guide_wheel_positions,
+        )
+        self._guide_wheel_xy.copy_(task._guide_wheel_positions[..., :2])
+        self._sample_surface(
+            self._guide_wheel_xy,
+            self._guide_wheel_height,
+            self._guide_wheel_valid,
+        )
+        torch.index_select(
+            self._guide_wheel_valid,
+            1,
+            task._guide_left_indices,
+            out=task._guide_left_contact_values,
+        )
+        torch.index_select(
+            self._guide_wheel_valid,
+            1,
+            task._guide_right_indices,
+            out=task._guide_right_contact_values,
+        )
+        torch.any(task._guide_left_contact_values, dim=1, out=self._guide_side_valid[:, 0])
+        torch.any(task._guide_right_contact_values, dim=1, out=self._guide_side_valid[:, 1])
+        torch.logical_or(self._wheel_valid, self._guide_side_valid, out=self._support_valid)
+
     def update_features(self) -> Any:
         """Write the 16-D terrain preview for the current CUDA task state."""
 
@@ -800,6 +834,7 @@ class StaticBoxTerrain16D:
         torch.index_select(self.task._geom_xpos, 1, self.task._wheel_geom_gpu, out=self.task._wheel_positions)
         self._wheel_xy.copy_(self.task._wheel_positions[..., :2])
         self._sample_surface(self._wheel_xy, self._wheel_height, self._wheel_valid)
+        self._update_guide_support_samples()
         features = self._feature_buffer
         features[:, :12] = torch.clamp(
             (self._sample_height - self._root_height) / self.settings.height_normalization_m,
@@ -823,7 +858,7 @@ class StaticBoxTerrain16D:
         )
         torch.logical_and(self._root_valid[:, 0], self._sample_valid.all(dim=1), out=self._last_support_valid)
         self._last_support_valid.logical_and_(self._near_valid.all(dim=1))
-        self._last_support_valid.logical_and_(self._wheel_valid.all(dim=1))
+        self._last_support_valid.logical_and_(self._support_valid.all(dim=1))
         features[:, 15] = self._last_support_valid.to(dtype=torch.float32)
         self.task.set_terrain_features(features)
         return features
@@ -844,6 +879,25 @@ class StaticBoxTerrain16D:
         )
         self.task._wheel_contacts.logical_and_(self._wheel_valid)
         return self.task._wheel_clearances, self.task._wheel_contacts
+
+    def guide_wheel_clearances_and_contacts(self) -> tuple[Any, Any]:
+        """Return current private lower-guide contacts against static supports."""
+
+        torch = self.torch
+        self._update_guide_support_samples()
+        torch.sub(
+            self.task._guide_wheel_positions[..., 2],
+            self.task._guide_wheel_radius,
+            out=self.task._guide_wheel_clearances,
+        )
+        self.task._guide_wheel_clearances.sub_(self._guide_wheel_height).clamp_(min=0.0)
+        torch.le(
+            self.task._guide_wheel_clearances,
+            self.task.config.contact_clearance_m,
+            out=self.task._guide_wheel_contacts,
+        )
+        self.task._guide_wheel_contacts.logical_and_(self._guide_wheel_valid)
+        return self.task._guide_wheel_clearances, self.task._guide_wheel_contacts
 
 
 class OfficialGrade15UpTask(WarpFlatWalkingTask):
@@ -941,6 +995,11 @@ class OfficialGrade15UpTask(WarpFlatWalkingTask):
         if self._official_terrain is None:
             return super()._wheel_clearances_and_contacts()
         return self._official_terrain.wheel_clearances_and_contacts()
+
+    def _guide_wheel_clearances_and_contacts(self) -> tuple[Any, Any]:
+        if self._official_terrain is None:
+            return super()._guide_wheel_clearances_and_contacts()
+        return self._official_terrain.guide_wheel_clearances_and_contacts()
 
     def observe(self) -> Any:
         if self._official_terrain is not None:

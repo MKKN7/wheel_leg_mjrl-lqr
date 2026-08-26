@@ -37,6 +37,7 @@ def _calibration() -> WarpFlatControllerCalibration:
         hip_actuator_ids=np.array((0, 1, 3, 4), dtype=np.int64),
         wheel_qpos_addresses=np.array((11, 12), dtype=np.int64),
         wheel_dof_addresses=np.array((10, 11), dtype=np.int64),
+        controlled_dof_indices=np.arange(20, dtype=np.int64),
         leg_jacobian=0.1,
         leg_length_m=0.25,
         gas_spring_dofs=np.array((6, 13), dtype=np.int64),

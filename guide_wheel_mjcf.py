@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import yaml
 
 
@@ -30,6 +31,21 @@ class GuideWheel:
 
 
 @dataclass(frozen=True)
+class RootInertialBaseline:
+    mass_kg: float
+    com_m: tuple[float, float, float]
+    fullinertia_kg_m2: tuple[float, float, float, float, float, float]
+
+
+@dataclass(frozen=True)
+class GuideWheelRuntimeContract:
+    contact_names: tuple[str, ...]
+    joint_names: tuple[str, ...]
+    left_indices: tuple[int, ...]
+    right_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class GuideWheelModel:
     root_body: str
     radius_m: float
@@ -46,6 +62,7 @@ class GuideWheelModel:
     rgba: tuple[float, float, float, float]
     expected_actuator_count: int
     expected_sensor_data_count: int
+    baseline_root_inertial: RootInertialBaseline
     wheels: tuple[GuideWheel, ...]
 
 
@@ -89,6 +106,19 @@ def load_guide_wheel_model(path: str | Path = DEFAULT_CONFIG) -> GuideWheelModel
         raise ValueError("guide wheel config must select rolling_passive_guide_wheels")
     geometry = _mapping(root.get("geometry"), "geometry")
     contracts = _mapping(root.get("contracts"), "contracts")
+    accounting = _mapping(root.get("mass_accounting"), "mass_accounting")
+    if accounting.get("mode") != "reallocate_from_root_inertial":
+        raise ValueError("mass_accounting.mode must reallocate_from_root_inertial")
+    baseline = _mapping(accounting.get("baseline_root_inertial"), "mass_accounting.baseline_root_inertial")
+    baseline_root_inertial = RootInertialBaseline(
+        mass_kg=_number(baseline.get("mass_kg"), "mass_accounting.baseline_root_inertial.mass_kg", minimum=1.0e-6),
+        com_m=_vector(baseline.get("com_m"), "mass_accounting.baseline_root_inertial.com_m", 3),
+        fullinertia_kg_m2=_vector(
+            baseline.get("fullinertia_kg_m2"),
+            "mass_accounting.baseline_root_inertial.fullinertia_kg_m2",
+            6,
+        ),
+    )
     wheels_raw = root.get("wheels")
     if not isinstance(wheels_raw, list) or len(wheels_raw) != int(contracts.get("expected_wheel_count", 0)):
         raise ValueError("wheels must match contracts.expected_wheel_count")
@@ -104,6 +134,9 @@ def load_guide_wheel_model(path: str | Path = DEFAULT_CONFIG) -> GuideWheelModel
         raise ValueError("guide wheel names must be unique")
     if {wheel.side for wheel in wheels} != {"left", "right"}:
         raise ValueError("guide wheel layout must contain both left and right support")
+    expected_per_side = int(_number(contracts.get("expected_wheels_per_side"), "contracts.expected_wheels_per_side", minimum=1.0))
+    if sum(wheel.side == "left" for wheel in wheels) != expected_per_side or sum(wheel.side == "right" for wheel in wheels) != expected_per_side:
+        raise ValueError("guide wheel layout does not match contracts.expected_wheels_per_side")
     return GuideWheelModel(
         root_body=_identifier(root.get("root_body"), "root_body"),
         radius_m=_number(geometry.get("radius_m"), "geometry.radius_m", minimum=1.0e-6),
@@ -120,7 +153,20 @@ def load_guide_wheel_model(path: str | Path = DEFAULT_CONFIG) -> GuideWheelModel
         rgba=_vector(geometry.get("rgba"), "geometry.rgba", 4, minimum=0.0),
         expected_actuator_count=int(_number(contracts.get("expected_actuator_count"), "contracts.expected_actuator_count", minimum=1.0)),
         expected_sensor_data_count=int(_number(contracts.get("expected_sensor_data_count"), "contracts.expected_sensor_data_count", minimum=0.0)),
+        baseline_root_inertial=baseline_root_inertial,
         wheels=tuple(wheels),
+    )
+
+
+def guide_wheel_runtime_contract(path: str | Path = DEFAULT_CONFIG) -> GuideWheelRuntimeContract:
+    """Return exact configured names and side membership for runtime validation."""
+
+    model = load_guide_wheel_model(path)
+    return GuideWheelRuntimeContract(
+        contact_names=tuple(f"{wheel.name}_contact" for wheel in model.wheels),
+        joint_names=tuple(f"{wheel.name}_spin" for wheel in model.wheels),
+        left_indices=tuple(index for index, wheel in enumerate(model.wheels) if wheel.side == "left"),
+        right_indices=tuple(index for index, wheel in enumerate(model.wheels) if wheel.side == "right"),
     )
 
 
@@ -128,10 +174,69 @@ def _fmt(values: tuple[float, ...]) -> str:
     return " ".join(f"{value:.7f}" for value in values)
 
 
+def guide_wheel_mass_kg(model: GuideWheelModel) -> float:
+    return math.pi * model.radius_m * model.radius_m * (2.0 * model.half_width_m) * model.density_kg_m3
+
+
+def reallocated_root_inertial(model: GuideWheelModel) -> tuple[float, np.ndarray, np.ndarray]:
+    """Move configured roller inertia from the baseline root into wheel bodies."""
+
+    if not np.allclose(model.axle_axis, (1.0, 0.0, 0.0), rtol=0.0, atol=1.0e-9):
+        raise ValueError("root-inertia reallocation currently requires guide axle_axis=[1, 0, 0]")
+    baseline = model.baseline_root_inertial
+    mass = guide_wheel_mass_kg(model)
+    guide_mass = mass * len(model.wheels)
+    remaining_mass = baseline.mass_kg - guide_mass
+    if not math.isfinite(remaining_mass) or remaining_mass <= 0.0:
+        raise ValueError("guide-wheel mass leaves a non-positive root mass")
+
+    com = np.asarray(baseline.com_m, dtype=np.float64)
+    ixx, iyy, izz, ixy, ixz, iyz = baseline.fullinertia_kg_m2
+    baseline_inertia = np.asarray(
+        ((ixx, ixy, ixz), (ixy, iyy, iyz), (ixz, iyz, izz)),
+        dtype=np.float64,
+    )
+    identity = np.eye(3, dtype=np.float64)
+    baseline_about_origin = baseline_inertia + baseline.mass_kg * (
+        np.dot(com, com) * identity - np.outer(com, com)
+    )
+    cylinder_axis_inertia = 0.5 * mass * model.radius_m * model.radius_m
+    cylinder_radial_inertia = mass * (3.0 * model.radius_m * model.radius_m + (2.0 * model.half_width_m) ** 2) / 12.0
+    cylinder_inertia = np.diag((cylinder_axis_inertia, cylinder_radial_inertia, cylinder_radial_inertia))
+    guide_first_moment = np.zeros(3, dtype=np.float64)
+    guide_about_origin = np.zeros((3, 3), dtype=np.float64)
+    for wheel in model.wheels:
+        position = np.asarray(wheel.position_m, dtype=np.float64)
+        guide_first_moment += mass * position
+        guide_about_origin += cylinder_inertia + mass * (
+            np.dot(position, position) * identity - np.outer(position, position)
+        )
+    remaining_com = (baseline.mass_kg * com - guide_first_moment) / remaining_mass
+    remaining_about_origin = baseline_about_origin - guide_about_origin
+    remaining_inertia = remaining_about_origin - remaining_mass * (
+        np.dot(remaining_com, remaining_com) * identity - np.outer(remaining_com, remaining_com)
+    )
+    if not np.isfinite(remaining_inertia).all() or np.linalg.eigvalsh(remaining_inertia).min() <= 1.0e-8:
+        raise ValueError("guide-wheel root inertia reallocation produced an invalid inertia tensor")
+    return remaining_mass, remaining_com, remaining_inertia
+
+
+def render_root_inertial(model: GuideWheelModel) -> str:
+    mass, com, inertia = reallocated_root_inertial(model)
+    full = (
+        inertia[0, 0], inertia[1, 1], inertia[2, 2],
+        inertia[0, 1], inertia[0, 2], inertia[1, 2],
+    )
+    return (
+        f'      <inertial pos="{_fmt(tuple(com))}" mass="{mass:.7f}" '
+        f'fullinertia="{_fmt(tuple(full))}" />'
+    )
+
+
 def render_guide_wheel_block(model: GuideWheelModel) -> str:
     lines = [
         BEGIN_MARKER,
-        "      <!-- Passive 40x10 mm guide rollers; no actuator or public sensor. -->",
+        "      <!-- Passive lower 30x9 mm guide rollers; no actuator or public sensor. -->",
     ]
     for wheel in model.wheels:
         lines.extend(
@@ -162,6 +267,19 @@ def _replace_block(source: str, block: str) -> str:
     return source[:begin] + block + source[end:]
 
 
+ROOT_INERTIAL = re.compile(
+    r'(?m)^\s*<inertial\s+pos="[^"]+"\s+mass="[^"]+"\s+fullinertia="[^"]+"\s*/>\s*$'
+)
+
+
+def _replace_root_inertial(source: str, model: GuideWheelModel) -> str:
+    matches = tuple(ROOT_INERTIAL.finditer(source))
+    if len(matches) != 1:
+        raise RuntimeError("expected exactly one robot root inertial element")
+    match = matches[0]
+    return source[:match.start()] + render_root_inertial(model) + source[match.end():]
+
+
 def apply_guide_wheel_block(
     xml_path: str | Path = DEFAULT_XML,
     config_path: str | Path = DEFAULT_CONFIG,
@@ -171,6 +289,7 @@ def apply_guide_wheel_block(
     source = target.read_text(encoding="utf-8")
     ET.fromstring(source)
     result = _replace_block(source, render_guide_wheel_block(model))
+    result = _replace_root_inertial(result, model)
     ET.fromstring(result)
     if result == source:
         return False
@@ -188,10 +307,10 @@ def main() -> None:
     if args.check:
         source = args.xml.read_text(encoding="utf-8")
         expected = render_guide_wheel_block(model)
-        if BEGIN_MARKER not in source or expected not in source:
+        if BEGIN_MARKER not in source or expected not in source or render_root_inertial(model) not in source:
             raise RuntimeError("guide-wheel XML block is absent or out of date")
         ET.fromstring(source)
-        print(f"validated guide-wheel MJCF block: wheels={len(model.wheels)}")
+        print(f"validated guide-wheel MJCF block: wheels={len(model.wheels)}, mass_each={guide_wheel_mass_kg(model):.8f}")
         return
     changed = apply_guide_wheel_block(args.xml, args.config)
     print(f"synchronized guide-wheel MJCF block: changed={changed}")

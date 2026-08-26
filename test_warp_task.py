@@ -78,6 +78,42 @@ class WarpFlatWalkingContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             WarpFlatWalkingConfig(control_delay_steps=1.5)
 
+    def test_lower_guide_contact_support_is_grouped_by_configured_side(self) -> None:
+        import torch
+
+        from warp_task import (
+            GUIDE_WHEEL_LEFT_INDICES,
+            GUIDE_WHEEL_RIGHT_INDICES,
+            combine_side_support_contacts,
+        )
+
+        active = torch.zeros((3, 2), dtype=torch.bool)
+        guides = torch.zeros((3, len(GUIDE_WHEEL_LEFT_INDICES) + len(GUIDE_WHEEL_RIGHT_INDICES)), dtype=torch.bool)
+        guides[0, GUIDE_WHEEL_LEFT_INDICES[0]] = True
+        guides[1, GUIDE_WHEEL_RIGHT_INDICES[-1]] = True
+        active[2, 0] = True
+        left_indices = torch.as_tensor(GUIDE_WHEEL_LEFT_INDICES, dtype=torch.long)
+        right_indices = torch.as_tensor(GUIDE_WHEEL_RIGHT_INDICES, dtype=torch.long)
+        left_values = torch.empty((3, len(GUIDE_WHEEL_LEFT_INDICES)), dtype=torch.bool)
+        right_values = torch.empty((3, len(GUIDE_WHEEL_RIGHT_INDICES)), dtype=torch.bool)
+        guide_side = torch.empty((3, 2), dtype=torch.bool)
+        support = torch.empty((3, 2), dtype=torch.bool)
+        result = combine_side_support_contacts(
+            torch,
+            active,
+            guides,
+            left_indices,
+            right_indices,
+            left_values,
+            right_values,
+            guide_side,
+            support,
+        )
+        torch.testing.assert_close(
+            result,
+            torch.tensor(((True, False), (False, True), (True, False)), dtype=torch.bool),
+        )
+
     def test_loads_yaml_task_parameters(self) -> None:
         config = load_flat_walking_config(Path(__file__).resolve().parent / "configs" / "warp_flat_walking.yaml")
         self.assertAlmostEqual(config.command_speed_limit_mps, 3.0)
