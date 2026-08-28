@@ -1,0 +1,348 @@
+schema_version: 3
+backend: mujoco_warp_curriculum_ppo_v2
+observation_size: 67
+action_size: 7
+reward_schema: warp_flat_terrain_compensated_reward_v2
+action_semantics: seven_dimensional_fixed_gain_residual
+batch_config: warp_rmuc_curriculum_batch.yaml
+flat_ppo_config: warp_flat_ppo.yaml
+
+# These are the only task-level perturbations admitted in the CUDA rollout.
+# Physics-parameter ranges live in warp_rmuc_curriculum_batch.yaml; terrain
+# geometry and collision topology remain immutable across worlds.
+gpu_task:
+  sensor_noise_std: 0.015
+  control_delay_steps: 1
+  stability_gate_seconds: 8.0
+  command_speed_gain_nm_per_mps: 3.0
+  command_yaw_gain_nm_per_rad_s: 0.75
+  command_wheel_feedforward_limit_nm: 0.60
+  allow_cpu_residual_warm_start: true
+
+curriculum:
+  name: rmuc_gpu_curriculum
+  stages:
+    # The built-in, parity-proven fixed-gain CUDA task.
+    - id: rmuc_flat
+      task_mode: flat_walking_only
+      xml_path: ../wheeled_infantry.xml
+      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_stage_id: flat_balance
+      controller_backend: fixed_gain_flat_controller_v2
+      terrain_enabled: false
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: false
+      command_speed_mps: 0.0
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      prerequisite_stage_ids: []
+    # Formal GPU DR stage. It reuses the fixed flat support surface and
+    # 67-D/7-D residual interface while randomizing only vehicle parameters,
+    # sensing, and a one-policy-step action delay.
+    - id: rmuc_flat_dr
+      task_mode: flat_vehicle_domain_randomization
+      xml_path: ../wheeled_infantry.xml
+      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_stage_id: flat_balance
+      controller_backend: fixed_gain_flat_controller_v2
+      terrain_enabled: false
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.0
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      prerequisite_stage_ids: [rmuc_flat]
+    # Hfield grades use an immutable GPU terrain query, per-route reset
+    # assignments, vehicle-only DR, and a mandatory real CUDA safety gate.
+    - id: grades
+      task_mode: rmuc_grades
+      xml_path: ../rm_train_ground.xml
+      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_stage_id: grades
+      adapter_config_path: rmuc_course_warp.yaml
+      controller_backend: rmuc_route_controller_v1
+      terrain_enabled: true
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.140
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_rmuc_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [rmuc_flat_dr]
+    - id: low_speed_turning
+      task_mode: low_speed_turning
+      xml_path: ../wheeled_infantry.xml
+      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_stage_id: turning
+      adapter_config_path: rmuc_course_warp.yaml
+      controller_backend: rmuc_route_controller_v1
+      terrain_enabled: false
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.400
+      command_yaw_rate_rad_s: 0.080
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_rmuc_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [grades]
+    # RMUC's 204 mm riser is an explicit direct-jump exercise.  It uses the
+    # hfield collision terrain and the same six residual actuator channels;
+    # the seventh action remains masked throughout launch and landing.
+    - id: rmuc_stair_jump
+      task_mode: rmuc_stair_jump
+      xml_path: ../rm_train_ground.xml
+      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_stage_id: stair_jump
+      adapter_config_path: rmuc_course_warp.yaml
+      controller_backend: rmuc_route_controller_v1
+      terrain_enabled: true
+      jump_enabled: true
+      steps_enabled: true
+      domain_randomization_enabled: true
+      command_speed_mps: 0.180
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_rmuc_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [low_speed_turning]
+    # Official-field exercises run as one immutable route family per CUDA
+    # stage. Each must pass its own zero-residual GPU safety gate before PPO
+    # storage is allocated. The 7th policy action remains masked; every
+    # up-step uses the YAML-owned deterministic direct-jump supervisor.
+    - id: official_grade15_up
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: grade15
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.195
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [rmuc_stair_jump]
+    - id: official_grade15_down
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: grade15
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.195
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_grade15_up]
+    - id: official_grade20_up
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: grade20
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.195
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_grade15_down]
+    - id: official_grade20_down
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: grade20
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.195
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_grade20_up]
+    - id: official_step150_up
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: step150
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: true
+      steps_enabled: true
+      domain_randomization_enabled: true
+      command_speed_mps: 0.154
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_grade20_down]
+    - id: official_step150_down
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: step150
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: false
+      steps_enabled: true
+      domain_randomization_enabled: true
+      command_speed_mps: 0.14
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_step150_up]
+    - id: official_stair2x100_up
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: stair2x100
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: true
+      steps_enabled: true
+      domain_randomization_enabled: true
+      command_speed_mps: 0.16
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_step150_down]
+    - id: official_stair2x100_down
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: stair2x100
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: false
+      steps_enabled: true
+      domain_randomization_enabled: true
+      command_speed_mps: 0.16
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_stair2x100_up]
+    - id: official_step200_lab
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: step200_lab
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: true
+      steps_enabled: true
+      domain_randomization_enabled: true
+      command_speed_mps: 0.162
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_stair2x100_down]
+    - id: official_fly17_jump
+      task_mode: official_course
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: fly17
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: true
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.36
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_step200_lab]
+    - id: official_doghole450
+      task_mode: official_course_doghole
+      xml_path: ../official_standard_warp_ground.xml
+      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_stage_id: doghole450
+      adapter_config_path: official_course_warp.yaml
+      scene_variant: official_warp_compat
+      controller_backend: official_course_controller_v1
+      terrain_enabled: true
+      jump_enabled: false
+      steps_enabled: false
+      domain_randomization_enabled: true
+      command_speed_mps: 0.128
+      command_yaw_rate_rad_s: 0.0
+      residual_action_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+      requires_gpu_parity: true
+      reward_schema: warp_official_terrain_compensated_reward_v2
+      prerequisite_stage_ids: [official_fly17_jump]
+
+ppo:
+  total_timesteps: 65536
+  rollout_steps: 32
+  epochs: 4
+  minibatch_size: 1024
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.20
+  value_coefficient: 0.50
+  entropy_coefficient: 0.001
+  max_gradient_norm: 0.50
+  hidden_size: 256
+  initial_action_std: 0.12
+  seed: 7
+
+output:
+  checkpoint_path: ../artifacts/warp_curriculum_ppo_v2.pt
+  metrics_path: ../artifacts/warp_curriculum_ppo_v2.metrics.csv
+  checkpoint_interval_updates: 1
+
+smoke:
+  rollout_steps: 4
+  epochs: 1
+  minibatch_size: 512
+  checkpoint_path: ../artifacts/warp_curriculum_ppo_v2_smoke.pt
+  metrics_path: ../artifacts/warp_curriculum_ppo_v2_smoke.metrics.csv
+
+capabilities:
+  require_gpu_parity: true
+  allow_external_task_factory: true

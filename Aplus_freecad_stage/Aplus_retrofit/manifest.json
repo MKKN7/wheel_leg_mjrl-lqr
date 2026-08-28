@@ -1,0 +1,20 @@
+{
+  "config": "../configs/guide_wheel_a_plus.yaml",
+  "output": "Aplus_retrofit",
+  "generated_parts": [
+    "Aplus_outer_cheek_7075T6",
+    "Aplus_shoulder_axle_D5_L25_M4",
+    "Aplus_roller_bushing_ID5_OD6_L10",
+    "Aplus_roller_bushing_ID5_OD6_L9",
+    "Aplus_inner_plate_reducer_ID5_OD6_L8",
+    "Aplus_thrust_washer_ID5p2_OD9_T0p5",
+    "Aplus_outer_axial_spacer_ID5p2_OD9_T1p3",
+    "Aplus_standoff_OD8_ID4p3_L12p0",
+    "Aplus_standoff_fastener_M4x25",
+    "Aplus_axle_lockwasher_M4",
+    "Aplus_axle_locknut_M4",
+    "Aplus_drill_template_common"
+  ],
+  "reference_assembly": "Aplus_40mm_reference_stack.step",
+  "safety_note": "Do not assemble or drill from this package until the live SolidWorks interface probe confirms the roller and mount-plate coordinate frames."
+}

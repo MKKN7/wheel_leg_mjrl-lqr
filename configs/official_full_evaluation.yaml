@@ -1,0 +1,17 @@
+schema_version: 1
+curriculum_config: warp_curriculum_ppo.yaml
+checkpoint_stage_id: official_doghole450
+full_terrain_stage_id: official_full
+official_stage_ids:
+  - official_grade15_up
+  - official_grade15_down
+  - official_grade20_up
+  - official_grade20_down
+  - official_fly17_jump
+  - official_step150_up
+  - official_step150_down
+  - official_stair2x100_up
+  - official_stair2x100_down
+  - official_step200_lab
+  - official_doghole450
+report_path: ../artifacts/warp_official_full_evaluation.json

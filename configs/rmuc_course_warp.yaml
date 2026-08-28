@@ -1,0 +1,114 @@
+schema_version: 1
+flat_ppo_config: warp_flat_ppo.yaml
+calibration_scene: ../wheeled_infantry.xml
+terrain_curriculum: ../rmuc_terrain_curriculum.yaml
+
+terrain_features:
+  lookahead_distances_m: [0.10, 0.28, 0.50, 0.76]
+  lateral_offsets_m: [-0.18, 0.0, 0.18]
+  height_normalization_m: 0.25
+  slope_normalization: 0.50
+
+route_reward:
+  progress_reward_per_m: 0.20
+  progress_delta_clip_m: 0.10
+  completion_bonus: 5.0
+  jump_peak_increment_weight: 3.0
+  jump_landing_bonus: 4.0
+  jump_failure_penalty: 20.0
+
+controller:
+  command_speed_gain_nm_per_mps: 3.0
+  command_yaw_gain_nm_per_rad_s: 1.00
+  command_wheel_feedforward_limit_nm: 1.20
+  command_wheel_accel_limit_nm: 0.35
+  command_wheel_brake_limit_nm: 1.20
+  terrain_support_reference_max_rate_mps: 0.30
+
+# Direct 204 mm stair ascent is a task-owned high-level jump supervisor.
+# All policy residual authority remains limited to the six motor channels;
+# channel seven stays masked by the shared CUDA task contract.
+jump_supervisor:
+  prepare_length_m: 0.315
+  crouch_length_m: 0.205
+  thrust_length_m: 0.385
+  flight_retract_length_m: 0.205
+  flight_preload_length_m: 0.320
+  landing_length_m: 0.285
+  prepare_seconds: 0.12
+  crouch_seconds: 0.10
+  thrust_seconds: 0.12
+  flight_retract_seconds: 0.10
+  maximum_airborne_seconds: 1.20
+  landing_confirm_seconds: 0.08
+  recovery_seconds: 0.30
+  prelanding_seconds: 0.05
+  landing_torque_fraction: 0.30
+  flight_torque_fraction: 0.10
+  jump_residual_fraction: 0.05
+  thrust_leg_force_limit_n: 180.0
+  minimum_peak_body_rise_m: 0.120
+  maximum_landing_vertical_speed_mps: 1.00
+  maximum_landing_angular_speed_rad_s: 2.50
+
+courses:
+  grades:
+    task_mode: rmuc_grades
+    batch_config: warp_rmuc_grades_batch.yaml
+    terrain_stage_id: grades
+    task_ids: [flat, uphill, downhill]
+    terrain_mode: hfield
+    hfield_geom: rmuc_terrain
+    projection_plane_geom: ground
+    command_speed_envelope_mps: 0.140
+    command_yaw_envelope_rad_s: 0.0
+    stability_gate:
+      duration_seconds: 8.0
+      require_no_terminated: true
+      require_no_overflow: true
+      require_finite_state: true
+      minimum_progress_m: 0.030
+      maximum_speed_mae_mps: 0.60
+      maximum_yaw_mae_rad_s: 0.25
+      maximum_unsafe_rate: 0.0
+    direct_jump: false
+  low_speed_turning:
+    task_mode: low_speed_turning
+    batch_config: warp_rmuc_turning_batch.yaml
+    terrain_stage_id: turning
+    task_ids: [flat, turn_left, turn_right]
+    terrain_mode: plane
+    hfield_geom: null
+    projection_plane_geom: null
+    command_speed_envelope_mps: 0.400
+    command_yaw_envelope_rad_s: 0.080
+    stability_gate:
+      duration_seconds: 8.0
+      require_no_terminated: true
+      require_no_overflow: true
+      require_finite_state: true
+      minimum_progress_m: 0.030
+      maximum_speed_mae_mps: 0.60
+      maximum_yaw_mae_rad_s: 0.25
+      maximum_unsafe_rate: 0.0
+    direct_jump: false
+  rmuc_stair_jump:
+    task_mode: rmuc_stair_jump
+    batch_config: warp_rmuc_grades_batch.yaml
+    terrain_stage_id: stair_jump
+    task_ids: [stair_up]
+    terrain_mode: hfield
+    hfield_geom: rmuc_terrain
+    projection_plane_geom: ground
+    command_speed_envelope_mps: 0.180
+    command_yaw_envelope_rad_s: 0.0
+    stability_gate:
+      duration_seconds: 8.0
+      require_no_terminated: true
+      require_no_overflow: true
+      require_finite_state: true
+      minimum_progress_m: 0.030
+      maximum_speed_mae_mps: 0.60
+      maximum_yaw_mae_rad_s: 0.25
+      maximum_unsafe_rate: 0.0
+    direct_jump: true
