@@ -670,6 +670,16 @@ def validate_official_grade15_contract(
     return curriculum, task, route
 
 
+@dataclass
+class _StaticBoxSampleWorkspace:
+    """Resident CUDA scratch for one static-box query width."""
+
+    shifted: Any
+    local_xy: Any
+    inside: Any
+    height: Any
+
+
 class StaticBoxTerrain16D:
     """GPU provider for the declared grade15 static-box support surfaces."""
 
@@ -690,6 +700,8 @@ class StaticBoxTerrain16D:
         self._rotation_xy_z = torch.as_tensor(layout.rotation[:, :2, 2], dtype=torch.float32, device=self.device)
         self._rotation_z_xy = torch.as_tensor(layout.rotation[:, 2, :2], dtype=torch.float32, device=self.device)
         self._rotation_zz = torch.as_tensor(layout.rotation[:, 2, 2], dtype=torch.float32, device=self.device)
+        self._top_xy_offset = self._rotation_xy_z * self._half_z.unsqueeze(1)
+        self._top_z_offset = self._rotation_zz * self._half_z
         offsets = tuple(
             (distance, lateral)
             for distance in settings.lookahead_distances_m
@@ -735,6 +747,20 @@ class StaticBoxTerrain16D:
         self._lateral = torch.empty((self.num_worlds, 2), dtype=torch.float32, device=self.device)
         self._last_support_valid = torch.empty(self.num_worlds, dtype=torch.bool, device=self.device)
         self._box_count = count
+        widths = {1, 2, 4, 12, len(GUIDE_WHEEL_CONTACT_GEOM_NAMES)}
+        self._workspaces = {width: self._workspace(width) for width in widths}
+
+    def _workspace(self, width: int) -> _StaticBoxSampleWorkspace:
+        """Allocate the fixed scratch for one query shape during setup only."""
+
+        torch = self.torch
+        shape = (self.num_worlds, width, self._box_count)
+        return _StaticBoxSampleWorkspace(
+            shifted=torch.empty(shape + (2,), dtype=torch.float32, device=self.device),
+            local_xy=torch.empty(shape + (2,), dtype=torch.float32, device=self.device),
+            inside=torch.empty(shape, dtype=torch.bool, device=self.device),
+            height=torch.empty(shape, dtype=torch.float32, device=self.device),
+        )
 
     @property
     def wheel_support_valid(self) -> Any:
@@ -748,21 +774,32 @@ class StaticBoxTerrain16D:
     def _sample_surface(self, xy: Any, height_out: Any, valid_out: Any) -> None:
         """Evaluate the top of every declared box and retain the highest one."""
 
+        if xy.shape[0] != self.num_worlds or xy.shape[-1] != 2 or xy.shape[1] not in self._workspaces:
+            raise ValueError("static-box query has an unsupported CUDA sample shape")
         torch = self.torch
-        shifted = (
-            xy.unsqueeze(2)
-            - self._center_xy.view(1, 1, self._box_count, 2)
-            - (self._rotation_xy_z * self._half_z.unsqueeze(1)).view(1, 1, self._box_count, 2)
-        )
-        local_xy = torch.einsum("bij,nkbj->nkbi", self._inverse_xy, shifted)
-        inside = (local_xy.abs() <= self._half_xy.view(1, 1, self._box_count, 2)).all(dim=-1)
-        height = (
-            self._center_z.view(1, 1, self._box_count)
-            + (local_xy * self._rotation_z_xy.view(1, 1, self._box_count, 2)).sum(dim=-1)
-            + (self._rotation_zz * self._half_z).view(1, 1, self._box_count)
-        )
-        valid_out.copy_(inside.any(dim=2))
-        height_out.copy_(torch.where(inside, height, torch.full_like(height, -torch.inf)).amax(dim=2))
+        work = self._workspaces[int(xy.shape[1])]
+        work.shifted.copy_(xy.unsqueeze(2))
+        work.shifted.sub_(self._center_xy.view(1, 1, self._box_count, 2))
+        work.shifted.sub_(self._top_xy_offset.view(1, 1, self._box_count, 2))
+
+        # Explicit 2-D matrix products avoid an einsum output allocation on
+        # every physics substep.  All large outputs live in ``work``.
+        work.local_xy[..., 0].copy_(work.shifted[..., 0]).mul_(self._inverse_xy[:, 0, 0])
+        work.local_xy[..., 0].addcmul_(work.shifted[..., 1], self._inverse_xy[:, 0, 1])
+        work.local_xy[..., 1].copy_(work.shifted[..., 0]).mul_(self._inverse_xy[:, 1, 0])
+        work.local_xy[..., 1].addcmul_(work.shifted[..., 1], self._inverse_xy[:, 1, 1])
+
+        work.inside.copy_(work.local_xy[..., 0].ge(-self._half_xy[:, 0]))
+        work.inside.logical_and_(work.local_xy[..., 0].le(self._half_xy[:, 0]))
+        work.inside.logical_and_(work.local_xy[..., 1].ge(-self._half_xy[:, 1]))
+        work.inside.logical_and_(work.local_xy[..., 1].le(self._half_xy[:, 1]))
+        torch.any(work.inside, dim=2, out=valid_out)
+
+        work.height.copy_(work.local_xy[..., 0]).mul_(self._rotation_z_xy[:, 0])
+        work.height.addcmul_(work.local_xy[..., 1], self._rotation_z_xy[:, 1])
+        work.height.add_(self._center_z).add_(self._top_z_offset)
+        work.height.masked_fill_(~work.inside, -torch.inf)
+        torch.amax(work.height, dim=2, out=height_out)
         height_out.masked_fill_(~valid_out, 0.0)
 
     def _update_heading(self) -> None:
@@ -834,6 +871,7 @@ class StaticBoxTerrain16D:
         torch.index_select(self.task._geom_xpos, 1, self.task._wheel_geom_gpu, out=self.task._wheel_positions)
         self._wheel_xy.copy_(self.task._wheel_positions[..., :2])
         self._sample_surface(self._wheel_xy, self._wheel_height, self._wheel_valid)
+        self.task.set_terrain_leg_support_heights(self._wheel_height, self._wheel_valid)
         self._update_guide_support_samples()
         features = self._feature_buffer
         features[:, :12] = torch.clamp(
@@ -870,6 +908,7 @@ class StaticBoxTerrain16D:
         torch.index_select(self.task._geom_xpos, 1, self.task._wheel_geom_gpu, out=self.task._wheel_positions)
         self._wheel_xy.copy_(self.task._wheel_positions[..., :2])
         self._sample_surface(self._wheel_xy, self._wheel_height, self._wheel_valid)
+        self.task.set_terrain_leg_support_heights(self._wheel_height, self._wheel_valid)
         torch.sub(self.task._wheel_positions[..., 2], self.task._wheel_radius, out=self.task._wheel_clearances)
         self.task._wheel_clearances.sub_(self._wheel_height).clamp_(min=0.0)
         torch.le(

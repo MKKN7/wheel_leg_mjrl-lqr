@@ -24,7 +24,7 @@ provider before being enabled.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 from typing import Any, Mapping
@@ -35,6 +35,7 @@ import yaml
 from guide_wheel_mjcf import guide_wheel_runtime_contract
 from warp_env import WarpBatchError, WarpBatchStep, WarpPhysicsBatch
 from warp_safety import (
+    SAFETY_REASON_LEG_LIMIT,
     SAFETY_REASON_NONFINITE_CONTROL,
     WarpSafetyLimits,
     WarpSafetyResult,
@@ -69,6 +70,153 @@ GUIDE_WHEEL_RIGHT_INDICES = _GUIDE_WHEEL_CONTRACT.right_indices
 
 
 @dataclass(frozen=True)
+class TerrainCompensatedLegRewardSettings:
+    """YAML-owned leg/attitude shaping for unequal terrain support heights.
+
+    The conventional equal-leg objective remains the fallback whenever both
+    active-wheel support heights are not available.  With a valid pair of
+    terrain samples, the desired signed leg difference follows the support
+    height difference, so an uphill wheel can retract without being punished
+    for keeping the chassis level.  This is a reward preference, not a safety
+    bypass: the task separately enforces individual leg travel and a hard
+    absolute-difference envelope.  The target itself is not an instantaneous
+    mechanical constraint because a new step sample can change faster than a
+    leg can safely move.
+    """
+
+    enabled: bool = False
+    support_height_to_leg_difference_gain: float = -1.0
+    target_leg_difference_limit_m: float = 0.160
+    reward_error_scale_m: float = 0.040
+    flat_leg_difference_penalty: float = 0.060
+    uneven_leg_difference_penalty: float = 0.020
+    turning_leg_penalty_fraction: float = 0.25
+    relief_start_m: float = 0.008
+    relief_full_m: float = 0.080
+    flat_attitude_reward_weight: float = 0.30
+    uneven_attitude_reward_weight: float = 0.50
+    terrain_raw_leg_difference_limit_m: float = 0.200
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("terrain_compensated_leg_reward.enabled must be boolean")
+        values = (
+            ("support_height_to_leg_difference_gain", self.support_height_to_leg_difference_gain),
+            ("target_leg_difference_limit_m", self.target_leg_difference_limit_m),
+            ("reward_error_scale_m", self.reward_error_scale_m),
+            ("flat_leg_difference_penalty", self.flat_leg_difference_penalty),
+            ("uneven_leg_difference_penalty", self.uneven_leg_difference_penalty),
+            ("turning_leg_penalty_fraction", self.turning_leg_penalty_fraction),
+            ("relief_start_m", self.relief_start_m),
+            ("relief_full_m", self.relief_full_m),
+            ("flat_attitude_reward_weight", self.flat_attitude_reward_weight),
+            ("uneven_attitude_reward_weight", self.uneven_attitude_reward_weight),
+            ("terrain_raw_leg_difference_limit_m", self.terrain_raw_leg_difference_limit_m),
+        )
+        for name, value in values:
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"terrain_compensated_leg_reward.{name} must be finite")
+        if abs(self.support_height_to_leg_difference_gain) <= 1.0e-9:
+            raise ValueError("terrain_compensated_leg_reward support-height gain must be non-zero")
+        if self.target_leg_difference_limit_m <= 0.0 or self.reward_error_scale_m <= 0.0:
+            raise ValueError("terrain-compensated leg target and reward scale must be positive")
+        if self.flat_leg_difference_penalty < 0.0 or self.uneven_leg_difference_penalty < 0.0:
+            raise ValueError("terrain-compensated leg penalties must be non-negative")
+        if not 0.0 <= self.turning_leg_penalty_fraction <= 1.0:
+            raise ValueError("turning_leg_penalty_fraction must be within [0, 1]")
+        if not 0.0 <= self.relief_start_m < self.relief_full_m:
+            raise ValueError("terrain relief bounds must satisfy 0 <= start < full")
+        if self.flat_attitude_reward_weight < 0.0 or self.uneven_attitude_reward_weight < self.flat_attitude_reward_weight:
+            raise ValueError("terrain attitude weights must be non-negative and non-decreasing")
+        if self.terrain_raw_leg_difference_limit_m <= 0.0:
+            raise ValueError("terrain raw leg-difference limit must be positive")
+
+
+def _require_terrain_reward_tensor(value: Any, name: str, *, worlds: int, columns: int, dtype: Any | None = None) -> None:
+    if not hasattr(value, "shape") or value.shape != (worlds, columns):
+        raise ValueError(f"{name} must have shape {(worlds, columns)}")
+    if dtype is not None and value.dtype != dtype:
+        raise ValueError(f"{name} has an invalid dtype")
+
+
+def terrain_compensated_leg_difference_cost(
+    torch: Any,
+    leg_lengths: Any,
+    support_heights: Any,
+    support_valid: Any,
+    settings: TerrainCompensatedLegRewardSettings,
+) -> tuple[Any, Any, Any]:
+    """Return raw leg-target error, target difference, and valid-support mask.
+
+    This pure tensor contract is deliberately separate from the task's
+    persistent CUDA workspaces.  It is used by CPU tests and documents the
+    exact target convention used by the resident rollout implementation:
+    ``left_leg - right_leg = gain * (left_support - right_support)``.
+    """
+
+    if not isinstance(settings, TerrainCompensatedLegRewardSettings):
+        raise TypeError("settings must be TerrainCompensatedLegRewardSettings")
+    worlds = int(leg_lengths.shape[0]) if hasattr(leg_lengths, "shape") and len(leg_lengths.shape) == 2 else -1
+    if worlds < 1:
+        raise ValueError("leg_lengths must have a non-empty [worlds, 2] shape")
+    _require_terrain_reward_tensor(leg_lengths, "leg_lengths", worlds=worlds, columns=2)
+    _require_terrain_reward_tensor(support_heights, "support_heights", worlds=worlds, columns=2)
+    _require_terrain_reward_tensor(support_valid, "support_valid", worlds=worlds, columns=2, dtype=torch.bool)
+    if leg_lengths.device != support_heights.device or leg_lengths.device != support_valid.device:
+        raise ValueError("terrain reward tensors must share a device")
+    if not leg_lengths.is_floating_point() or not support_heights.is_floating_point():
+        raise ValueError("leg_lengths and support_heights must be floating point")
+
+    finite_leg = torch.isfinite(leg_lengths).all(dim=1)
+    valid = support_valid.all(dim=1) & torch.isfinite(support_heights).all(dim=1) & finite_leg
+    if not settings.enabled:
+        valid = torch.zeros_like(valid)
+    safe_heights = torch.nan_to_num(support_heights, nan=0.0, posinf=0.0, neginf=0.0)
+    target_difference = torch.clamp(
+        (safe_heights[:, 0] - safe_heights[:, 1]) * settings.support_height_to_leg_difference_gain,
+        min=-settings.target_leg_difference_limit_m,
+        max=settings.target_leg_difference_limit_m,
+    )
+    target_difference = torch.where(valid, target_difference, torch.zeros_like(target_difference))
+    safe_lengths = torch.nan_to_num(leg_lengths, nan=0.0, posinf=0.0, neginf=0.0)
+    cost = torch.abs((safe_lengths[:, 0] - safe_lengths[:, 1]) - target_difference)
+    return cost, target_difference, valid
+
+
+def terrain_adaptive_attitude_weight(
+    torch: Any,
+    support_heights: Any,
+    support_valid: Any,
+    settings: TerrainCompensatedLegRewardSettings,
+) -> Any:
+    """Return bounded attitude weight that rises only with valid cross-relief."""
+
+    if not isinstance(settings, TerrainCompensatedLegRewardSettings):
+        raise TypeError("settings must be TerrainCompensatedLegRewardSettings")
+    worlds = int(support_heights.shape[0]) if hasattr(support_heights, "shape") and len(support_heights.shape) == 2 else -1
+    if worlds < 1:
+        raise ValueError("support_heights must have a non-empty [worlds, 2] shape")
+    _require_terrain_reward_tensor(support_heights, "support_heights", worlds=worlds, columns=2)
+    _require_terrain_reward_tensor(support_valid, "support_valid", worlds=worlds, columns=2, dtype=torch.bool)
+    if support_heights.device != support_valid.device or not support_heights.is_floating_point():
+        raise ValueError("support heights/validity must be floating point and share a device")
+    valid = support_valid.all(dim=1) & torch.isfinite(support_heights).all(dim=1)
+    if not settings.enabled:
+        valid = torch.zeros_like(valid)
+    safe_heights = torch.nan_to_num(support_heights, nan=0.0, posinf=0.0, neginf=0.0)
+    relief = torch.abs(safe_heights[:, 0] - safe_heights[:, 1])
+    ratio = torch.clamp(
+        (relief - settings.relief_start_m) / (settings.relief_full_m - settings.relief_start_m),
+        min=0.0,
+        max=1.0,
+    )
+    ratio = torch.where(valid, ratio, torch.zeros_like(ratio))
+    return settings.flat_attitude_reward_weight + ratio * (
+        settings.uneven_attitude_reward_weight - settings.flat_attitude_reward_weight
+    )
+
+
+@dataclass(frozen=True)
 class WarpFlatWalkingConfig:
     """GPU task parameters; callers should construct this from YAML."""
 
@@ -95,6 +243,9 @@ class WarpFlatWalkingConfig:
     direct_control_mode: bool = False
     residual_limits: tuple[float, float, float, float, float, float, float] = DEFAULT_RESIDUAL_LIMITS
     leg_action_enabled: bool = False
+    terrain_compensated_leg_reward: TerrainCompensatedLegRewardSettings = field(
+        default_factory=TerrainCompensatedLegRewardSettings
+    )
 
     def __post_init__(self) -> None:
         values = (
@@ -148,6 +299,13 @@ class WarpFlatWalkingConfig:
             raise ValueError("command_leg_length_m is outside configured leg length limits")
         if not isinstance(self.direct_control_mode, bool) or not isinstance(self.leg_action_enabled, bool):
             raise ValueError("direct_control_mode and leg_action_enabled must be boolean")
+        if not isinstance(self.terrain_compensated_leg_reward, TerrainCompensatedLegRewardSettings):
+            raise ValueError("terrain_compensated_leg_reward must be TerrainCompensatedLegRewardSettings")
+        if (
+            self.terrain_compensated_leg_reward.terrain_raw_leg_difference_limit_m
+            > self.safety_leg_length_max_m - self.safety_leg_length_min_m + 1.0e-9
+        ):
+            raise ValueError("terrain raw leg-difference limit exceeds the configured mechanical travel span")
         limits = tuple(self.residual_limits)
         if len(limits) != ACTION_SIZE:
             raise ValueError(f"residual_limits must have {ACTION_SIZE} entries")
@@ -189,11 +347,21 @@ class WarpFlatWalkingConfig:
             "direct_control_mode",
             "residual_limits",
             "leg_action_enabled",
+            "terrain_compensated_leg_reward",
         }
         unknown = sorted(set(raw) - allowed)
         if unknown:
             raise ValueError(f"unknown flat walking task config keys: {unknown}")
-        return cls(**dict(raw))
+        values = dict(raw)
+        settings_raw = values.get("terrain_compensated_leg_reward")
+        if settings_raw is not None:
+            if not isinstance(settings_raw, Mapping):
+                raise ValueError("terrain_compensated_leg_reward must be a mapping")
+            try:
+                values["terrain_compensated_leg_reward"] = TerrainCompensatedLegRewardSettings(**dict(settings_raw))
+            except TypeError as error:
+                raise ValueError(f"invalid terrain_compensated_leg_reward keys: {error}") from error
+        return cls(**values)
 
 
 def load_flat_walking_config(path: str | Path, *, section: str = "flat_walking") -> WarpFlatWalkingConfig:
@@ -659,12 +827,63 @@ class WarpFlatWalkingTask:
         )
         self._delayed_action = torch.empty_like(self._previous_action)
         self._contact_loss_steps = torch.zeros((self.num_worlds, 2), dtype=torch.int32, device=self.device)
+        # Terrain/jump adapters may temporarily exempt a world from the
+        # contact-loss timer only while their own bounded flight supervisor is
+        # active.  Flat walking keeps this false forever.
+        self._contact_loss_exempt = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        self._safety_contacts = torch.empty((self.num_worlds, 2), dtype=torch.bool, device=self.device)
+        # Terrain adapters publish only active-wheel support samples through
+        # this narrow interface.  All buffers are resident for the lifetime
+        # of the task because terrain-compensated reward and P0 leg safety are
+        # evaluated at every physical substep, never through CPU readback.
+        self._terrain_leg_support_heights = torch.zeros(
+            (self.num_worlds, 2), dtype=torch.float32, device=self.device
+        )
+        self._terrain_leg_support_finite = torch.zeros(
+            (self.num_worlds, 2), dtype=torch.bool, device=self.device
+        )
+        self._terrain_leg_support_valid = torch.zeros(
+            (self.num_worlds, 2), dtype=torch.bool, device=self.device
+        )
+        self._terrain_leg_target_valid = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        self._terrain_leg_compensation_valid = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        self._terrain_leg_compensation_valid_float = torch.zeros(
+            self.num_worlds, dtype=torch.float32, device=self.device
+        )
+        self._terrain_leg_target_difference = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_leg_difference = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_leg_raw_difference_m = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_leg_target_error_m = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_leg_error_m = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_support_relief_m = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_support_relief_ratio = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_leg_penalty_weight = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_turn_penalty_scale = torch.ones(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_attitude_weight = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_leg_cost = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._terrain_leg_known_uneven_support = torch.zeros(
+            self.num_worlds, dtype=torch.bool, device=self.device
+        )
+        self._terrain_leg_raw_violation = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        self._terrain_leg_fallback_violation = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        self._terrain_leg_safety_violation = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        self._terrain_leg_reason_mask = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        # Controller adapters can lower all baseline actuator/generalized
+        # force output per world during flight and landing.  The raw batch
+        # still independently clips every physical actuator to 80% rated.
+        self._controller_torque_scale = torch.ones(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._controller_torque_scale_invalid = torch.zeros(
+            self.num_worlds, dtype=torch.bool, device=self.device
+        )
+        self._domain_randomization_active = bool(self.config.domain_randomization_enabled)
         self._episode_done = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        self._task_truncated = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
         self._jump_request = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
         self._all_world_mask = torch.ones(self.num_worlds, dtype=torch.bool, device=self.device)
         self._last_unsafe = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
         self._action_nonfinite = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
         self._safety_terminated = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
+        self._post_physics_terminated = torch.zeros_like(self._safety_terminated)
         self._safety_reason_code = torch.zeros(self.num_worlds, dtype=torch.int64, device=self.device)
         self._safe_requested_controls = torch.zeros(
             (self.num_worlds, batch.num_actuators), dtype=torch.float32, device=self.device
@@ -722,7 +941,11 @@ class WarpFlatWalkingTask:
             fall_guard_enabled=batch.config.fall_guard.enabled,
             max_attitude_error_rad=batch.config.fall_guard.max_attitude_error_rad,
             max_root_height_drop_m=batch.config.fall_guard.max_root_height_drop_m,
-            max_leg_length_difference_m=self.config.max_leg_length_difference_m,
+            # The generic helper still enforces each individual leg travel.
+            # Difference safety is applied immediately after it so terrain
+            # tasks can use a valid support-height target while all flat or
+            # invalid-support worlds retain the original 15 mm hard limit.
+            max_leg_length_difference_m=None,
             min_leg_length_m=self.config.safety_leg_length_min_m,
             max_leg_length_m=self.config.safety_leg_length_max_m,
             max_contact_loss_steps=self._contact_loss_limit_steps,
@@ -758,7 +981,7 @@ class WarpFlatWalkingTask:
     def _apply_domain_randomization_reset(self, mask: Any) -> None:
         """Commit/reset episode-constant model DR outside the substep loop."""
 
-        if self.config.domain_randomization_enabled:
+        if self._domain_randomization_active:
             if not self.batch.domain_randomization_enabled:
                 raise WarpBatchError(
                     "task domain_randomization_enabled requires a batch domain_randomization block"
@@ -766,6 +989,20 @@ class WarpFlatWalkingTask:
             self.batch.sample_domain_randomization(mask)
         elif self.batch.domain_randomization_enabled:
             self.batch.reset_domain_randomization(mask)
+
+    def set_domain_randomization_active(self, enabled: bool) -> None:
+        """Enable DR only at an explicit episode/reset boundary.
+
+        Deterministic safety gates use this to validate the physical baseline
+        before PPO starts.  The flag does not alter model data until a future
+        :meth:`reset`, so it cannot mutate dynamics in a physics substep.
+        """
+
+        if not isinstance(enabled, bool):
+            raise ValueError("domain randomization active flag must be boolean")
+        if enabled and not self.config.domain_randomization_enabled:
+            raise WarpBatchError("task has no configured domain-randomization contract")
+        self._domain_randomization_active = enabled
 
     def _delay_action(self, action: Any) -> Any:
         """Apply the configured CUDA-resident policy-period delay."""
@@ -887,6 +1124,149 @@ class WarpFlatWalkingTask:
         torch.nan_to_num(terrain_features, nan=0.0, posinf=0.0, neginf=0.0, out=self._terrain_features)
         torch.clamp(self._terrain_features, -10.0, 10.0, out=self._terrain_features)
 
+    def set_terrain_leg_support_heights(self, support_heights: Any, support_valid: Any) -> None:
+        """Publish active-wheel terrain support data for reward/P0 leg checks.
+
+        Terrain providers call this immediately after their current CUDA
+        surface query.  ``support_valid`` means the query lies on immutable
+        route geometry; physical active-wheel contact is combined later at
+        the current substep, so a stale airborne sample never earns terrain
+        compensation.
+        """
+
+        torch = self.torch
+        expected = (self.num_worlds, 2)
+        if (
+            not isinstance(support_heights, torch.Tensor)
+            or support_heights.shape != expected
+            or support_heights.device != self.device
+            or support_heights.dtype != torch.float32
+            or not support_heights.is_contiguous()
+        ):
+            raise ValueError("terrain support heights must be contiguous float32 CUDA [worlds, 2]")
+        if (
+            not isinstance(support_valid, torch.Tensor)
+            or support_valid.shape != expected
+            or support_valid.device != self.device
+            or support_valid.dtype != torch.bool
+            or not support_valid.is_contiguous()
+        ):
+            raise ValueError("terrain support validity must be contiguous bool CUDA [worlds, 2]")
+        torch.nan_to_num(support_heights, nan=0.0, posinf=0.0, neginf=0.0, out=self._terrain_leg_support_heights)
+        # Torch 2.11's ``isfinite`` has no ``out=`` overload.  The temporary
+        # boolean expression remains GPU-resident and is copied into our
+        # persistent safety workspace; it never triggers a host readback.
+        self._terrain_leg_support_finite.copy_(torch.isfinite(support_heights))
+        self._terrain_leg_support_valid.copy_(support_valid)
+        self._terrain_leg_support_valid.logical_and_(self._terrain_leg_support_finite)
+        torch.all(self._terrain_leg_support_valid, dim=1, out=self._terrain_leg_target_valid)
+        settings = self.config.terrain_compensated_leg_reward
+        self._terrain_leg_target_difference.copy_(self._terrain_leg_support_heights[:, 0])
+        self._terrain_leg_target_difference.sub_(self._terrain_leg_support_heights[:, 1])
+        self._terrain_leg_target_difference.mul_(settings.support_height_to_leg_difference_gain)
+        self._terrain_leg_target_difference.clamp_(
+            -settings.target_leg_difference_limit_m,
+            settings.target_leg_difference_limit_m,
+        )
+        torch.logical_not(self._terrain_leg_target_valid, out=self._terrain_leg_reason_mask)
+        self._terrain_leg_target_difference.masked_fill_(self._terrain_leg_reason_mask, 0.0)
+
+    def _clear_terrain_leg_support_heights(self, mask: Any) -> None:
+        """Clear reset worlds so a prior route sample cannot cross episodes."""
+
+        mask = self._require_mask(mask)
+        side_mask = mask.unsqueeze(1)
+        self._terrain_leg_support_heights.masked_fill_(side_mask, 0.0)
+        self._terrain_leg_support_finite.masked_fill_(side_mask, False)
+        self._terrain_leg_support_valid.masked_fill_(side_mask, False)
+        self._terrain_leg_target_valid.masked_fill_(mask, False)
+        self._terrain_leg_compensation_valid.masked_fill_(mask, False)
+        self._terrain_leg_compensation_valid_float.masked_fill_(mask, 0.0)
+        self._terrain_leg_target_difference.masked_fill_(mask, 0.0)
+
+    def _refresh_terrain_leg_state(
+        self,
+        leg_lengths: Any,
+        active_wheel_contacts: Any,
+        side_support_contacts: Any,
+        turn_intensity: Any | None = None,
+    ) -> None:
+        """Refresh resident compensation/error buffers from the current substep.
+
+        Reward compensation is admitted only with finite query data and both
+        active wheels in contact.  Its P0 envelope is deliberately broader:
+        a known unequal terrain relief with two-sided active-or-guide support,
+        or an explicitly supervised flight, uses the configured absolute cap
+        rather than pretending a newly sampled target is instantly reachable.
+        """
+
+        torch = self.torch
+        expected = (self.num_worlds, 2)
+        if (
+            leg_lengths.shape != expected
+            or active_wheel_contacts.shape != expected
+            or side_support_contacts.shape != expected
+        ):
+            raise ValueError("terrain leg state inputs must all have shape [worlds, 2]")
+        self._terrain_leg_difference.copy_(leg_lengths[:, 0])
+        self._terrain_leg_difference.sub_(leg_lengths[:, 1])
+        torch.nan_to_num(self._terrain_leg_difference, nan=0.0, posinf=0.0, neginf=0.0, out=self._terrain_leg_difference)
+        self._terrain_leg_raw_difference_m.copy_(self._terrain_leg_difference).abs_()
+        self._terrain_leg_target_error_m.copy_(self._terrain_leg_difference)
+        self._terrain_leg_target_error_m.sub_(self._terrain_leg_target_difference).abs_()
+        settings = self.config.terrain_compensated_leg_reward
+        self._terrain_support_relief_m.copy_(self._terrain_leg_support_heights[:, 0])
+        self._terrain_support_relief_m.sub_(self._terrain_leg_support_heights[:, 1]).abs_()
+        self._terrain_leg_known_uneven_support.copy_(self._terrain_leg_target_valid)
+        torch.all(side_support_contacts, dim=1, out=self._terrain_leg_reason_mask)
+        self._terrain_leg_known_uneven_support.logical_and_(self._terrain_leg_reason_mask)
+        torch.gt(
+            self._terrain_support_relief_m,
+            settings.relief_start_m,
+            out=self._terrain_leg_reason_mask,
+        )
+        self._terrain_leg_known_uneven_support.logical_and_(self._terrain_leg_reason_mask)
+        self._terrain_leg_compensation_valid.copy_(self._terrain_leg_target_valid)
+        torch.all(active_wheel_contacts, dim=1, out=self._terrain_leg_reason_mask)
+        self._terrain_leg_compensation_valid.logical_and_(self._terrain_leg_reason_mask)
+        torch.logical_not(self._contact_loss_exempt, out=self._terrain_leg_reason_mask)
+        self._terrain_leg_compensation_valid.logical_and_(self._terrain_leg_reason_mask)
+        if not settings.enabled:
+            self._terrain_leg_compensation_valid.zero_()
+            self._terrain_leg_known_uneven_support.zero_()
+        self._terrain_leg_compensation_valid_float.copy_(self._terrain_leg_compensation_valid)
+        torch.where(
+            self._terrain_leg_compensation_valid,
+            self._terrain_leg_target_error_m,
+            self._terrain_leg_raw_difference_m,
+            out=self._terrain_leg_error_m,
+        )
+        self._terrain_support_relief_ratio.copy_(self._terrain_support_relief_m)
+        self._terrain_support_relief_ratio.sub_(settings.relief_start_m)
+        self._terrain_support_relief_ratio.div_(settings.relief_full_m - settings.relief_start_m)
+        self._terrain_support_relief_ratio.clamp_(0.0, 1.0)
+        torch.logical_not(self._terrain_leg_compensation_valid, out=self._terrain_leg_reason_mask)
+        self._terrain_support_relief_ratio.masked_fill_(self._terrain_leg_reason_mask, 0.0)
+        self._terrain_leg_penalty_weight.copy_(self._terrain_support_relief_ratio)
+        self._terrain_leg_penalty_weight.mul_(
+            settings.uneven_leg_difference_penalty - settings.flat_leg_difference_penalty
+        )
+        self._terrain_leg_penalty_weight.add_(settings.flat_leg_difference_penalty)
+        if turn_intensity is None:
+            self._terrain_turn_penalty_scale.fill_(1.0)
+        else:
+            self._terrain_turn_penalty_scale.copy_(turn_intensity).clamp_(0.0, 1.0)
+            self._terrain_turn_penalty_scale.mul_(1.0 - settings.turning_leg_penalty_fraction).neg_().add_(1.0)
+        self._terrain_leg_penalty_weight.mul_(self._terrain_turn_penalty_scale)
+        self._terrain_leg_cost.copy_(self._terrain_leg_error_m)
+        self._terrain_leg_cost.div_(settings.reward_error_scale_m).clamp_(0.0, 1.0)
+        self._terrain_leg_cost.mul_(self._terrain_leg_penalty_weight)
+        self._terrain_attitude_weight.copy_(self._terrain_support_relief_ratio)
+        self._terrain_attitude_weight.mul_(
+            settings.uneven_attitude_reward_weight - settings.flat_attitude_reward_weight
+        )
+        self._terrain_attitude_weight.add_(settings.flat_attitude_reward_weight)
+
     def set_feedback_controller(self, controller: Any) -> None:
         """Attach the CUDA feedback controller used by residual PPO.
 
@@ -901,6 +1281,47 @@ class WarpFlatWalkingTask:
         if controller is None:
             raise ValueError("controller must not be None in residual mode")
         self._controller = controller
+
+    def set_contact_loss_exempt(self, exempt: Any) -> None:
+        """Set a task-owned, CUDA-resident bounded-flight contact exemption.
+
+        This does not disable contact safety globally: the caller must clear
+        the mask before its own flight timeout and landing confirmation.  It
+        exists so a genuine jump is not falsely labelled a contact loss while
+        every other P0 check remains active.
+        """
+
+        exempt = self._require_mask(exempt)
+        self._contact_loss_exempt.copy_(exempt)
+
+    def set_controller_torque_scale(self, scale: Any) -> None:
+        """Apply a validated per-world torque attenuation to a feedback task."""
+
+        torch = self.torch
+        if (
+            not isinstance(scale, torch.Tensor)
+            or scale.shape != (self.num_worlds,)
+            or scale.device != self.device
+            or scale.dtype != torch.float32
+            or not scale.is_contiguous()
+        ):
+            raise ValueError("controller torque scale must be contiguous float32 CUDA [world]")
+        self._controller_torque_scale_invalid.copy_(~torch.isfinite(scale))
+        self._controller_torque_scale_invalid.logical_or_(scale < 0.0)
+        self._controller_torque_scale_invalid.logical_or_(scale > 1.0)
+        # Keep this entirely on CUDA: malformed internal supervisor output is
+        # a P0 estop rather than a host exception or a silent scale clamp.
+        self._controller_torque_scale.copy_(
+            torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+        )
+        self._controller_torque_scale.clamp_(0.0, 1.0)
+        self._controller_torque_scale.masked_fill_(self._controller_torque_scale_invalid, 0.0)
+        self._safety_terminated.logical_or_(self._controller_torque_scale_invalid)
+        self._safety_reason_code.masked_fill_(
+            self._controller_torque_scale_invalid,
+            SAFETY_REASON_NONFINITE_CONTROL,
+        )
+        self.batch.latch_estop(self._controller_torque_scale_invalid)
 
     def reset(self, world_mask: Any | None = None) -> Any:
         """Reset selected worlds and return their current 67-D observation."""
@@ -935,10 +1356,16 @@ class WarpFlatWalkingTask:
         self._delayed_action[mask] = 0.0
         self._observation_noise[mask] = 0.0
         self._contact_loss_steps[mask] = 0
+        self._contact_loss_exempt[mask] = False
+        self._clear_terrain_leg_support_heights(mask)
+        self._controller_torque_scale[mask] = 1.0
+        self._controller_torque_scale_invalid[mask] = False
         self._episode_done[mask] = False
+        self._task_truncated[mask] = False
         self._last_unsafe[mask] = False
         self._action_nonfinite[mask] = False
         self._safety_terminated[mask] = False
+        self._post_physics_terminated[mask] = False
         self._safety_reason_code[mask] = 0
         self._safe_requested_controls[mask] = 0.0
         self._safe_applied_forces[mask] = 0.0
@@ -1163,17 +1590,69 @@ class WarpFlatWalkingTask:
     def _update_contact_loss(self, contacts: Any) -> None:
         self._contact_loss_steps.masked_fill_(contacts, 0)
         self._contact_loss_steps.add_((~contacts).to(dtype=self.torch.int32))
+        self._contact_loss_steps.masked_fill_(self._contact_loss_exempt.unsqueeze(1), 0)
+
+    def _apply_terrain_leg_safety(self, result: WarpSafetyResult) -> WarpSafetyResult:
+        """Apply the terrain-aware P0 difference gate to generic safety output.
+
+        The generic safety helper has already checked leg finite values and
+        individual mechanical travel.  Flat or unknown-support worlds retain
+        the strict configured difference gate.  Known unequal terrain with
+        two-sided support, and only the bounded direct-jump flight exemption,
+        use the independently configured absolute cap.  The reward target is
+        deliberately diagnostic rather than a one-substep estop condition.
+        """
+
+        torch = self.torch
+        settings = self.config.terrain_compensated_leg_reward
+        torch.gt(
+            self._terrain_leg_raw_difference_m,
+            settings.terrain_raw_leg_difference_limit_m,
+            out=self._terrain_leg_raw_violation,
+        )
+        torch.gt(
+            self._terrain_leg_raw_difference_m,
+            self.config.max_leg_length_difference_m,
+            out=self._terrain_leg_fallback_violation,
+        )
+        self._terrain_leg_reason_mask.copy_(self._terrain_leg_known_uneven_support)
+        self._terrain_leg_reason_mask.logical_or_(self._contact_loss_exempt)
+        torch.where(
+            self._terrain_leg_reason_mask,
+            self._terrain_leg_raw_violation,
+            self._terrain_leg_fallback_violation,
+            out=self._terrain_leg_safety_violation,
+        )
+        result.leg_limit.logical_or_(self._terrain_leg_safety_violation)
+        result.failure.logical_or_(self._terrain_leg_safety_violation)
+        result.terminated.logical_or_(self._terrain_leg_safety_violation)
+        torch.eq(result.reason_code, 0, out=self._terrain_leg_reason_mask)
+        self._terrain_leg_reason_mask.logical_and_(self._terrain_leg_safety_violation)
+        result.reason_code.masked_fill_(self._terrain_leg_reason_mask, SAFETY_REASON_LEG_LIMIT)
+        result.safe_controls.masked_fill_(result.terminated.unsqueeze(1), 0.0)
+        return result
 
     def _evaluate_safety(self, controls: Any) -> WarpSafetyResult:
         """Run task-level P0 checks using only resident CUDA tensors."""
 
         contacts = self._side_support_contacts()
+        self._safety_contacts.copy_(contacts)
+        self._safety_contacts.logical_or_(self._contact_loss_exempt.unsqueeze(1))
         torch = self.torch
         torch.index_select(
             self.batch.sensordata,
             1,
             self._leg_length_indices,
             out=self._safety_leg_lengths,
+        )
+        # The active contact mask authorizes reward compensation.  The side
+        # support mask additionally lets a lower guide keep a bounded leg
+        # envelope during a real step transition, without treating its height
+        # as a calibrated active-wheel target.
+        self._refresh_terrain_leg_state(
+            self._safety_leg_lengths,
+            self._wheel_contacts,
+            contacts,
         )
         joint_positions = None
         joint_lower = None
@@ -1193,7 +1672,7 @@ class WarpFlatWalkingTask:
             self.batch.estopped,
             out=self._previous_estopped,
         )
-        return evaluate_safety(
+        result = evaluate_safety(
             self.batch.qpos,
             self.batch.qvel,
             controls,
@@ -1211,11 +1690,12 @@ class WarpFlatWalkingTask:
             joint_lower=joint_lower,
             joint_upper=joint_upper,
             leg_lengths=self._safety_leg_lengths,
-            wheel_contact=contacts,
+            wheel_contact=self._safety_contacts,
             contact_loss_steps=self._contact_loss_steps,
             safe_controls_out=self._safe_requested_controls,
             scratch=self._safety_scratch,
         )
+        return self._apply_terrain_leg_safety(result)
 
     def _latch_safety(self, result: WarpSafetyResult, *, action_nonfinite: Any | None = None) -> Any:
         """Persist task safety state and zero controls for malformed actions."""
@@ -1246,10 +1726,32 @@ class WarpFlatWalkingTask:
         self._last_unsafe.copy_(unsafe)
         terminated = self._episode_done | unsafe
         elapsed = self.batch.time >= self.config.episode_seconds
-        truncated = elapsed & ~terminated
+        truncated = (elapsed | self._task_truncated) & ~terminated
         done = terminated | truncated
-        self._episode_done |= done
         return terminated, truncated, done
+
+    def _before_policy_step(self) -> None:
+        """Extension hook run before a policy interval on resident CUDA data."""
+
+    def _transform_policy_action(self, action: Any) -> Any:
+        """Apply task-owned residual authority before delay buffering.
+
+        Terrain supervisors may attenuate residual authority for a bounded
+        safety phase (for example, launch, flight, and landing).  The default
+        task preserves the configured action mask unchanged.  Implementations
+        must mutate and return this resident CUDA buffer; they must not create
+        per-step host data or grant authority to the masked leg channel.
+        """
+
+        return action
+
+    def _policy_action_authority(self) -> Any:
+        """Return the current CUDA authority mask used by PPO collection."""
+
+        return self._policy_action_enabled.unsqueeze(0)
+
+    def _after_physics_interval(self, terminated: Any) -> None:
+        """Extension hook run after the final physical substep before reward."""
 
     def _reward(self, controls: Any, action: Any, unsafe: Any) -> Any:
         torch = self.torch
@@ -1281,12 +1783,24 @@ class WarpFlatWalkingTask:
             0.0,
             1.0,
         )
-        leg_diff_weight = 0.5 + (2.0 - 0.5) * (1.0 - turn_intensity)
-        leg_diff = torch.abs(leg_lengths[:, 0] - leg_lengths[:, 1])
+        terrain_settings = self.config.terrain_compensated_leg_reward
+        if terrain_settings.enabled:
+            self._refresh_terrain_leg_state(
+                leg_lengths,
+                self._wheel_contacts,
+                contacts,
+                turn_intensity,
+            )
+            attitude_term = self._terrain_attitude_weight * attitude_tracking
+            leg_difference_cost = self._terrain_leg_cost
+        else:
+            attitude_term = 0.30 * attitude_tracking
+            leg_diff_weight = 0.5 + (2.0 - 0.5) * (1.0 - turn_intensity)
+            leg_difference_cost = leg_diff_weight * torch.abs(leg_lengths[:, 0] - leg_lengths[:, 1])
         reward = (
             0.65 * tracking
             + 0.30 * leg_tracking
-            + 0.30 * attitude_tracking
+            + attitude_term
             + contact_bonus
             + 0.25 * yaw_tracking
         )
@@ -1294,25 +1808,38 @@ class WarpFlatWalkingTask:
             0.03 * energy_cost
             + 0.02 * residual_cost
             + 0.05 * torch.square(yaw_rate_error)
-            + leg_diff_weight * leg_diff
+            + leg_difference_cost
         )
         unsafe_penalty = torch.where(
             unsafe,
             torch.full_like(reward, 30.0),
             torch.zeros_like(reward),
         )
-        self._reward_terms.update({
+        reward_terms = {
             "speed_tracking": 0.65 * tracking,
             "leg_tracking": 0.30 * leg_tracking,
-            "attitude_tracking": 0.30 * attitude_tracking,
             "contact": contact_bonus,
             "yaw_tracking": 0.25 * yaw_tracking,
             "energy_cost": -0.03 * energy_cost,
             "residual_cost": -0.02 * residual_cost,
             "yaw_rate_cost": -0.05 * torch.square(yaw_rate_error),
-            "leg_symmetry_cost": -leg_diff_weight * leg_diff,
             "unsafe_penalty": -unsafe_penalty,
-        })
+        }
+        if terrain_settings.enabled:
+            reward_terms.update({
+                "terrain_attitude_tracking": attitude_term,
+                "terrain_compensated_leg_difference_cost": -leg_difference_cost,
+                "terrain_leg_target_difference_m": self._terrain_leg_target_difference,
+                "terrain_leg_error_m": self._terrain_leg_error_m,
+                "terrain_support_relief_m": self._terrain_support_relief_m,
+                "terrain_compensation_valid": self._terrain_leg_compensation_valid_float,
+            })
+        else:
+            reward_terms.update({
+                "attitude_tracking": attitude_term,
+                "leg_symmetry_cost": -leg_difference_cost,
+            })
+        self._reward_terms.update(reward_terms)
         return reward - unsafe_penalty
 
     def step(self, action: Any, controls: Any | None = None) -> WarpTaskStep:
@@ -1329,6 +1856,13 @@ class WarpFlatWalkingTask:
         torch = self.torch
         action = self._require_action(action)
         torch.mul(action, self._policy_action_enabled, out=self._effective_action)
+        # Let a terrain supervisor update its phase state from the last
+        # resident physics sample before its bounded action authority is
+        # written into the delay buffer for this policy interval.
+        self._before_policy_step()
+        transformed_action = self._transform_policy_action(self._effective_action)
+        if transformed_action is not self._effective_action:
+            raise RuntimeError("_transform_policy_action must return the resident effective-action buffer")
         effective_action = self._delay_action(self._effective_action)
         supplied_controls = controls
         if supplied_controls is not None:
@@ -1398,6 +1932,9 @@ class WarpFlatWalkingTask:
 
         if physics is None:  # pragma: no cover - config rejects zero substeps
             raise RuntimeError("flat task did not execute a physics substep")
+        self._post_physics_terminated.copy_(self._safety_terminated)
+        self._post_physics_terminated.logical_or_(self.batch.estopped)
+        self._after_physics_interval(self._post_physics_terminated)
         terminated, truncated, done = self._termination()
         # MuJoCo-Warp sanitizes/derates controls in ``_safe_controls`` before
         # writing them to the model.  Score that physical command, never a
@@ -1405,6 +1942,7 @@ class WarpFlatWalkingTask:
         reward = self._reward(self.batch._safe_controls, effective_action, self._last_unsafe)
         self._previous_action.copy_(effective_action)
         observation = self.observe()
+        self._episode_done.logical_or_(done)
         return WarpTaskStep(
             observation=observation,
             reward=reward,
@@ -1428,7 +1966,7 @@ class WarpFlatWalkingTask:
         # disabled by ``_policy_action_enabled``.
         policy_action_masks = (
             (~self._action_nonfinite).to(dtype=self.torch.float32).unsqueeze(1)
-            * self._policy_action_enabled.unsqueeze(0)
+            * self._policy_action_authority()
         ).contiguous()
         return WarpVectorStep(
             observations=result.observation,
@@ -1453,6 +1991,9 @@ class WarpFlatWalkingTask:
             "calibrated_nominal_controls": self._calibrated_nominal_controls,
             "guide_wheel_contacts": self._guide_wheel_contacts,
             "support_contacts": self._support_contacts,
+            "terrain_leg_target_difference_m": self._terrain_leg_target_difference,
+            "terrain_leg_error_m": self._terrain_leg_error_m,
+            "terrain_compensation_valid": self._terrain_leg_compensation_valid,
         }
 
 
@@ -1463,6 +2004,7 @@ __all__ = [
     "GUIDE_WHEEL_RIGHT_INDICES",
     "OBSERVATION_SIZE",
     "OBS_LAYOUT",
+    "TerrainCompensatedLegRewardSettings",
     "WarpFlatWalkingConfig",
     "WarpFlatStanceCalibration",
     "WarpFlatWalkingTask",
@@ -1471,4 +2013,6 @@ __all__ = [
     "calibrate_flat_stance",
     "combine_side_support_contacts",
     "load_flat_walking_config",
+    "terrain_adaptive_attitude_weight",
+    "terrain_compensated_leg_difference_cost",
 ]

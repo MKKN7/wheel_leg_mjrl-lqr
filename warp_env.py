@@ -123,6 +123,23 @@ class WarpDomainRandomizationConfig:
 
 
 @dataclass(frozen=True)
+class WarpStaticTerrainSupportConfig:
+    """Immutable collision-topology selection made before CUDA upload.
+
+    RMUC terrain scenes retain a flat plane only so CPU LQR calibration can
+    construct its standing trim.  A hfield rollout must explicitly disable
+    that plane before the model is uploaded, otherwise the plane can mask the
+    actual terrain contact.  This is intentionally an initialization-only
+    choice; no hfield data, geometry pose, or collision mask is touched at a
+    reset or during a physics step.
+    """
+
+    mode: str = "default"
+    hfield_geom: str | None = None
+    disabled_collision_geoms: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class WarpBatchConfig:
     source_path: Path
     backend: str
@@ -138,6 +155,7 @@ class WarpBatchConfig:
     controller_backend: str
     ppo_training_enabled: bool
     domain_randomization: WarpDomainRandomizationConfig = WarpDomainRandomizationConfig()
+    static_terrain_support: WarpStaticTerrainSupportConfig = WarpStaticTerrainSupportConfig()
 
 
 @dataclass(frozen=True)
@@ -318,6 +336,51 @@ def _domain_randomization_config(value: object) -> WarpDomainRandomizationConfig
     )
 
 
+def _static_terrain_support_config(value: object) -> WarpStaticTerrainSupportConfig:
+    """Parse the optional immutable terrain collision-topology contract."""
+
+    if value is None:
+        return WarpStaticTerrainSupportConfig()
+    root = _mapping(value, "static_terrain_support")
+    expected = {"mode", "hfield_geom", "disabled_collision_geoms"}
+    unknown = sorted(set(root) - expected)
+    if unknown:
+        raise WarpBatchError(f"static_terrain_support has unknown keys: {unknown}")
+    mode = root.get("mode")
+    if not isinstance(mode, str) or mode not in {"default", "hfield_only"}:
+        raise WarpBatchError("static_terrain_support.mode must be default or hfield_only")
+    hfield_geom = root.get("hfield_geom")
+    disabled_raw = root.get("disabled_collision_geoms", [])
+    if not isinstance(disabled_raw, list):
+        raise WarpBatchError("static_terrain_support.disabled_collision_geoms must be a list")
+    disabled: list[str] = []
+    for index, name in enumerate(disabled_raw):
+        if not isinstance(name, str) or not name or name.strip() != name:
+            raise WarpBatchError(
+                f"static_terrain_support.disabled_collision_geoms[{index}] must be a non-empty identifier"
+            )
+        disabled.append(name)
+    if len(set(disabled)) != len(disabled):
+        raise WarpBatchError("static_terrain_support.disabled_collision_geoms must not contain duplicates")
+    if mode == "default":
+        if hfield_geom is not None or disabled:
+            raise WarpBatchError(
+                "static_terrain_support.default must not declare a hfield or disabled collision geoms"
+            )
+        return WarpStaticTerrainSupportConfig()
+    if not isinstance(hfield_geom, str) or not hfield_geom or hfield_geom.strip() != hfield_geom:
+        raise WarpBatchError("static_terrain_support.hfield_geom must be a non-empty identifier for hfield_only")
+    if not disabled:
+        raise WarpBatchError("hfield_only support must explicitly disable the calibration projection plane")
+    if hfield_geom in disabled:
+        raise WarpBatchError("hfield_only support cannot disable its active hfield geometry")
+    return WarpStaticTerrainSupportConfig(
+        mode=mode,
+        hfield_geom=hfield_geom,
+        disabled_collision_geoms=tuple(disabled),
+    )
+
+
 def _signed_rated_control_limits(model: Any, torque_fraction: float) -> tuple[np.ndarray, np.ndarray]:
     """Return signed GPU control caps from the model's explicit ranges.
 
@@ -479,6 +542,7 @@ def load_warp_batch_config(path: str | Path) -> WarpBatchConfig:
     if not xml_path.is_file():
         raise WarpBatchError(f"MJCF XML does not exist: {xml_path}")
     domain_randomization = _domain_randomization_config(root.get("domain_randomization"))
+    static_terrain_support = _static_terrain_support_config(root.get("static_terrain_support"))
     return WarpBatchConfig(
         source_path=source_path,
         backend=backend,
@@ -496,6 +560,7 @@ def load_warp_batch_config(path: str | Path) -> WarpBatchConfig:
         controller_backend=controller_backend,
         ppo_training_enabled=ppo_training_enabled,
         domain_randomization=domain_randomization,
+        static_terrain_support=static_terrain_support,
     )
 
 
@@ -570,6 +635,7 @@ class WarpPhysicsBatch:
         _configure_warp_runtime(config.runtime, self._torch, self._warp)
 
         self.host_model = self._mujoco.MjModel.from_xml_path(str(config.xml_path))
+        self._apply_static_terrain_support_contract()
         host_data = self._mujoco.MjData(self.host_model)
         self._mujoco.mj_forward(self.host_model, host_data)
         if config.capacity.nvmax > self.host_model.nv:
@@ -666,16 +732,25 @@ class WarpPhysicsBatch:
         reference_norm = float(np.linalg.norm(reference_quaternion))
         if not np.isfinite(reference_norm) or reference_norm <= 1.0e-6:
             raise WarpBatchError("free-root reference quaternion is invalid")
+        reference_root_height = float(reference_state[self._root_qpos_address + 2])
+        if not np.isfinite(reference_root_height):
+            raise WarpBatchError("free-root reference height is invalid")
+        # The raw physics fall guard is independent of a task controller, so
+        # it must retain an individual reference for every CUDA world.  A
+        # single shared reference incorrectly estops valid route resets on
+        # different platform heights or headings.
         self._reference_root_quaternion = self._torch.as_tensor(
             reference_quaternion / reference_norm, dtype=self._torch.float32, device=self.device
+        ).unsqueeze(0).repeat(self.num_worlds, 1)
+        self._reference_root_height = self._torch.full(
+            (self.num_worlds,), reference_root_height, dtype=self._torch.float32, device=self.device
         )
-        self._reference_root_height = float(reference_state[self._root_qpos_address + 2])
-        if not np.isfinite(self._reference_root_height):
-            raise WarpBatchError("free-root reference height is invalid")
+        self._reference_root_height_candidate = self._torch.empty_like(self._reference_root_height)
 
         control_low, control_high = self._rated_control_limits()
         self._control_low = self._torch.as_tensor(control_low, dtype=self._torch.float32, device=self.device)
         self._control_high = self._torch.as_tensor(control_high, dtype=self._torch.float32, device=self.device)
+        self._initialize_generalized_force_budget(control_low, control_high)
         self._safe_controls = self._torch.zeros(
             (self.num_worlds, self.num_actuators), dtype=self._torch.float32, device=self.device
         )
@@ -698,6 +773,49 @@ class WarpPhysicsBatch:
         # Warp wrapper at every masked reset.
         self._masked_worlds = self._torch.zeros(self.num_worlds, dtype=self._torch.bool, device=self.device)
         self._masked_worlds_warp = self._warp.from_torch(self._masked_worlds, dtype=self._warp.bool)
+
+    def _apply_static_terrain_support_contract(self) -> None:
+        """Apply the YAML-declared static terrain topology before CUDA upload.
+
+        The operation is deliberately restricted to disabling fixed-world
+        calibration aids.  It cannot alter the active hfield, its samples,
+        friction, dimensions, or collision category, and it is completed
+        before ``mujoco_warp.put_model`` creates the immutable CUDA model.
+        """
+
+        support = self.config.static_terrain_support
+        if support.mode == "default":
+            return
+        if support.mode != "hfield_only" or support.hfield_geom is None:
+            raise WarpBatchError("unsupported static terrain support mode")
+        model = self.host_model
+        hfield_id = int(
+            self._mujoco.mj_name2id(
+                model,
+                self._mujoco.mjtObj.mjOBJ_GEOM,
+                support.hfield_geom,
+            )
+        )
+        if hfield_id < 0:
+            raise WarpBatchError(f"configured hfield geom is missing: {support.hfield_geom}")
+        if int(model.geom_type[hfield_id]) != int(self._mujoco.mjtGeom.mjGEOM_HFIELD):
+            raise WarpBatchError(f"configured hfield geom is not an hfield: {support.hfield_geom}")
+        if int(model.geom_bodyid[hfield_id]) != 0:
+            raise WarpBatchError("configured hfield support must be fixed to the world body")
+        if int(model.geom_contype[hfield_id]) == 0 or int(model.geom_conaffinity[hfield_id]) == 0:
+            raise WarpBatchError("configured hfield support must retain collision enabled")
+        for name in support.disabled_collision_geoms:
+            geom_id = int(self._mujoco.mj_name2id(model, self._mujoco.mjtObj.mjOBJ_GEOM, name))
+            if geom_id < 0:
+                raise WarpBatchError(f"configured disabled collision geom is missing: {name}")
+            if geom_id == hfield_id:
+                raise WarpBatchError("configured disabled collision geom cannot be the active hfield")
+            if int(model.geom_bodyid[geom_id]) != 0:
+                raise WarpBatchError(
+                    "only fixed-world calibration aids may be disabled by static_terrain_support"
+                )
+            model.geom_contype[geom_id] = 0
+            model.geom_conaffinity[geom_id] = 0
 
     @property
     def estopped(self) -> Any:
@@ -978,7 +1096,12 @@ class WarpPhysicsBatch:
         self._warp.copy(self.data.qfrc_applied, self._safe_applied_forces_warp)
 
     def set_fall_guard_reference(self, quaternion: Any, root_height_m: float) -> None:
-        """Set a validated fixed reference used by the independent fall guard."""
+        """Set one validated fall-guard reference for all CUDA worlds.
+
+        Kept for the flat-task compatibility path.  Terrain tasks should use
+        :meth:`set_fall_guard_references` so masked resets can carry distinct
+        route headings and support-relative heights.
+        """
 
         quaternion = self._require_cuda_tensor(
             quaternion, (4,), "reference quaternion", dtype=self._torch.float32
@@ -988,11 +1111,155 @@ class WarpPhysicsBatch:
         norm = self._torch.linalg.vector_norm(quaternion)
         if bool((~self._torch.isfinite(norm) | (norm <= 1.0e-7)).item()):
             raise WarpBatchError("reference quaternion must have a finite non-zero norm")
-        self._reference_root_quaternion.copy_(quaternion / norm)
-        self._reference_root_height = float(root_height_m)
+        self._reference_root_quaternion.copy_(
+            (quaternion / norm).unsqueeze(0).expand_as(self._reference_root_quaternion)
+        )
+        self._reference_root_height.fill_(float(root_height_m))
+
+    def set_fall_guard_references(
+        self,
+        quaternions: Any,
+        root_heights_m: Any,
+        world_mask: Any | None = None,
+    ) -> None:
+        """Set masked, per-world CUDA fall-guard references at reset time.
+
+        This method intentionally validates and updates only resident CUDA
+        buffers.  It is a reset-boundary API, never a per-substep model
+        mutation.  Invalid references fail before they can weaken the
+        independent raw-physics fall guard.
+        """
+
+        quaternions = self._require_cuda_tensor(
+            quaternions,
+            (self.num_worlds, 4),
+            "reference quaternions",
+            dtype=self._torch.float32,
+        )
+        root_heights_m = self._require_cuda_tensor(
+            root_heights_m,
+            (self.num_worlds,),
+            "reference root heights",
+            dtype=self._torch.float32,
+        )
+        if world_mask is None:
+            world_mask = self._all_worlds
+        else:
+            world_mask = self._require_cuda_tensor(
+                world_mask, (self.num_worlds,), "world_mask", dtype=self._torch.bool
+            )
+        norms = self._torch.linalg.vector_norm(quaternions, dim=1)
+        invalid = world_mask & (
+            ~self._torch.isfinite(norms)
+            | (norms <= 1.0e-7)
+            | ~self._torch.isfinite(root_heights_m)
+        )
+        # A reset-boundary host read is intentional: accepting an invalid
+        # reference would silently turn an independent safety guard into a
+        # no-op for that world.
+        if bool(invalid.any().item()):
+            raise WarpBatchError("fall-guard references must be finite with non-zero quaternions")
+        normalized = quaternions / norms.clamp_min(1.0e-7).unsqueeze(1)
+        self._reference_root_quaternion[world_mask] = normalized[world_mask]
+        self._reference_root_height[world_mask] = root_heights_m[world_mask]
+
+    def update_fall_guard_reference_heights(
+        self,
+        root_heights_m: Any,
+        world_mask: Any,
+    ) -> None:
+        """Update support-relative heights on CUDA without a host sync.
+
+        Route tasks call this only for worlds with confirmed two-sided support.
+        A non-finite candidate is a P0 fault: it is latched immediately rather
+        than being copied into the independent fall guard.
+        """
+
+        root_heights_m = self._require_cuda_tensor(
+            root_heights_m,
+            (self.num_worlds,),
+            "reference root heights",
+            dtype=self._torch.float32,
+        )
+        world_mask = self._require_cuda_tensor(
+            world_mask, (self.num_worlds,), "world_mask", dtype=self._torch.bool
+        )
+        invalid = world_mask & ~self._torch.isfinite(root_heights_m)
+        self._step_failures.logical_or_(invalid)
+        self._estopped.logical_or_(invalid)
+        valid = world_mask & ~invalid
+        self._reference_root_height_candidate.copy_(self._reference_root_height)
+        self._reference_root_height_candidate[valid] = root_heights_m[valid]
+        self._reference_root_height.copy_(self._reference_root_height_candidate)
+        self._safe_controls.masked_fill_(self._estopped.unsqueeze(1), 0.0)
+        self._safe_applied_forces.masked_fill_(self._estopped.unsqueeze(1), 0.0)
+        self._warp.copy(self.data.ctrl, self._safe_controls_warp)
+        self._warp.copy(self.data.qfrc_applied, self._safe_applied_forces_warp)
 
     def _rated_control_limits(self) -> tuple[np.ndarray, np.ndarray]:
         return _signed_rated_control_limits(self.host_model, self.config.safety.torque_fraction_of_rated)
+
+    def _initialize_generalized_force_budget(
+        self,
+        control_low: np.ndarray,
+        control_high: np.ndarray,
+    ) -> None:
+        """Build a conservative per-DOF 80% force budget once at startup.
+
+        ``qfrc_applied`` bypasses MuJoCo actuator clipping.  The batch
+        therefore accounts for the already-staged actuator contribution and
+        rejects any additional generalized force that would exceed the same
+        derated actuator torque envelope.  Non-actuated DOFs receive a zero
+        external-force budget by design.
+        """
+
+        model = self.host_model
+        nv = int(model.nv)
+        joint_transmission = int(self._mujoco.mjtTrn.mjTRN_JOINT)
+        actuator_indices: list[int] = []
+        actuator_dofs: list[int] = []
+        actuator_gears: list[float] = []
+        force_limits = np.zeros(nv, dtype=np.float32)
+        for actuator_id in range(self.num_actuators):
+            if int(model.actuator_trntype[actuator_id]) != joint_transmission:
+                continue
+            joint_id = int(model.actuator_trnid[actuator_id, 0])
+            if joint_id < 0 or joint_id >= int(model.njnt):
+                raise WarpBatchError("joint-transmission actuator has an invalid target joint")
+            dof = int(model.jnt_dofadr[joint_id])
+            if dof < 0 or dof >= nv:
+                raise WarpBatchError("joint-transmission actuator target has an invalid DOF")
+            gear = float(model.actuator_gear[actuator_id, 0])
+            if not np.isfinite(gear) or abs(gear) <= 1.0e-9:
+                raise WarpBatchError("joint-transmission actuator gear must be finite and non-zero")
+            torque_cap = max(abs(float(control_low[actuator_id])), abs(float(control_high[actuator_id]))) * abs(gear)
+            if not np.isfinite(torque_cap) or torque_cap <= 0.0:
+                raise WarpBatchError("joint-transmission actuator has no finite derated torque capacity")
+            actuator_indices.append(actuator_id)
+            actuator_dofs.append(dof)
+            actuator_gears.append(gear)
+            force_limits[dof] += torque_cap
+        self._generalized_force_limit = self._torch.as_tensor(
+            force_limits, dtype=self._torch.float32, device=self.device
+        )
+        self._force_budget_actuator_indices = self._torch.as_tensor(
+            actuator_indices, dtype=self._torch.long, device=self.device
+        )
+        self._force_budget_dofs = self._torch.as_tensor(
+            actuator_dofs, dtype=self._torch.long, device=self.device
+        )
+        self._force_budget_gears = self._torch.as_tensor(
+            actuator_gears, dtype=self._torch.float32, device=self.device
+        )
+        count = len(actuator_indices)
+        self._actuator_force_controls = self._torch.empty(
+            (self.num_worlds, count), dtype=self._torch.float32, device=self.device
+        )
+        self._actuator_generalized_force = self._torch.zeros(
+            (self.num_worlds, nv), dtype=self._torch.float32, device=self.device
+        )
+        self._applied_force_lower = self._torch.empty_like(self._actuator_generalized_force)
+        self._applied_force_upper = self._torch.empty_like(self._actuator_generalized_force)
 
     def _require_cuda_tensor(self, value: Any, shape: tuple[int, ...], name: str, *, dtype: Any | None = None) -> Any:
         if not isinstance(value, self._torch.Tensor):
@@ -1131,7 +1398,7 @@ class WarpPhysicsBatch:
         self._warp.copy(self.data.ctrl, self._safe_controls_warp)
 
     def _stage_applied_forces(self, applied_forces: Any | None) -> None:
-        """Stage finite generalized forces without retaining stale inputs."""
+        """Stage finite, jointly derated generalized forces on CUDA."""
 
         if applied_forces is None:
             self._safe_applied_forces.zero_()
@@ -1147,6 +1414,38 @@ class WarpPhysicsBatch:
             self._safe_applied_forces.copy_(
                 self._torch.nan_to_num(applied_forces, nan=0.0, posinf=0.0, neginf=0.0)
             )
+            # Account for physical actuator torque already staged this
+            # substep.  A direct jump supervisor may only use the remaining
+            # 80%-rated generalized-force headroom on the same DOF.
+            self._actuator_generalized_force.zero_()
+            if self._force_budget_dofs.numel() > 0:
+                self._torch.index_select(
+                    self._safe_controls,
+                    1,
+                    self._force_budget_actuator_indices,
+                    out=self._actuator_force_controls,
+                )
+                self._actuator_force_controls.mul_(self._force_budget_gears.unsqueeze(0))
+                self._actuator_generalized_force.index_add_(
+                    1,
+                    self._force_budget_dofs,
+                    self._actuator_force_controls,
+                )
+            self._torch.sub(
+                -self._generalized_force_limit.unsqueeze(0),
+                self._actuator_generalized_force,
+                out=self._applied_force_lower,
+            )
+            self._torch.sub(
+                self._generalized_force_limit.unsqueeze(0),
+                self._actuator_generalized_force,
+                out=self._applied_force_upper,
+            )
+            force_out_of_budget = (
+                (self._safe_applied_forces < self._applied_force_lower)
+                | (self._safe_applied_forces > self._applied_force_upper)
+            ).any(dim=1)
+            self._step_failures.logical_or_(force_out_of_budget)
         self._estopped.logical_or_(self._step_failures)
         self._safe_applied_forces.masked_fill_(self._estopped.unsqueeze(1), 0.0)
         self._warp.copy(self.data.qfrc_applied, self._safe_applied_forces_warp)
@@ -1162,7 +1461,7 @@ class WarpPhysicsBatch:
             root_quaternion = self.qpos[:, self._root_qpos_address + 3 : self._root_qpos_address + 7]
             quaternion_norm = self._torch.linalg.vector_norm(root_quaternion, dim=1)
             normalized_quaternion = root_quaternion / quaternion_norm.clamp_min(1.0e-7).unsqueeze(1)
-            dot = (normalized_quaternion * self._reference_root_quaternion.unsqueeze(0)).sum(dim=1).abs()
+            dot = (normalized_quaternion * self._reference_root_quaternion).sum(dim=1).abs()
             attitude_error = 2.0 * self._torch.acos(dot.clamp(min=-1.0, max=1.0))
             root_height = self.qpos[:, self._root_qpos_address + 2]
             fall_guard_failed = (attitude_error > self.config.fall_guard.max_attitude_error_rad) | (

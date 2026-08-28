@@ -1,0 +1,16 @@
+# Python caches and local editor state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.vscode/
+
+# Runtime scratch directories created by temporary-file APIs
+tmp*/
+
+# Local MuJoCo diagnostics
+MUJOCO_LOG.TXT
+
+# Generated training outputs (keep only explicitly curated artifacts)
+artifacts/*.pt
+artifacts/*.csv

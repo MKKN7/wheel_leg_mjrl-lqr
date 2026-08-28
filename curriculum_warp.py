@@ -23,7 +23,7 @@ FLAT_TASK_MODE = "flat_vehicle_domain_randomization"
 FIXED_GAIN_BACKEND = "fixed_gain_flat_controller_v2"
 OBSERVATION_SIZE = 67
 ACTION_SIZE = 7
-REWARD_SCHEMA = "warp_flat_walking_reward_v1"
+REWARD_SCHEMA = "warp_flat_terrain_compensated_reward_v2"
 _EXPECTED_ACTION_MASK = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
 _PHYSICAL_DR_FIELDS = (
     "body_mass",
@@ -247,9 +247,34 @@ def _make_stability_gate(batch: Any, task: Any, duration_seconds: float) -> Call
         terminated_seen = torch.zeros(batch.num_worlds, dtype=torch.bool, device=batch.device)
         overflow_seen = torch.zeros_like(terminated_seen)
         estopped_seen = torch.zeros_like(terminated_seen)
+        finite_reward = torch.ones((), dtype=torch.bool, device=batch.device)
+        finite_reward_terms = torch.ones((), dtype=torch.bool, device=batch.device)
+        finite_reward_values = torch.empty_like(terminated_seen)
+        finite_reward_step = torch.empty((), dtype=torch.bool, device=batch.device)
+        finite_reward_terms_step = torch.empty((), dtype=torch.bool, device=batch.device)
         task.reset()
         for _ in range(policy_steps):
             result = task.step(zero_action)
+            reward_value = getattr(result, "reward", None)
+            if isinstance(reward_value, torch.Tensor) and tuple(reward_value.shape) == (batch.num_worlds,):
+                finite_reward_values.copy_(torch.isfinite(reward_value))
+                torch.all(finite_reward_values, out=finite_reward_step)
+                finite_reward.logical_and_(finite_reward_step)
+            else:
+                finite_reward.zero_()
+            finite_reward_terms_step.fill_(True)
+            reward_terms = getattr(task, "_reward_terms", None)
+            if not isinstance(reward_terms, Mapping) or not reward_terms:
+                finite_reward_terms_step.zero_()
+            else:
+                for reward_term in reward_terms.values():
+                    if not isinstance(reward_term, torch.Tensor) or tuple(reward_term.shape) != (batch.num_worlds,):
+                        finite_reward_terms_step.zero_()
+                        break
+                    finite_reward_values.copy_(torch.isfinite(reward_term))
+                    torch.all(finite_reward_values, out=finite_reward_step)
+                    finite_reward_terms_step.logical_and_(finite_reward_step)
+            finite_reward_terms.logical_and_(finite_reward_terms_step)
             terminated_seen.logical_or_(result.terminated)
             overflow_seen.logical_or_(batch.overflow.ne(0))
             estopped_seen.logical_or_(batch.estopped)
@@ -259,9 +284,11 @@ def _make_stability_gate(batch: Any, task: Any, duration_seconds: float) -> Call
             overflow_seen.sum(dtype=torch.int64),
             estopped_seen.sum(dtype=torch.int64),
             finite_state.to(dtype=torch.int64),
+            finite_reward.to(dtype=torch.int64),
+            finite_reward_terms.to(dtype=torch.int64),
         ))
         torch.cuda.synchronize(batch.device)
-        terminated_worlds, overflowed_worlds, estopped_worlds, finite_state_flag = (
+        terminated_worlds, overflowed_worlds, estopped_worlds, finite_state_flag, finite_reward_flag, finite_reward_terms_flag = (
             int(value) for value in summary.detach().cpu().tolist()
         )
         report: Mapping[str, Any] = {
@@ -274,6 +301,8 @@ def _make_stability_gate(batch: Any, task: Any, duration_seconds: float) -> Call
             "overflowed_worlds": overflowed_worlds,
             "estopped_worlds": estopped_worlds,
             "finite_state": bool(finite_state_flag),
+            "finite_reward": bool(finite_reward_flag),
+            "finite_reward_terms": bool(finite_reward_terms_flag),
             "zero_residual": True,
             "domain_randomization_enabled": True,
         }
@@ -281,11 +310,19 @@ def _make_stability_gate(batch: Any, task: Any, duration_seconds: float) -> Call
         # profiles after the gate.  This is a CUDA reset-boundary operation,
         # not a per-substep model mutation.
         task.reset()
-        if terminated_worlds or overflowed_worlds or estopped_worlds or not finite_state_flag:
+        if (
+            terminated_worlds
+            or overflowed_worlds
+            or estopped_worlds
+            or not finite_state_flag
+            or not finite_reward_flag
+            or not finite_reward_terms_flag
+        ):
             raise WarpCurriculumStageError(
                 "rmuc_flat_dr nominal stability gate failed: "
                 f"terminated={terminated_worlds}, overflowed={overflowed_worlds}, "
                 f"estopped={estopped_worlds}, finite_state={bool(finite_state_flag)}, "
+                f"finite_reward={bool(finite_reward_flag)}, finite_reward_terms={bool(finite_reward_terms_flag)}, "
                 f"duration={policy_steps * action_dt:.6f}s"
             )
         cache["report"] = report

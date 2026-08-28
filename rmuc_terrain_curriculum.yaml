@@ -273,6 +273,17 @@ stages:
     minimum_completion_rate: 0.90
     command_speed_scale: 0.50
     command_yaw_rate_scale: 0.35
+  # Dedicated one-task CUDA direct-jump exercise.  It intentionally excludes
+  # stair_down: the upward 204 mm riser is negotiated by the task-owned
+  # supervisor, whereas descent remains a separate route-control problem.
+  - id: stair_jump
+    task_ids:
+      - stair_up
+    evaluation_episodes: 100
+    maximum_unsafe_rate: 0.09
+    minimum_completion_rate: 0.90
+    command_speed_scale: 1.0
+    command_yaw_rate_scale: 1.0
   - id: dynamic_locomotion
     # The normal dynamic stage keeps turning conservative; high-speed
     # acceleration turns are available only through high_speed_turn above.

@@ -34,12 +34,13 @@ from warp_env import (
 from warp_flat_controller import WarpFlatControllerConfig
 
 
-FLAT_PPO_CONFIG_SCHEMA = 2
+FLAT_PPO_CONFIG_SCHEMA = 3
 FLAT_PPO_CHECKPOINT_FORMAT = 2
 FLAT_PPO_BACKEND = "mujoco_warp_flat_ppo_fixed_gain_v2"
 FIXED_GAIN_CONTROLLER_BACKEND = "fixed_gain_flat_controller_v2"
 OBSERVATION_SIZE = 67
 ACTION_SIZE = 7
+REWARD_SCHEMA = "warp_flat_terrain_compensated_reward_v2"
 
 _FLAT_WALKING_KEYS = {
     "command_speed_mps",
@@ -56,6 +57,7 @@ _FLAT_WALKING_KEYS = {
     "safety_leg_length_min_m",
     "safety_leg_length_max_m",
     "max_leg_length_difference_m",
+    "terrain_compensated_leg_reward",
     "direct_control_mode",
     "residual_limits",
     "leg_action_enabled",
@@ -147,6 +149,7 @@ class StabilityGateConfig:
 class FlatPpoTrainingConfig:
     source_path: Path
     backend: str
+    reward_schema: str
     batch_config_path: Path
     flat_walking: dict[str, Any]
     flat_controller: WarpFlatControllerConfig
@@ -168,6 +171,8 @@ class StabilityGateReport:
     overflowed_worlds: int
     estopped_worlds: int
     finite_state: bool
+    finite_reward: bool
+    finite_reward_terms: bool
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -424,7 +429,7 @@ def load_flat_ppo_training_config(path: str | Path) -> FlatPpoTrainingConfig:
         raise WarpFlatPpoConfigError(f"unable to read flat PPO configuration {source_path}: {error}") from error
     root = _mapping(raw, "flat PPO configuration")
     expected = {
-        "schema_version", "backend", "batch_config", "flat_walking", "flat_controller", "ppo",
+        "schema_version", "backend", "reward_schema", "batch_config", "flat_walking", "flat_controller", "ppo",
         "output", "smoke", "scope", "stability_gate",
     }
     _expect_exact_keys(root, "flat PPO configuration", expected)
@@ -433,6 +438,9 @@ def load_flat_ppo_training_config(path: str | Path) -> FlatPpoTrainingConfig:
     backend = _string(_required(root, "backend"), "backend")
     if backend != FLAT_PPO_BACKEND:
         raise WarpFlatPpoConfigError(f"backend must be {FLAT_PPO_BACKEND!r}")
+    reward_schema = _string(_required(root, "reward_schema"), "reward_schema")
+    if reward_schema != REWARD_SCHEMA:
+        raise WarpFlatPpoConfigError(f"reward_schema must be {REWARD_SCHEMA!r}")
     flat_walking = _load_flat_walking_config(_mapping(_required(root, "flat_walking"), "flat_walking"))
     flat_controller = _load_flat_controller_config(
         _mapping(_required(root, "flat_controller"), "flat_controller")
@@ -452,6 +460,7 @@ def load_flat_ppo_training_config(path: str | Path) -> FlatPpoTrainingConfig:
     return FlatPpoTrainingConfig(
         source_path=source_path,
         backend=backend,
+        reward_schema=reward_schema,
         batch_config_path=_resolve_path(source_path, _required(root, "batch_config"), "batch_config"),
         flat_walking=flat_walking,
         flat_controller=flat_controller,
@@ -505,9 +514,34 @@ def _run_zero_residual_stability_gate(
     terminated_seen = torch.zeros(batch.num_worlds, dtype=torch.bool, device=batch.device)
     overflow_seen = torch.zeros_like(terminated_seen)
     estopped_seen = torch.zeros_like(terminated_seen)
+    finite_reward = torch.ones((), dtype=torch.bool, device=batch.device)
+    finite_reward_terms = torch.ones((), dtype=torch.bool, device=batch.device)
+    finite_reward_values = torch.empty_like(terminated_seen)
+    finite_reward_step = torch.empty((), dtype=torch.bool, device=batch.device)
+    finite_reward_terms_step = torch.empty((), dtype=torch.bool, device=batch.device)
     task.reset()
     for _ in range(policy_steps):
         result = task.step(zero_action)
+        reward_value = getattr(result, "reward", None)
+        if isinstance(reward_value, torch.Tensor) and tuple(reward_value.shape) == (batch.num_worlds,):
+            finite_reward_values.copy_(torch.isfinite(reward_value))
+            torch.all(finite_reward_values, out=finite_reward_step)
+            finite_reward.logical_and_(finite_reward_step)
+        else:
+            finite_reward.zero_()
+        finite_reward_terms_step.fill_(True)
+        reward_terms = getattr(task, "_reward_terms", None)
+        if not isinstance(reward_terms, Mapping) or not reward_terms:
+            finite_reward_terms_step.zero_()
+        else:
+            for reward_term in reward_terms.values():
+                if not isinstance(reward_term, torch.Tensor) or tuple(reward_term.shape) != (batch.num_worlds,):
+                    finite_reward_terms_step.zero_()
+                    break
+                finite_reward_values.copy_(torch.isfinite(reward_term))
+                torch.all(finite_reward_values, out=finite_reward_step)
+                finite_reward_terms_step.logical_and_(finite_reward_step)
+        finite_reward_terms.logical_and_(finite_reward_terms_step)
         terminated_seen.logical_or_(result.terminated)
         overflow_seen.logical_or_(batch.overflow.ne(0))
         estopped_seen.logical_or_(batch.estopped)
@@ -517,9 +551,11 @@ def _run_zero_residual_stability_gate(
         overflow_seen.sum(dtype=torch.int64),
         estopped_seen.sum(dtype=torch.int64),
         finite_state.to(dtype=torch.int64),
+        finite_reward.to(dtype=torch.int64),
+        finite_reward_terms.to(dtype=torch.int64),
     ))
     torch.cuda.synchronize(batch.device)
-    terminated_worlds, overflowed_worlds, estopped_worlds, finite_state_flag = (
+    terminated_worlds, overflowed_worlds, estopped_worlds, finite_state_flag, finite_reward_flag, finite_reward_terms_flag = (
         int(value) for value in summary.detach().cpu().tolist()
     )
     report = StabilityGateReport(
@@ -531,6 +567,8 @@ def _run_zero_residual_stability_gate(
         overflowed_worlds=overflowed_worlds,
         estopped_worlds=estopped_worlds,
         finite_state=bool(finite_state_flag),
+        finite_reward=bool(finite_reward_flag),
+        finite_reward_terms=bool(finite_reward_terms_flag),
     )
     task.reset()
     if (
@@ -538,11 +576,14 @@ def _run_zero_residual_stability_gate(
         or (config.stability_gate.require_no_overflow and report.overflowed_worlds)
         or report.estopped_worlds
         or (config.stability_gate.require_finite_state and not report.finite_state)
+        or not report.finite_reward
+        or not report.finite_reward_terms
     ):
         raise WarpFlatPpoConfigError(
             "fixed-gain nominal stability gate failed: "
             f"terminated={report.terminated_worlds}, overflowed={report.overflowed_worlds}, "
             f"estopped={report.estopped_worlds}, finite_state={report.finite_state}, "
+            f"finite_reward={report.finite_reward}, finite_reward_terms={report.finite_reward_terms}, "
             f"duration={report.simulated_duration_seconds:.6f}s"
         )
     return report
@@ -576,6 +617,12 @@ def _checkpoint_payload(
         "action_semantics": "seven_dimensional_fixed_gain_residual",
         "observation_size": OBSERVATION_SIZE,
         "action_size": ACTION_SIZE,
+        "reward_schema": config.reward_schema,
+        "reward_terms": (
+            "speed_tracking", "leg_tracking", "terrain_attitude_tracking", "contact", "yaw_tracking",
+            "energy_cost", "residual_cost", "yaw_rate_cost",
+            "terrain_compensated_leg_difference_cost", "unsafe_penalty",
+        ),
         "timesteps": int(timesteps),
         "update_index": int(update_index),
         "smoke": bool(smoke),
@@ -588,6 +635,7 @@ def _checkpoint_payload(
             "command_yaw_rate_rad_s": 0.0,
             "flat_terrain_features_zeroed": True,
             "jump_features_zeroed": True,
+            "terrain_compensated_leg_reward_enabled": True,
         },
         "policy_action_mask": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0],
         "controller_scope": {

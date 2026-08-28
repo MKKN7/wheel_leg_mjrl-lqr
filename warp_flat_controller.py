@@ -805,7 +805,6 @@ class FixedGainFlatController:
         return self._state_error
 
     def _write_gas_spring(self, task: Any, safe_controls: Any | None = None) -> Any:
-        del task
         forces = self._applied_forces
         forces.zero_()
         if self.config.gas_spring_enabled and self._gas_dofs.numel() > 0:
@@ -843,6 +842,16 @@ class FixedGainFlatController:
                 )
                 gas_values = self._gas_applied_values
             forces.index_copy_(1, self._gas_dofs, gas_values)
+        torque_scale = getattr(task, "_controller_torque_scale", None)
+        if torque_scale is not None:
+            if (
+                not isinstance(torque_scale, self.torch.Tensor)
+                or torque_scale.shape != (self.num_worlds,)
+                or torque_scale.device != self.device
+                or torque_scale.dtype != self.torch.float32
+            ):
+                raise ValueError("task controller torque scale must be CUDA float32 [world]")
+            forces.mul_(torque_scale.unsqueeze(1))
         return forces
 
     def applied_generalized_forces(self, task: Any | None = None, *, safe_controls: Any | None = None) -> Any:
@@ -932,6 +941,16 @@ class FixedGainFlatController:
 
         torch.nan_to_num(self._command, nan=0.0, posinf=0.0, neginf=0.0, out=self._command)
         torch.clamp(self._command, min=self._control_low, max=self._control_high, out=self._command)
+        torque_scale = getattr(task, "_controller_torque_scale", None)
+        if torque_scale is not None:
+            if (
+                not isinstance(torque_scale, torch.Tensor)
+                or torque_scale.shape != (self.num_worlds,)
+                or torque_scale.device != self.device
+                or torque_scale.dtype != torch.float32
+            ):
+                raise ValueError("task controller torque scale must be CUDA float32 [world]")
+            self._command.mul_(torque_scale.unsqueeze(1))
         return self._command
 
 

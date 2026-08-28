@@ -1,11 +1,9 @@
 """Capability-gated MuJoCo-Warp curriculum PPO training.
 
-The manifest and stage capability checks run before GPU model allocation.  The
-repository currently proves only the fixed-gain flat task; RMUC grades,
-steps/jumps, and domain-randomized turning remain blocked until a GPU task
-backend publishes matching parity evidence.  External backends may register a
-``GPU_CURRICULUM_CAPABILITIES`` mapping and a ``build_curriculum_stage``
-factory in ``warp_curriculum_task``.
+    The manifest and stage capability checks run before GPU model allocation.
+    External backends publish a ``GPU_CURRICULUM_CAPABILITIES`` mapping and a
+    ``build_curriculum_stage`` factory.  Every non-flat curriculum stage remains
+    conditional until its own real CUDA runtime gate passes.
 """
 
 from __future__ import annotations
@@ -26,14 +24,16 @@ import numpy as np
 import yaml
 
 
-CURRICULUM_CONFIG_SCHEMA = 2
+CURRICULUM_CONFIG_SCHEMA = 3
 CURRICULUM_CHECKPOINT_FORMAT = 2
 CURRICULUM_BACKEND = "mujoco_warp_curriculum_ppo_v2"
 FLAT_BACKEND = "mujoco_warp_flat_ppo_fixed_gain_v2"
 FLAT_CONTROLLER_BACKEND = "fixed_gain_flat_controller_v2"
+GATE_EVIDENCE_SCHEMA = 2
 OBSERVATION_SIZE = 67
 ACTION_SIZE = 7
-REWARD_SCHEMA = "warp_flat_walking_reward_v1"
+REWARD_SCHEMA = "warp_flat_terrain_compensated_reward_v2"
+LEGACY_FLAT_REWARD_SCHEMA = "warp_flat_walking_reward_v1"
 ACTION_SEMANTICS = "seven_dimensional_fixed_gain_residual"
 
 
@@ -91,6 +91,7 @@ class StageConfig:
     command_yaw_rate_rad_s: float
     residual_action_mask: tuple[float, ...]
     requires_gpu_parity: bool
+    prerequisite_stage_ids: tuple[str, ...] = ()
     adapter_config_path: Path | None = None
     scene_variant: str = "canonical"
     reward_schema: str | None = None
@@ -139,6 +140,19 @@ class GpuStageCapability:
     action_size: int = ACTION_SIZE
     reward_schema: str = REWARD_SCHEMA
     runtime_gate_required: bool = False
+
+
+@dataclass(frozen=True)
+class CourseEvaluationResult:
+    """Host summary of a post-training, CUDA-resident course evaluation."""
+
+    stage_id: str
+    episodes: int
+    completion_rate: float
+    unsafe_rate: float
+    speed_mae_mps: float
+    yaw_mae_rad: float
+    passed: bool
 
 
 @dataclass(frozen=True)
@@ -338,7 +352,7 @@ def _load_stage(raw: Mapping[str, Any], source: Path, index: int) -> StageConfig
         "steps_enabled", "domain_randomization_enabled", "command_speed_mps", "command_yaw_rate_rad_s",
         "residual_action_mask", "requires_gpu_parity", "terrain_curriculum_path", "terrain_stage_id",
     }
-    optional = {"adapter_config_path", "scene_variant", "reward_schema"}
+    optional = {"adapter_config_path", "scene_variant", "reward_schema", "prerequisite_stage_ids"}
     actual = set(raw)
     missing = sorted(expected - actual)
     unknown = sorted(actual - expected - optional)
@@ -363,6 +377,15 @@ def _load_stage(raw: Mapping[str, Any], source: Path, index: int) -> StageConfig
     yaw = _finite_float(_required(raw, "command_yaw_rate_rad_s"), f"{name}.command_yaw_rate_rad_s")
     if abs(speed) > 3.0 or abs(yaw) > 0.45:
         raise WarpCurriculumConfigError(f"{name} command exceeds GPU task limits")
+    prerequisites_raw = raw.get("prerequisite_stage_ids", [])
+    if not isinstance(prerequisites_raw, list):
+        raise WarpCurriculumConfigError(f"{name}.prerequisite_stage_ids must be a sequence")
+    prerequisites = tuple(
+        _string(value, f"{name}.prerequisite_stage_ids[{index}]")
+        for index, value in enumerate(prerequisites_raw)
+    )
+    if len(set(prerequisites)) != len(prerequisites):
+        raise WarpCurriculumConfigError(f"{name}.prerequisite_stage_ids must not contain duplicates")
     stage = StageConfig(
         stage_id=_string(_required(raw, "id"), f"{name}.id"),
         task_mode=_string(_required(raw, "task_mode"), f"{name}.task_mode"),
@@ -385,6 +408,7 @@ def _load_stage(raw: Mapping[str, Any], source: Path, index: int) -> StageConfig
         command_yaw_rate_rad_s=yaw,
         residual_action_mask=mask,
         requires_gpu_parity=_boolean(_required(raw, "requires_gpu_parity"), f"{name}.requires_gpu_parity"),
+        prerequisite_stage_ids=prerequisites,
         adapter_config_path=(
             None
             if "adapter_config_path" not in raw
@@ -499,6 +523,17 @@ def load_curriculum_config(path: str | Path) -> CurriculumConfig:
     stage_ids = [stage.stage_id for stage in stages]
     if len(set(stage_ids)) != len(stage_ids):
         raise WarpCurriculumConfigError("curriculum.stages contains duplicate ids")
+    stage_positions = {stage_id: index for index, stage_id in enumerate(stage_ids)}
+    for index, stage in enumerate(stages):
+        for prerequisite in stage.prerequisite_stage_ids:
+            if prerequisite not in stage_positions:
+                raise WarpCurriculumConfigError(
+                    f"stage {stage.stage_id!r} references an unknown prerequisite {prerequisite!r}"
+                )
+            if prerequisite == stage.stage_id or stage_positions[prerequisite] >= index:
+                raise WarpCurriculumConfigError(
+                    f"stage {stage.stage_id!r} prerequisite {prerequisite!r} must occur earlier in the YAML order"
+                )
     capabilities_raw = _mapping(_required(root, "capabilities"), "capabilities")
     _exact_keys(capabilities_raw, "capabilities", {"require_gpu_parity", "allow_external_task_factory"})
     require_gpu_parity = _boolean(_required(capabilities_raw, "require_gpu_parity"), "capabilities.require_gpu_parity")
@@ -558,6 +593,8 @@ def gpu_stage_capability(stage_id: str, *, allow_external: bool = True) -> GpuSt
     if allow_external:
         for module_name in (
             "warp_curriculum_task",
+            "rmuc_curriculum_warp",
+            "official_course_warp",
             "official_curriculum_warp",
             "curriculum_warp",
             "warp_task",
@@ -624,6 +661,40 @@ def validate_stage_capability(config: CurriculumConfig, stage: StageConfig) -> G
     return capability
 
 
+def _validate_course_certificate(
+    metadata: Mapping[str, Any], *, config: CurriculumConfig, source_stage_id: str
+) -> None:
+    """Reject candidate, smoke, or unsigned CUDA-stage checkpoints as warm starts."""
+
+    if metadata.get("artifact_status") != "certified":
+        raise WarpCurriculumConfigError("GPU curriculum warm start is not a certified checkpoint")
+    certificate = metadata.get("course_certificate")
+    evaluation = metadata.get("course_evaluation")
+    if not isinstance(certificate, Mapping) or not isinstance(evaluation, Mapping):
+        raise WarpCurriculumConfigError("GPU curriculum warm start is missing stage-promotion evidence")
+    if (
+        certificate.get("certificate_schema") != 1
+        or certificate.get("passed") is not True
+        or certificate.get("stage_id") != source_stage_id
+        or evaluation.get("passed") is not True
+        or evaluation.get("stage_id") != source_stage_id
+    ):
+        raise WarpCurriculumConfigError("GPU curriculum warm start has an invalid stage-promotion certificate")
+    try:
+        source_stage = config.stage(source_stage_id)
+    except WarpCurriculumConfigError as error:
+        raise WarpCurriculumConfigError("GPU curriculum warm start names an unknown certificate stage") from error
+    if certificate.get("curriculum_config_sha256") != config.source_digest:
+        raise WarpCurriculumConfigError("GPU curriculum warm start certificate uses a different curriculum YAML")
+    expected_adapter_digest = (
+        None
+        if source_stage.adapter_config_path is None
+        else hashlib.sha256(source_stage.adapter_config_path.read_bytes()).hexdigest()
+    )
+    if certificate.get("adapter_config_sha256") != expected_adapter_digest:
+        raise WarpCurriculumConfigError("GPU curriculum warm start certificate adapter provenance mismatches YAML")
+
+
 def validate_checkpoint_metadata(
     metadata: Mapping[str, Any], *, config: CurriculumConfig, stage: StageConfig
 ) -> None:
@@ -660,6 +731,22 @@ def validate_checkpoint_metadata(
             raise WarpCurriculumConfigError("residual checkpoint format version is incompatible with its backend")
         if metadata.get("action_semantics") not in {ACTION_SEMANTICS, "seven_dimensional_fixed_gain_residual"}:
             raise WarpCurriculumConfigError("residual checkpoint action semantics are incompatible")
+    source_stage_id = metadata.get("stage_id")
+    explicit_predecessor = bool(
+        not cpu_transfer
+        and backend == CURRICULUM_BACKEND
+        and isinstance(source_stage_id, str)
+        and source_stage_id in stage.prerequisite_stage_ids
+    )
+    exact_gpu_stage = bool(
+        not cpu_transfer and backend == CURRICULUM_BACKEND and source_stage_id == stage.stage_id
+    )
+    if not cpu_transfer and backend == CURRICULUM_BACKEND:
+        if not (explicit_predecessor or exact_gpu_stage):
+            raise WarpCurriculumConfigError(
+                "GPU curriculum warm start must be the selected stage or an explicitly declared prerequisite"
+            )
+        _validate_course_certificate(metadata, config=config, source_stage_id=str(source_stage_id))
     expected_reward_schema = stage.reward_schema or config.reward_schema
     saved_reward = metadata.get("reward_schema")
     if cpu_transfer:
@@ -679,6 +766,7 @@ def validate_checkpoint_metadata(
         # exact flat task; arbitrary legacy checkpoints remain rejected.
         if (
             backend == FLAT_BACKEND
+            and expected_reward_schema == LEGACY_FLAT_REWARD_SCHEMA
             and isinstance(scope, Mapping)
             and scope.get("task_mode") == "flat_walking_only"
             and scope.get("terrain_enabled") is False
@@ -687,41 +775,60 @@ def validate_checkpoint_metadata(
             and scope.get("flat_terrain_features_zeroed") is True
             and scope.get("jump_features_zeroed") is True
         ):
-            saved_reward = REWARD_SCHEMA
+            saved_reward = LEGACY_FLAT_REWARD_SCHEMA
         else:
             raise WarpCurriculumConfigError("residual checkpoint is missing an auditable reward schema")
-    if not cpu_transfer and saved_reward != expected_reward_schema:
+    if not cpu_transfer and saved_reward != expected_reward_schema and not explicit_predecessor:
         raise WarpCurriculumConfigError("residual checkpoint reward schema is incompatible")
-    if stage.reward_schema is not None and not cpu_transfer:
+    if not cpu_transfer and backend == CURRICULUM_BACKEND:
         scope = metadata.get("stage_scope")
         if not isinstance(scope, Mapping):
-            raise WarpCurriculumConfigError("official checkpoint is missing auditable stage_scope provenance")
-        for name, expected in (
-            ("task_mode", stage.task_mode),
-            ("xml_path", str(stage.xml_path)),
-            ("scene_variant", stage.scene_variant),
-            ("terrain_curriculum_path", str(stage.terrain_curriculum_path)),
-            ("terrain_stage_id", stage.terrain_stage_id),
-            ("controller_backend", stage.controller_backend),
-        ):
-            if scope.get(name) != expected:
-                raise WarpCurriculumConfigError(f"checkpoint stage_scope.{name} does not match the selected official stage")
+            raise WarpCurriculumConfigError("GPU curriculum checkpoint is missing auditable stage_scope provenance")
+        if not explicit_predecessor:
+            for name, expected in (
+                ("task_mode", stage.task_mode),
+                ("xml_path", str(stage.xml_path)),
+                ("scene_variant", stage.scene_variant),
+                ("terrain_curriculum_path", str(stage.terrain_curriculum_path)),
+                ("terrain_stage_id", stage.terrain_stage_id),
+                ("controller_backend", stage.controller_backend),
+            ):
+                if scope.get(name) != expected:
+                    raise WarpCurriculumConfigError(f"checkpoint stage_scope.{name} does not match the selected curriculum stage")
         experiment = metadata.get("experiment_config")
         if not isinstance(experiment, Mapping):
-            raise WarpCurriculumConfigError("official checkpoint is missing experiment_config provenance")
-        digest_fields: tuple[tuple[str, Path], ...] = (
-            ("xml_sha256", stage.xml_path),
-            ("terrain_curriculum_sha256", stage.terrain_curriculum_path),
-        )
-        if stage.adapter_config_path is not None:
-            digest_fields += (("adapter_config_sha256", stage.adapter_config_path),)
-        for field, path in digest_fields:
-            try:
-                expected_digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
-            except OSError as error:
-                raise WarpCurriculumConfigError(f"unable to hash official provenance file {path}") from error
-            if experiment.get(field) != expected_digest:
-                raise WarpCurriculumConfigError(f"official checkpoint provenance digest mismatch for {field}")
+            raise WarpCurriculumConfigError("GPU curriculum checkpoint is missing experiment_config provenance")
+        if explicit_predecessor:
+            for field in (
+                "xml_sha256",
+                "terrain_curriculum_sha256",
+                "flat_ppo_config_sha256",
+            ):
+                value = experiment.get(field)
+                if not isinstance(value, str) or len(value) != 64:
+                    raise WarpCurriculumConfigError("prerequisite checkpoint provenance is incomplete")
+            source_stage = config.stage(str(source_stage_id))
+            adapter_digest = experiment.get("adapter_config_sha256")
+            if source_stage.adapter_config_path is None:
+                if adapter_digest is not None:
+                    raise WarpCurriculumConfigError("flat prerequisite checkpoint must not claim an adapter digest")
+            elif not isinstance(adapter_digest, str) or len(adapter_digest) != 64:
+                raise WarpCurriculumConfigError("prerequisite checkpoint adapter provenance is incomplete")
+        else:
+            digest_fields: tuple[tuple[str, Path], ...] = (
+                ("xml_sha256", stage.xml_path),
+                ("terrain_curriculum_sha256", stage.terrain_curriculum_path),
+                ("flat_ppo_config_sha256", config.flat_ppo_config_path),
+            )
+            if stage.adapter_config_path is not None:
+                digest_fields += (("adapter_config_sha256", stage.adapter_config_path),)
+            for field, path in digest_fields:
+                try:
+                    expected_digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                except OSError as error:
+                    raise WarpCurriculumConfigError(f"unable to hash curriculum provenance file {path}") from error
+                if experiment.get(field) != expected_digest:
+                    raise WarpCurriculumConfigError(f"GPU curriculum checkpoint provenance digest mismatch for {field}")
     mask = metadata.get("policy_action_mask")
     if not cpu_transfer:
         if not isinstance(mask, (list, tuple)) or len(mask) != config.action_size:
@@ -767,23 +874,37 @@ def load_residual_checkpoint(
 
 def build_checkpoint_metadata(
     *, config: CurriculumConfig, stage: StageConfig, timesteps: int, update_index: int,
-    source_checkpoint: ResidualCheckpoint | None, batch: Any, smoke: bool
+    source_checkpoint: ResidualCheckpoint | None, batch: Any, task: Any, smoke: bool
 ) -> dict[str, Any]:
     """Create provenance metadata for a curriculum checkpoint."""
 
     reward_schema = stage.reward_schema or config.reward_schema
-    reward_terms = (
-        (
-            "speed_tracking", "leg_tracking", "attitude_tracking", "contact", "yaw_tracking",
-            "energy_cost", "residual_cost", "yaw_rate_cost", "leg_symmetry_cost", "unsafe_penalty",
-            "official_route_progress", "official_route_completion",
-        )
-        if stage.reward_schema is not None
-        else (
-            "speed_tracking", "leg_tracking", "attitude_tracking", "contact", "yaw_tracking",
-            "energy_cost", "residual_cost", "yaw_rate_cost", "leg_symmetry_cost", "unsafe_penalty",
-        )
+    terrain_reward = bool(
+        getattr(getattr(task, "config", None), "terrain_compensated_leg_reward", None)
+        and getattr(task.config.terrain_compensated_leg_reward, "enabled", False)
     )
+    if terrain_reward:
+        if not reward_schema.endswith("_v2"):
+            raise WarpCurriculumConfigError(
+                "terrain-compensated task cannot be checkpointed under a pre-v2 reward schema"
+            )
+        # The task configuration, rather than whether a stage overrides the
+        # global schema, is the source of truth.  This covers the flat and
+        # flat-DR stages as well as terrain route adapters.
+        reward_terms = (
+            "speed_tracking", "leg_tracking", "terrain_attitude_tracking", "contact", "yaw_tracking",
+            "energy_cost", "residual_cost", "yaw_rate_cost",
+            "terrain_compensated_leg_difference_cost", "unsafe_penalty",
+        )
+        if stage.adapter_config_path is not None and stage.stage_id.startswith("official_"):
+            reward_terms += ("official_route", "direct_jump")
+        elif stage.adapter_config_path is not None:
+            reward_terms += ("rmuc_route", "rmuc_direct_jump")
+    else:
+        reward_terms = (
+            "speed_tracking", "leg_tracking", "attitude_tracking", "contact", "yaw_tracking",
+            "energy_cost", "residual_cost", "yaw_rate_cost", "leg_symmetry_cost", "unsafe_penalty",
+        )
     digest = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
     return {
         "format_version": CURRICULUM_CHECKPOINT_FORMAT,
@@ -808,6 +929,7 @@ def build_checkpoint_metadata(
                 None if stage.adapter_config_path is None else str(stage.adapter_config_path)
             ),
             "reward_schema": reward_schema,
+            "terrain_compensated_leg_reward_enabled": terrain_reward,
             "controller_backend": stage.controller_backend,
             "terrain_enabled": stage.terrain_enabled,
             "steps_enabled": stage.steps_enabled,
@@ -815,6 +937,7 @@ def build_checkpoint_metadata(
             "domain_randomization_enabled": stage.domain_randomization_enabled,
             "command_speed_mps": stage.command_speed_mps,
             "command_yaw_rate_rad_s": stage.command_yaw_rate_rad_s,
+            "prerequisite_stage_ids": list(stage.prerequisite_stage_ids),
         },
         "experiment_config": {
             "source_path": str(config.source_path),
@@ -824,6 +947,7 @@ def build_checkpoint_metadata(
             "device": str(batch.device),
             "xml_sha256": digest(stage.xml_path),
             "terrain_curriculum_sha256": digest(stage.terrain_curriculum_path),
+            "flat_ppo_config_sha256": digest(config.flat_ppo_config_path),
             "adapter_config_sha256": (
                 None if stage.adapter_config_path is None else digest(stage.adapter_config_path)
             ),
@@ -882,6 +1006,8 @@ def _external_stage_bundle(config: CurriculumConfig, stage: StageConfig) -> Any:
         )
     for module_name in (
         "warp_curriculum_task",
+        "rmuc_curriculum_warp",
+        "official_course_warp",
         "official_curriculum_warp",
         "curriculum_warp",
     ):
@@ -931,48 +1057,189 @@ def _bundle_value(bundle: Any, name: str, *, required: bool = True) -> Any:
     return value
 
 
-def _validate_runtime_gate_report(
-    report: Any, *, stage: StageConfig, capability: GpuStageCapability
-) -> Mapping[str, Any]:
-    """Validate the minimum evidence required by a conditional GPU stage."""
+def _gate_float(value: Any, name: str, *, nonnegative: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WarpCurriculumConfigError(f"conditional GPU gate field {name!r} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or (nonnegative and result < 0.0):
+        raise WarpCurriculumConfigError(f"conditional GPU gate field {name!r} must be finite")
+    return result
 
+
+def _gate_int(value: Any, name: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise WarpCurriculumConfigError(f"conditional GPU gate field {name!r} must be an integer")
+    if minimum is not None and value < minimum:
+        raise WarpCurriculumConfigError(f"conditional GPU gate field {name!r} is below its allowed range")
+    return int(value)
+
+
+def _validate_gate_pass(
+    value: Any,
+    *,
+    name: str,
+    stage: StageConfig,
+    config: CurriculumConfig,
+    expected_worlds: int,
+    expected_domain_randomization_active: bool,
+) -> Mapping[str, Any]:
+    """Validate one immutable, zero-residual CUDA gate pass."""
+
+    if not isinstance(value, Mapping):
+        raise WarpCurriculumConfigError(f"conditional GPU gate is missing mapping evidence for {name!r}")
+    required = (
+        "passed", "requested_duration_seconds", "simulated_duration_seconds", "policy_steps",
+        "num_worlds", "terminated_worlds", "overflowed_worlds", "estopped_worlds", "finite_state",
+        "finite_reward", "finite_reward_terms",
+        "zero_residual", "domain_randomization_active", "physical_parameter_randomization",
+        "terrain_geometry_randomization", "sensor_noise_std", "control_delay_steps",
+        "minimum_progress_m", "speed_mae_mps", "unsafe_rate", "first_fault_step",
+        "first_fault_reason_code", "obstacle_guard_verified",
+    )
+    for field in required:
+        if field not in value:
+            raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} is missing {field!r}")
+    if value["passed"] is not True or value["zero_residual"] is not True:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} did not pass its zero-residual physical test")
+    worlds = _gate_int(value["num_worlds"], f"{name}.num_worlds", minimum=1)
+    if worlds != expected_worlds:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} world count changed between stress passes")
+    counts = tuple(
+        _gate_int(value[field], f"{name}.{field}", minimum=0)
+        for field in ("terminated_worlds", "overflowed_worlds", "estopped_worlds")
+    )
+    if any(count > worlds for count in counts) or any(counts):
+        raise WarpCurriculumConfigError(
+            f"conditional GPU gate {name!r} must have zero terminated, overflowed, and estopped worlds"
+        )
+    if value["finite_state"] is not True:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} must prove finite_state=true")
+    if value["finite_reward"] is not True:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} must prove finite_reward=true")
+    if value["finite_reward_terms"] is not True:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} must prove finite_reward_terms=true")
+    requested = _gate_float(value["requested_duration_seconds"], f"{name}.requested_duration_seconds", nonnegative=True)
+    simulated = _gate_float(value["simulated_duration_seconds"], f"{name}.simulated_duration_seconds", nonnegative=True)
+    steps = _gate_int(value["policy_steps"], f"{name}.policy_steps", minimum=1)
+    if requested < config.gpu_task.stability_gate_seconds - 1.0e-9:
+        raise WarpCurriculumConfigError("conditional GPU gate did not run for the YAML-required safety duration")
+    if simulated + 1.0e-9 < requested:
+        raise WarpCurriculumConfigError("conditional GPU gate simulated less than its declared safety duration")
+    if simulated <= 0.0 or simulated / float(steps) <= 0.0:
+        raise WarpCurriculumConfigError("conditional GPU gate has an invalid physics action timestep")
+    if value["domain_randomization_active"] is not expected_domain_randomization_active:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} has the wrong DR activation state")
+    if value["physical_parameter_randomization"] is not expected_domain_randomization_active:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} did not exercise the required physical DR")
+    if value["terrain_geometry_randomization"] is not False:
+        raise WarpCurriculumConfigError("conditional GPU gate may not randomize terrain geometry or collision topology")
+    sensor_noise = _gate_float(value["sensor_noise_std"], f"{name}.sensor_noise_std", nonnegative=True)
+    if not math.isclose(sensor_noise, config.gpu_task.sensor_noise_std, rel_tol=0.0, abs_tol=1.0e-8):
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} sensor-noise evidence mismatches YAML")
+    if _gate_int(value["control_delay_steps"], f"{name}.control_delay_steps", minimum=0) != config.gpu_task.control_delay_steps:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} action-delay evidence mismatches YAML")
+    for field in ("minimum_progress_m", "speed_mae_mps", "unsafe_rate"):
+        _gate_float(value[field], f"{name}.{field}", nonnegative=True)
+    _gate_int(value["first_fault_step"], f"{name}.first_fault_step", minimum=-1)
+    _gate_int(value["first_fault_reason_code"], f"{name}.first_fault_reason_code", minimum=0)
+    if value["obstacle_guard_verified"] is not True:
+        raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} did not verify its analytic obstacle guard")
+    if stage.jump_enabled:
+        jump_fields = (
+            "jump_supervisor_verified", "jump_triggered_worlds", "landing_confirmed_worlds",
+            "jump_minimum_peak_worlds", "landing_kinematics_worlds", "minimum_flight_seconds",
+            "landing_preload_seconds",
+        )
+        for field in jump_fields:
+            if field not in value:
+                raise WarpCurriculumConfigError(f"jump GPU gate {name!r} is missing {field!r}")
+        if value["jump_supervisor_verified"] is not True:
+            raise WarpCurriculumConfigError(f"jump GPU gate {name!r} did not verify the direct-jump supervisor")
+        for field in (
+            "jump_triggered_worlds", "landing_confirmed_worlds", "jump_minimum_peak_worlds",
+            "landing_kinematics_worlds",
+        ):
+            if _gate_int(value[field], f"{name}.{field}", minimum=0) != worlds:
+                raise WarpCurriculumConfigError(f"jump GPU gate {name!r} must prove {field} for every world")
+        minimum_flight = _gate_float(value["minimum_flight_seconds"], f"{name}.minimum_flight_seconds", nonnegative=True)
+        if minimum_flight + 1.0e-9 < simulated / float(steps):
+            raise WarpCurriculumConfigError(f"jump GPU gate {name!r} did not prove a physical flight interval")
+        preload = _gate_float(value["landing_preload_seconds"], f"{name}.landing_preload_seconds", nonnegative=True)
+        if preload < 0.050:
+            raise WarpCurriculumConfigError("jump GPU gate must reduce landing torque at least 50 ms before touchdown")
+    return value
+
+
+def _validate_runtime_gate_report(
+    report: Any, *, config: CurriculumConfig, stage: StageConfig, capability: GpuStageCapability
+) -> Mapping[str, Any]:
+    """Reject any GPU gate without versioned, YAML-bound dual-pass evidence."""
+
+    del capability
     if not isinstance(report, Mapping):
         raise WarpCurriculumConfigError("conditional GPU gate must return a mapping report")
     if report.get("stage_id") != stage.stage_id:
         raise WarpCurriculumConfigError("conditional GPU gate report stage_id does not match the selected stage")
     if report.get("conditional_capability") is not True:
         raise WarpCurriculumConfigError("conditional GPU gate report must set conditional_capability=true")
+    if report.get("gate_evidence_schema") != GATE_EVIDENCE_SCHEMA:
+        raise WarpCurriculumConfigError("conditional GPU gate report has an incompatible evidence schema")
+    if stage.adapter_config_path is None:
+        raise WarpCurriculumConfigError("conditional GPU stage lacks an auditable adapter configuration")
+    try:
+        expected_digest = hashlib.sha256(stage.adapter_config_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise WarpCurriculumConfigError("unable to hash conditional GPU gate configuration") from error
+    for field in ("gate_config_sha256", "threshold_config_sha256"):
+        if report.get(field) != expected_digest:
+            raise WarpCurriculumConfigError(f"conditional GPU gate {field} does not match the selected YAML")
     if report.get("passed") is not True:
         raise WarpCurriculumConfigError("conditional GPU gate report must set passed=true")
-    required = ("num_worlds", "terminated_worlds", "overflowed_worlds", "estopped_worlds", "finite_state")
-    for name in required:
-        if name not in report:
-            raise WarpCurriculumConfigError(f"conditional GPU gate report is missing {name!r}")
-    try:
-        worlds = int(report["num_worlds"])
-        counts = tuple(int(report[name]) for name in required[1:4])
-    except (TypeError, ValueError) as error:
-        raise WarpCurriculumConfigError("conditional GPU gate counts must be integers") from error
-    if worlds < 1 or any(value < 0 or value > worlds for value in counts):
-        raise WarpCurriculumConfigError("conditional GPU gate counts are outside [0, num_worlds]")
-    if report["finite_state"] is not True:
-        raise WarpCurriculumConfigError("conditional GPU gate must prove finite_state=true")
-    if stage.stage_id == "official_grade15_up":
-        for name in (
-            "zero_residual", "minimum_progress_m", "speed_mae_mps", "unsafe_rate",
-            "first_fault_step", "first_fault_reason_code",
-        ):
-            if name not in report:
-                raise WarpCurriculumConfigError(f"official GPU gate report is missing {name!r}")
-        if report["zero_residual"] is not True:
-            raise WarpCurriculumConfigError("official GPU gate must be a zero-residual baseline test")
-        for name in ("minimum_progress_m", "speed_mae_mps", "unsafe_rate"):
-            try:
-                value = float(report[name])
-            except (TypeError, ValueError) as error:
-                raise WarpCurriculumConfigError(f"official GPU gate field {name!r} must be numeric") from error
-            if not math.isfinite(value):
-                raise WarpCurriculumConfigError(f"official GPU gate field {name!r} must be finite")
+    if report.get("zero_residual") is not True:
+        raise WarpCurriculumConfigError("conditional GPU gate must be a zero-residual baseline test")
+    if report.get("domain_randomization_enabled") is not True or not stage.domain_randomization_enabled:
+        raise WarpCurriculumConfigError("conditional GPU stage must require reset-boundary domain randomization")
+    worlds = _gate_int(report.get("num_worlds"), "num_worlds", minimum=1)
+    deterministic = _validate_gate_pass(
+        report.get("deterministic_baseline"),
+        name="deterministic_baseline",
+        stage=stage,
+        config=config,
+        expected_worlds=worlds,
+        expected_domain_randomization_active=False,
+    )
+    domain_randomized = _validate_gate_pass(
+        report.get("domain_randomization_stress"),
+        name="domain_randomization_stress",
+        stage=stage,
+        config=config,
+        expected_worlds=worlds,
+        expected_domain_randomization_active=True,
+    )
+    if report.get("deterministic_baseline_passed") is not True or report.get("domain_randomization_stress_passed") is not True:
+        raise WarpCurriculumConfigError("conditional GPU gate must pass both deterministic and DR physical stress runs")
+    for field in (
+        "requested_duration_seconds", "simulated_duration_seconds", "policy_steps", "terminated_worlds",
+        "overflowed_worlds", "estopped_worlds", "finite_state", "finite_reward", "finite_reward_terms",
+        "minimum_progress_m", "speed_mae_mps",
+        "unsafe_rate", "first_fault_step", "first_fault_reason_code", "obstacle_guard_verified",
+    ):
+        if field not in report:
+            raise WarpCurriculumConfigError(f"conditional GPU gate report is missing {field!r}")
+    # The top-level summary must be the DR stress result, never a stale
+    # deterministic summary that masks a randomized-world failure.
+    for field in (
+        "requested_duration_seconds", "simulated_duration_seconds", "policy_steps", "terminated_worlds",
+        "overflowed_worlds", "estopped_worlds", "finite_state", "finite_reward", "finite_reward_terms",
+        "minimum_progress_m", "speed_mae_mps",
+        "unsafe_rate", "first_fault_step", "first_fault_reason_code", "obstacle_guard_verified",
+    ):
+        if report[field] != domain_randomized[field]:
+            raise WarpCurriculumConfigError("conditional GPU gate top-level summary must match its DR stress evidence")
+    if "doghole" in stage.task_mode and (
+        deterministic["obstacle_guard_verified"] is not True or domain_randomized["obstacle_guard_verified"] is not True
+    ):
+        raise WarpCurriculumConfigError("doghole GPU gate must verify the obstacle collision guard in both passes")
     return report
 
 
@@ -1012,6 +1279,42 @@ def _stage_artifact_path(path: Path, stage: StageConfig) -> Path:
     if stage.stage_id == "rmuc_flat":
         return path
     return path.with_name(f"{path.stem}.{stage.stage_id}{path.suffix}")
+
+
+def _stage_candidate_path(path: Path) -> Path:
+    """Keep unverified policy snapshots outside the warm-start namespace."""
+
+    return path.with_name(f"{path.stem}.candidate{path.suffix}")
+
+
+def _stage_requires_promotion(stage: StageConfig, *, smoke: bool) -> bool:
+    """Every formal CUDA stage must be certified before it becomes a baseline."""
+
+    del stage
+    return not smoke
+
+
+def _certify_course_evaluation(
+    evaluation: Mapping[str, Any] | None, *, config: CurriculumConfig, stage: StageConfig
+) -> Mapping[str, Any]:
+    """Turn a passed CUDA route evaluation into checkpoint-bound evidence."""
+
+    if not isinstance(evaluation, Mapping):
+        raise WarpCurriculumConfigError("CUDA curriculum stage did not return promotion evidence")
+    if evaluation.get("stage_id") != stage.stage_id or evaluation.get("passed") is not True:
+        raise WarpCurriculumConfigError("CUDA curriculum stage did not pass its post-training evaluation")
+    return {
+        "certificate_schema": 1,
+        "passed": True,
+        "stage_id": stage.stage_id,
+        "curriculum_config_sha256": config.source_digest,
+        "adapter_config_sha256": (
+            None
+            if stage.adapter_config_path is None
+            else hashlib.sha256(stage.adapter_config_path.read_bytes()).hexdigest()
+        ),
+        "evaluation_scope": evaluation.get("evaluation_scope", "declared_route"),
+    }
 
 
 def _run_vector_training(
@@ -1057,6 +1360,8 @@ def _run_vector_training(
         output_path = _stage_artifact_path(config.output.checkpoint_path, stage)
         metrics_path = _stage_artifact_path(config.output.metrics_path, stage)
         total_timesteps, max_updates = config.ppo.total_timesteps, None
+    requires_promotion = _stage_requires_promotion(stage, smoke=smoke)
+    write_path = _stage_candidate_path(output_path) if requires_promotion else output_path
     if total_timesteps % int(batch.num_worlds):
         raise WarpCurriculumConfigError("total_timesteps must be divisible by the GPU world count")
     observations = task.reset()
@@ -1090,12 +1395,13 @@ def _run_vector_training(
         payload = {
             **build_checkpoint_metadata(
                 config=config, stage=stage, timesteps=timesteps, update_index=update_index,
-                source_checkpoint=source_checkpoint, batch=batch, smoke=smoke,
+                source_checkpoint=source_checkpoint, batch=batch, task=task, smoke=smoke,
             ),
             "model_state_dict": {key: value.detach().clone() for key, value in policy.state_dict().items()},
             "actor_state_dict": {key: value.detach().clone() for key, value in policy.actor.state_dict().items()},
             "optimizer_state_dict": optimizer.state_dict(),
             "gate_report": gate_report,
+            "artifact_status": "candidate" if requires_promotion else ("smoke" if smoke else "uncertified"),
             "ppo_config": asdict(config.ppo),
         }
         _append_metrics(metrics_path, {
@@ -1110,14 +1416,216 @@ def _run_vector_training(
             "aggregate_world_steps_per_second": current_steps * int(batch.num_worlds) / elapsed,
         })
         if smoke or timesteps == total_timesteps or update_index % config.output.checkpoint_interval_updates == 0:
-            _atomic_save(payload, output_path, torch)
+            _atomic_save(payload, write_path, torch)
         if max_updates is not None and update_index >= max_updates:
             break
     if smoke and update_index != 1:
         raise RuntimeError("curriculum PPO smoke must execute exactly one update")
+    evaluation = _run_post_training_evaluation(
+        task=task,
+        batch=batch,
+        policy=policy,
+        stage=stage,
+        config=config,
+        smoke=smoke,
+    )
+    if requires_promotion:
+        certificate = _certify_course_evaluation(evaluation, config=config, stage=stage)
+        payload = {
+            **build_checkpoint_metadata(
+                config=config, stage=stage, timesteps=timesteps, update_index=update_index,
+                source_checkpoint=source_checkpoint, batch=batch, task=task, smoke=smoke,
+            ),
+            "model_state_dict": {key: value.detach().clone() for key, value in policy.state_dict().items()},
+            "actor_state_dict": {key: value.detach().clone() for key, value in policy.actor.state_dict().items()},
+            "optimizer_state_dict": optimizer.state_dict(),
+            "gate_report": gate_report,
+            "course_evaluation": evaluation,
+            "course_certificate": certificate,
+            "artifact_status": "certified",
+            "ppo_config": asdict(config.ppo),
+        }
+        _atomic_save(payload, output_path, torch)
     if callable(close_bundle):
         close_bundle()
     return output_path
+
+
+def _evaluate_flat_policy_stage(
+    *, task: Any, batch: Any, policy: Any, stage: StageConfig, config: CurriculumConfig
+) -> Mapping[str, Any]:
+    """Run a deterministic post-PPO CUDA safety evaluation for flat stages."""
+
+    torch = getattr(batch, "_torch", None)
+    if torch is None or not str(getattr(batch, "device", "")).startswith("cuda"):
+        raise WarpCurriculumConfigError("flat post-policy evaluation requires a CUDA task bundle")
+    actor = getattr(policy, "actor", None)
+    if actor is None:
+        raise WarpCurriculumConfigError("PPO policy does not expose an actor for flat CUDA evaluation")
+    action_dt = float(getattr(task, "_time_step", 0.0))
+    if not math.isfinite(action_dt) or action_dt <= 0.0:
+        raise WarpCurriculumConfigError("flat post-policy evaluation has an invalid action timestep")
+    duration = float(config.gpu_task.stability_gate_seconds)
+    if duration > float(task.config.episode_seconds) + 1.0e-9:
+        raise WarpCurriculumConfigError("flat post-policy evaluation exceeds the task episode horizon")
+    steps = max(1, int(math.ceil(duration / action_dt)))
+    terminated = torch.zeros(batch.num_worlds, dtype=torch.bool, device=batch.device)
+    overflowed = torch.zeros_like(terminated)
+    estopped = torch.zeros_like(terminated)
+    finite_reward = torch.ones((), dtype=torch.bool, device=batch.device)
+    finite_reward_terms = torch.ones((), dtype=torch.bool, device=batch.device)
+    finite_values = torch.empty_like(terminated)
+    finite_step = torch.empty((), dtype=torch.bool, device=batch.device)
+    finite_terms_step = torch.empty((), dtype=torch.bool, device=batch.device)
+    task.reset()
+    policy.eval()
+    try:
+        for _ in range(steps):
+            with torch.no_grad():
+                output = actor(task.observe())
+                action = output[0] if isinstance(output, tuple) else output
+                if not isinstance(action, torch.Tensor) or action.shape != (batch.num_worlds, ACTION_SIZE):
+                    raise WarpCurriculumConfigError("flat evaluation policy must return CUDA [world, 7] actions")
+                action = torch.tanh(action).contiguous().to(dtype=torch.float32)
+            result = task.step(action)
+            reward_value = getattr(result, "reward", None)
+            if isinstance(reward_value, torch.Tensor) and tuple(reward_value.shape) == (batch.num_worlds,):
+                finite_values.copy_(torch.isfinite(reward_value))
+                torch.all(finite_values, out=finite_step)
+                finite_reward.logical_and_(finite_step)
+            else:
+                finite_reward.zero_()
+            finite_terms_step.fill_(True)
+            reward_terms = getattr(task, "_reward_terms", None)
+            if not isinstance(reward_terms, Mapping) or not reward_terms:
+                finite_terms_step.zero_()
+            else:
+                for reward_term in reward_terms.values():
+                    if not isinstance(reward_term, torch.Tensor) or tuple(reward_term.shape) != (batch.num_worlds,):
+                        finite_terms_step.zero_()
+                        break
+                    finite_values.copy_(torch.isfinite(reward_term))
+                    torch.all(finite_values, out=finite_step)
+                    finite_terms_step.logical_and_(finite_step)
+            finite_reward_terms.logical_and_(finite_terms_step)
+            terminated.logical_or_(result.terminated)
+            overflowed.logical_or_(batch.overflow.ne(0))
+            estopped.logical_or_(batch.estopped)
+            task.reset(result.done)
+        finite_state = torch.isfinite(batch.qpos).all() & torch.isfinite(batch.qvel).all()
+        summary = torch.stack((
+            terminated.sum(dtype=torch.int64),
+            overflowed.sum(dtype=torch.int64),
+            estopped.sum(dtype=torch.int64),
+            finite_state.to(dtype=torch.int64),
+            finite_reward.to(dtype=torch.int64),
+            finite_reward_terms.to(dtype=torch.int64),
+        ))
+        torch.cuda.synchronize(batch.device)
+        (
+            terminated_count,
+            overflow_count,
+            estop_count,
+            finite_state_flag,
+            finite_reward_flag,
+            finite_reward_terms_flag,
+        ) = (int(value) for value in summary.detach().cpu().tolist())
+    finally:
+        task.reset()
+    passed = bool(
+        terminated_count == 0
+        and overflow_count == 0
+        and estop_count == 0
+        and bool(finite_state_flag)
+        and bool(finite_reward_flag)
+        and bool(finite_reward_terms_flag)
+    )
+    report: Mapping[str, Any] = {
+        "stage_id": stage.stage_id,
+        "evaluation_scope": "post_policy_flat_cuda_safety",
+        "requested_duration_seconds": duration,
+        "simulated_duration_seconds": steps * action_dt,
+        "policy_steps": steps,
+        "num_worlds": int(batch.num_worlds),
+        "terminated_worlds": terminated_count,
+        "overflowed_worlds": overflow_count,
+        "estopped_worlds": estop_count,
+        "finite_state": bool(finite_state_flag),
+        "finite_reward": bool(finite_reward_flag),
+        "finite_reward_terms": bool(finite_reward_terms_flag),
+        "domain_randomization_active": bool(getattr(task.config, "domain_randomization_enabled", False)),
+        "passed": passed,
+    }
+    if not passed:
+        raise WarpCurriculumConfigError(
+            f"flat post-policy CUDA safety evaluation failed for {stage.stage_id}: "
+            f"terminated={terminated_count}, overflowed={overflow_count}, estopped={estop_count}, "
+            f"finite_state={bool(finite_state_flag)}, finite_reward={bool(finite_reward_flag)}, "
+            f"finite_reward_terms={bool(finite_reward_terms_flag)}"
+        )
+    return report
+
+
+def _run_post_training_evaluation(
+    *, task: Any, batch: Any, policy: Any, stage: StageConfig, config: CurriculumConfig, smoke: bool
+) -> Mapping[str, Any] | None:
+    """Dispatch a CUDA-only policy evaluation for every formal curriculum stage."""
+
+    if smoke:
+        return None
+    if stage.adapter_config_path is None:
+        return _evaluate_flat_policy_stage(task=task, batch=batch, policy=policy, stage=stage, config=config)
+
+    def deterministic_action(observation: Any) -> Any:
+        actor = getattr(policy, "actor", None)
+        if actor is None:
+            raise WarpCurriculumConfigError("PPO policy does not expose an actor for CUDA course evaluation")
+        return actor(observation)
+    try:
+        from official_course_warp import OfficialCourseTask, evaluate_policy_stage as evaluate_official
+
+        if isinstance(task, OfficialCourseTask):
+            return evaluate_official(task, deterministic_action, stage)
+    except ImportError:
+        pass
+    try:
+        from rmuc_curriculum_warp import RmucRouteTask, evaluate_policy_stage as evaluate_rmuc
+
+        if isinstance(task, RmucRouteTask):
+            return evaluate_rmuc(task, deterministic_action, stage)
+    except ImportError:
+        pass
+    raise WarpCurriculumConfigError(
+        "CUDA curriculum stage did not provide a verified post-training evaluator"
+    )
+
+
+def _load_required_prerequisite_checkpoint(
+    config: CurriculumConfig, stage: StageConfig, *, smoke: bool
+) -> ResidualCheckpoint | None:
+    """Require all YAML predecessors and select the final certified baseline.
+
+    This runs before a simulator is constructed.  A user may still supply a
+    separately audited CPU residual warm start, but cannot skip the completed
+    predecessor certificates that define the curriculum order.
+    """
+
+    if smoke or not stage.prerequisite_stage_ids:
+        return None
+    selected: ResidualCheckpoint | None = None
+    for predecessor_id in stage.prerequisite_stage_ids:
+        predecessor = config.stage(predecessor_id)
+        artifact = _stage_artifact_path(config.output.checkpoint_path, predecessor)
+        if not artifact.is_file():
+            raise WarpCurriculumConfigError(
+                f"stage {stage.stage_id!r} is blocked until prerequisite {predecessor_id!r} has a certified checkpoint"
+            )
+        # Verify the source artifact against the stage that produced it before
+        # validating the explicit target-stage transfer.  This binds both the
+        # certificate and the source stage scope to the same checked-in YAML.
+        selected = load_residual_checkpoint(artifact, config=config, stage=predecessor)
+        validate_checkpoint_metadata(selected.metadata, config=config, stage=stage)
+    return selected
 
 
 def run_curriculum_training(
@@ -1128,10 +1636,10 @@ def run_curriculum_training(
 
     stage = config.stage(stage_id)
     capability = validate_stage_capability(config, stage)
-    source_checkpoint = (
-        None if init_residual_checkpoint is None
-        else load_residual_checkpoint(init_residual_checkpoint, config=config, stage=stage)
-    )
+    certified_predecessor = _load_required_prerequisite_checkpoint(config, stage, smoke=smoke)
+    source_checkpoint = certified_predecessor
+    if init_residual_checkpoint is not None:
+        source_checkpoint = load_residual_checkpoint(init_residual_checkpoint, config=config, stage=stage)
     if stage.stage_id != "rmuc_flat":
         bundle = _external_stage_bundle(config, stage)
         batch = _bundle_value(bundle, "batch")
@@ -1149,7 +1657,7 @@ def run_curriculum_training(
             if gate is None:
                 raise WarpCurriculumConfigError("external GPU bundle must provide gate_report or run_stability_gate")
             if capability.runtime_gate_required:
-                gate = _validate_runtime_gate_report(gate, stage=stage, capability=capability)
+                gate = _validate_runtime_gate_report(gate, config=config, stage=stage, capability=capability)
             return _run_vector_training(
                 config=config, stage=stage, batch=batch, task=task, gate_report=gate,
                 source_checkpoint=source_checkpoint, smoke=smoke,
