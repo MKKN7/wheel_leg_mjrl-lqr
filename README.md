@@ -23,11 +23,22 @@ points remain easy to find.
 
 ## Testing
 
-Run the test suite from the project root:
+All project commands must use the `robot7` Python 3.12 environment. VS Code is
+configured to use it for Run and Debug. From a terminal, run either the included
+launcher or activate the Conda environment:
 
 ```powershell
+./robot7_python.cmd train_warp_ppo.py
+./run_tests_robot7.cmd
+
+# Equivalent interactive shell workflow
+conda activate robot7
 python -m unittest discover -s tests -t .
 ```
+
+Do not launch project scripts by double-clicking `.py` files: Windows currently
+associates them with the system Python 3.14. The required MuJoCo and learning
+dependencies are installed in `robot7` (Python 3.12).
 
 GPU-backed checks remain opt-in where the individual tests document an
 environment-variable gate.

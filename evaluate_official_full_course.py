@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from entrypoint_paths import project_path, resolve_cli_input
 from official_course_warp import (
     OfficialCourseAdapterError,
     evaluate_policy_stage,
@@ -247,9 +248,13 @@ def evaluate_full_course(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/official_full_evaluation.yaml"))
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--report", type=Path, default=None)
+    parser.add_argument(
+        "--config",
+        type=resolve_cli_input,
+        default=project_path("configs", "official_full_evaluation.yaml"),
+    )
+    parser.add_argument("--checkpoint", type=resolve_cli_input, required=True)
+    parser.add_argument("--report", type=resolve_cli_input, default=None)
     return parser.parse_args(argv)
 
 

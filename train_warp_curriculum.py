@@ -23,6 +23,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import yaml
 
+from entrypoint_paths import project_path, resolve_cli_input
 
 CURRICULUM_CONFIG_SCHEMA = 3
 CURRICULUM_CHECKPOINT_FORMAT = 2
@@ -1697,9 +1698,13 @@ def run_curriculum_training(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a capability-gated MuJoCo-Warp curriculum PPO stage.")
-    parser.add_argument("--curriculum", type=Path, default=Path("configs/warp_curriculum_ppo.yaml"))
+    parser.add_argument(
+        "--curriculum",
+        type=resolve_cli_input,
+        default=project_path("configs", "warp_curriculum_ppo.yaml"),
+    )
     parser.add_argument("--stage", required=True, help="Curriculum stage id, for example rmuc_flat or grades.")
-    parser.add_argument("--init-residual-checkpoint", type=Path, default=None)
+    parser.add_argument("--init-residual-checkpoint", type=resolve_cli_input, default=None)
     parser.add_argument("--smoke", action="store_true", help="Run one short GPU PPO update.")
     return parser.parse_args(argv)
 
@@ -1707,7 +1712,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     try:
-        config = load_curriculum_config(args.curriculum)
+        config = load_curriculum_config(resolve_cli_input(args.curriculum))
         output = run_curriculum_training(
             config,
             stage_id=args.stage,

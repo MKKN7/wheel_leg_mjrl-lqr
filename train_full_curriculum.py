@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 from typing import Sequence
 
+from entrypoint_paths import project_path, resolve_cli_input
 from evaluate_official_full_course import (
     _atomic_json,
     evaluate_full_course,
@@ -20,15 +21,16 @@ from train_warp_curriculum import (
 )
 
 
-DEFAULT_FULL_EVALUATION_CONFIG = Path("configs/official_full_evaluation.yaml")
+DEFAULT_CURRICULUM_CONFIG = project_path("configs", "warp_curriculum_ppo.yaml")
+DEFAULT_FULL_EVALUATION_CONFIG = project_path("configs", "official_full_evaluation.yaml")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--curriculum", type=Path, default=Path("configs/warp_curriculum_ppo.yaml"))
+    parser.add_argument("--curriculum", type=resolve_cli_input, default=DEFAULT_CURRICULUM_CONFIG)
     parser.add_argument(
         "--init-residual-checkpoint",
-        type=Path,
+        type=resolve_cli_input,
         default=None,
         help="Optional audited CPU residual checkpoint for the first executed CUDA stage.",
     )
@@ -39,7 +41,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--full-evaluation-config",
-        type=Path,
+        type=resolve_cli_input,
         default=DEFAULT_FULL_EVALUATION_CONFIG,
         help="YAML plan for fail-closed final official full-course certification.",
     )
@@ -60,8 +62,8 @@ def run_full_curriculum(
     supplies deterministic ordering and refuses to continue after any error.
     """
 
-    config = load_curriculum_config(curriculum_path)
-    full_evaluation = load_full_evaluation_config(full_evaluation_config)
+    config = load_curriculum_config(resolve_cli_input(curriculum_path))
+    full_evaluation = load_full_evaluation_config(resolve_cli_input(full_evaluation_config))
     stages = config.stages
     if not stages:
         raise WarpCurriculumConfigError("curriculum contains no CUDA course stages")

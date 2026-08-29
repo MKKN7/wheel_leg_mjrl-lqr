@@ -20,6 +20,7 @@ from typing import Any, Mapping
 import numpy as np
 import yaml
 
+from entrypoint_paths import project_path, resolve_cli_input
 
 WARP_BATCH_CONFIG_SCHEMA = 1
 MAX_TORQUE_FRACTION_OF_RATED = 0.80
@@ -1629,8 +1630,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a fail-closed MuJoCo-Warp GPU batch physics preflight.")
     parser.add_argument(
         "--config",
-        type=Path,
-        default=Path("configs/warp_batch_preflight.yaml"),
+        type=resolve_cli_input,
+        default=project_path("configs", "warp_batch_preflight.yaml"),
         help="YAML configuration for the GPU batch physics harness.",
     )
     return parser.parse_args()

@@ -19,11 +19,12 @@ import math
 import os
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import yaml
 
+from entrypoint_paths import project_path, resolve_cli_input
 from warp_env import (
     WarpBatchConfig,
     WarpBatchError,
@@ -857,18 +858,18 @@ def _run_flat_training(config: FlatPpoTrainingConfig, *, smoke: bool) -> None:
         batch._warp.copy(batch.data.ctrl, batch._safe_controls_warp)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run MuJoCo-Warp physics preflight or fixed-gain flat CUDA PPO.")
     parser.add_argument(
         "--config",
-        type=Path,
-        default=Path("configs/warp_batch_preflight.yaml"),
+        type=resolve_cli_input,
+        default=project_path("configs", "warp_batch_preflight.yaml"),
         help="Physics preflight YAML used when --train is absent.",
     )
     parser.add_argument(
         "--train-config",
-        type=Path,
-        default=Path("configs/warp_flat_ppo.yaml"),
+        type=resolve_cli_input,
+        default=project_path("configs", "warp_flat_ppo.yaml"),
         help="Strict v2 fixed-gain flat PPO experiment YAML used with --train.",
     )
     parser.add_argument(
@@ -881,7 +882,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Without --train run physics preflight; with --train run one gated PPO update.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _run_preflight(config_path: Path) -> None:
