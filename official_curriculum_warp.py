@@ -726,6 +726,19 @@ class StaticBoxTerrain16D:
         self._wheel_xy = torch.empty((self.num_worlds, 2, 2), dtype=torch.float32, device=self.device)
         self._wheel_height = torch.empty((self.num_worlds, 2), dtype=torch.float32, device=self.device)
         self._wheel_valid = torch.empty((self.num_worlds, 2), dtype=torch.bool, device=self.device)
+        # Keep the winning support-box index resident on CUDA.  Direct-jump
+        # routes use the final declared support box as their landing target;
+        # retaining the index prevents an arbitrary lower surface contact from
+        # being accepted as a landing.
+        self._wheel_support_index = torch.empty(
+            (self.num_worlds, 2), dtype=torch.int64, device=self.device
+        )
+        self._wheel_landing_target_contacts = torch.empty(
+            (self.num_worlds, 2), dtype=torch.bool, device=self.device
+        )
+        self._wheel_landing_target_worlds = torch.empty(
+            self.num_worlds, dtype=torch.bool, device=self.device
+        )
         self._guide_wheel_xy = torch.empty(
             (self.num_worlds, len(GUIDE_WHEEL_CONTACT_GEOM_NAMES), 2),
             dtype=torch.float32,
@@ -739,6 +752,11 @@ class StaticBoxTerrain16D:
         self._guide_wheel_valid = torch.empty(
             (self.num_worlds, len(GUIDE_WHEEL_CONTACT_GEOM_NAMES)),
             dtype=torch.bool,
+            device=self.device,
+        )
+        self._guide_wheel_support_index = torch.empty(
+            (self.num_worlds, len(GUIDE_WHEEL_CONTACT_GEOM_NAMES)),
+            dtype=torch.int64,
             device=self.device,
         )
         self._guide_side_valid = torch.empty((self.num_worlds, 2), dtype=torch.bool, device=self.device)
@@ -771,7 +789,13 @@ class StaticBoxTerrain16D:
     def last_support_valid(self) -> Any:
         return self._last_support_valid
 
-    def _sample_surface(self, xy: Any, height_out: Any, valid_out: Any) -> None:
+    def _sample_surface(
+        self,
+        xy: Any,
+        height_out: Any,
+        valid_out: Any,
+        index_out: Any | None = None,
+    ) -> None:
         """Evaluate the top of every declared box and retain the highest one."""
 
         if xy.shape[0] != self.num_worlds or xy.shape[-1] != 2 or xy.shape[1] not in self._workspaces:
@@ -799,7 +823,11 @@ class StaticBoxTerrain16D:
         work.height.addcmul_(work.local_xy[..., 1], self._rotation_z_xy[:, 1])
         work.height.add_(self._center_z).add_(self._top_z_offset)
         work.height.masked_fill_(~work.inside, -torch.inf)
-        torch.amax(work.height, dim=2, out=height_out)
+        if index_out is None:
+            torch.amax(work.height, dim=2, out=height_out)
+        else:
+            torch.max(work.height, dim=2, out=(height_out, index_out))
+            index_out.masked_fill_(~valid_out, -1)
         height_out.masked_fill_(~valid_out, 0.0)
 
     def _update_heading(self) -> None:
@@ -826,6 +854,7 @@ class StaticBoxTerrain16D:
             self._guide_wheel_xy,
             self._guide_wheel_height,
             self._guide_wheel_valid,
+            self._guide_wheel_support_index,
         )
         torch.index_select(
             self._guide_wheel_valid,
@@ -870,7 +899,12 @@ class StaticBoxTerrain16D:
         self._sample_surface(self._near_xy, self._near_height, self._near_valid)
         torch.index_select(self.task._geom_xpos, 1, self.task._wheel_geom_gpu, out=self.task._wheel_positions)
         self._wheel_xy.copy_(self.task._wheel_positions[..., :2])
-        self._sample_surface(self._wheel_xy, self._wheel_height, self._wheel_valid)
+        self._sample_surface(
+            self._wheel_xy,
+            self._wheel_height,
+            self._wheel_valid,
+            self._wheel_support_index,
+        )
         self.task.set_terrain_leg_support_heights(self._wheel_height, self._wheel_valid)
         self._update_guide_support_samples()
         features = self._feature_buffer
@@ -907,7 +941,12 @@ class StaticBoxTerrain16D:
         torch = self.torch
         torch.index_select(self.task._geom_xpos, 1, self.task._wheel_geom_gpu, out=self.task._wheel_positions)
         self._wheel_xy.copy_(self.task._wheel_positions[..., :2])
-        self._sample_surface(self._wheel_xy, self._wheel_height, self._wheel_valid)
+        self._sample_surface(
+            self._wheel_xy,
+            self._wheel_height,
+            self._wheel_valid,
+            self._wheel_support_index,
+        )
         self.task.set_terrain_leg_support_heights(self._wheel_height, self._wheel_valid)
         torch.sub(self.task._wheel_positions[..., 2], self.task._wheel_radius, out=self.task._wheel_clearances)
         self.task._wheel_clearances.sub_(self._wheel_height).clamp_(min=0.0)
@@ -917,7 +956,30 @@ class StaticBoxTerrain16D:
             out=self.task._wheel_contacts,
         )
         self.task._wheel_contacts.logical_and_(self._wheel_valid)
+        torch.eq(
+            self._wheel_support_index,
+            self._box_count - 1,
+            out=self._wheel_landing_target_contacts,
+        )
+        self._wheel_landing_target_contacts.logical_and_(self.task._wheel_contacts)
+        torch.all(
+            self._wheel_landing_target_contacts,
+            dim=1,
+            out=self._wheel_landing_target_worlds,
+        )
         return self.task._wheel_clearances, self.task._wheel_contacts
+
+    @property
+    def wheel_landing_target_contacts(self) -> Any:
+        """Per-side active-wheel contacts on the final declared support box."""
+
+        return self._wheel_landing_target_contacts
+
+    @property
+    def wheel_landing_target_worlds(self) -> Any:
+        """World mask requiring both active wheels on the final support box."""
+
+        return self._wheel_landing_target_worlds
 
     def guide_wheel_clearances_and_contacts(self) -> tuple[Any, Any]:
         """Return current private lower-guide contacts against static supports."""

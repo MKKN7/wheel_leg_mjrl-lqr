@@ -1,0 +1,140 @@
+schema_version: 1
+mode: rolling_passive_guide_wheels
+source_xml: ../wheeled_infantry.xml
+root_body: robot
+
+# Only the lower 30 x 9 mm CAD guide rollers participate in the training
+# model. The four separate 40 mm end rollers are intentionally excluded.
+geometry:
+  radius_m: 0.015
+  half_width_m: 0.0045
+  axle_axis: [1.0, 0.0, 0.0]
+  cylinder_quat: [0.70710678, 0.0, 0.70710678, 0.0]
+  density_kg_m3: 2588.0
+  joint_damping_nms: 0.00015
+  joint_armature_kg_m2: 0.0
+  friction: [1.10, 0.005, 0.0001]
+  condim: 3
+  contype: 1
+  conaffinity: 2
+  rgba: [0.07, 0.07, 0.08, 1.0]
+
+# The original root inertial includes the CAD lower-guide mass. The MJCF
+# synchronizer removes the following 24 roller mass/inertia contributions
+# before assigning each roller its own passive rolling body.
+mass_accounting:
+  mode: reallocate_from_root_inertial
+  baseline_root_inertial:
+    mass_kg: 16.62220419
+    com_m: [-0.00509948, 0.12135430, -0.00542460]
+    fullinertia_kg_m2: [0.40366446, 0.60660496, 0.37345494, -0.01685508, 0.00427268, -0.05125392]
+
+# Root-local centers reproduced from the actual 24 lower 30-6-9 CAD STL
+# centers relative to ROOT_ORIGIN_MM in build_wheeled_infantry.py.
+wheels:
+  - name: guide_wheel_lower_right_01
+    side: right
+    source_index: 1
+    position_m: [-0.0950001, -0.1399738, -0.1346828]
+  - name: guide_wheel_lower_right_02
+    side: right
+    source_index: 2
+    position_m: [-0.0800001, -0.1357210, -0.1670853]
+  - name: guide_wheel_lower_right_03
+    side: right
+    source_index: 3
+    position_m: [-0.0950001, -0.1357210, -0.1669864]
+  - name: guide_wheel_lower_right_04
+    side: right
+    source_index: 4
+    position_m: [-0.0800001, -0.1400231, -0.1347281]
+  - name: guide_wheel_lower_left_01
+    side: left
+    source_index: 5
+    position_m: [0.0949999, -0.1357210, -0.1669864]
+  - name: guide_wheel_lower_left_02
+    side: left
+    source_index: 6
+    position_m: [0.0799999, -0.1357210, -0.1670853]
+  - name: guide_wheel_lower_left_03
+    side: left
+    source_index: 7
+    position_m: [0.0949999, -0.1399738, -0.1346828]
+  - name: guide_wheel_lower_left_04
+    side: left
+    source_index: 8
+    position_m: [0.0799999, -0.1400231, -0.1347281]
+  - name: guide_wheel_lower_left_05
+    side: left
+    source_index: 9
+    position_m: [0.0949999, -0.1399738, 0.1346520]
+  - name: guide_wheel_lower_left_06
+    side: left
+    source_index: 10
+    position_m: [0.0949999, -0.1357210, 0.1669556]
+  - name: guide_wheel_lower_left_07
+    side: left
+    source_index: 11
+    position_m: [0.0799999, -0.1357210, 0.1670545]
+  - name: guide_wheel_lower_left_08
+    side: left
+    source_index: 12
+    position_m: [0.0799999, -0.1400231, 0.1346973]
+  - name: guide_wheel_lower_right_05
+    side: right
+    source_index: 13
+    position_m: [-0.0800001, -0.1357210, 0.1670545]
+  - name: guide_wheel_lower_right_06
+    side: right
+    source_index: 14
+    position_m: [-0.0950001, -0.1357210, 0.1669556]
+  - name: guide_wheel_lower_right_07
+    side: right
+    source_index: 15
+    position_m: [-0.0800001, -0.1400231, 0.1346973]
+  - name: guide_wheel_lower_right_08
+    side: right
+    source_index: 16
+    position_m: [-0.0950001, -0.1399738, 0.1346520]
+  - name: guide_wheel_lower_left_09
+    side: left
+    source_index: 17
+    position_m: [0.0779999, -0.1534738, -0.0300649]
+  - name: guide_wheel_lower_left_10
+    side: left
+    source_index: 18
+    position_m: [0.0929999, -0.1534738, -0.0299659]
+  - name: guide_wheel_lower_left_11
+    side: left
+    source_index: 19
+    position_m: [0.0929999, -0.1534738, 0.0300341]
+  - name: guide_wheel_lower_left_12
+    side: left
+    source_index: 20
+    position_m: [0.0779999, -0.1534738, 0.0299351]
+  - name: guide_wheel_lower_right_09
+    side: right
+    source_index: 21
+    position_m: [-0.0930001, -0.1534738, 0.0300341]
+  - name: guide_wheel_lower_right_10
+    side: right
+    source_index: 22
+    position_m: [-0.0780001, -0.1534738, 0.0299351]
+  - name: guide_wheel_lower_right_11
+    side: right
+    source_index: 23
+    position_m: [-0.0930001, -0.1534738, -0.0299659]
+  - name: guide_wheel_lower_right_12
+    side: right
+    source_index: 24
+    position_m: [-0.0780001, -0.1534738, -0.0300649]
+
+contracts:
+  expected_wheel_count: 24
+  expected_wheels_per_side: 12
+  expected_actuator_count: 6
+  expected_sensor_data_count: 40
+  expected_policy_observation_size: 67
+  expected_policy_action_size: 7
+  uncontrolled_passive_joint_suffix: _spin
+  public_contact_observation: driven_wheels_only

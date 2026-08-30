@@ -388,9 +388,15 @@ def build_curriculum_stage(stage: Any, config: Any) -> WarpCurriculumStageBundle
         flat.flat_controller,
         command_speed_mps=0.0,
         command_yaw_rate_rad_s=0.0,
+        # This stage is a zero-command robustness exercise.  A wheel
+        # command-feedforward term would turn passive calibration drift into
+        # an active drive command and can trip the attitude guard before PPO
+        # starts.  Non-zero route stages retain their YAML-owned feedforward.
+        command_wheel_feedforward_limit_nm=0.0,
+        command_wheel_accel_limit_nm=0.0,
+        command_wheel_brake_limit_nm=0.0,
         command_speed_gain_nm_per_mps=settings.command_speed_gain_nm_per_mps,
         command_yaw_gain_nm_per_rad_s=settings.command_yaw_gain_nm_per_rad_s,
-        command_wheel_feedforward_limit_nm=settings.command_wheel_feedforward_limit_nm,
     )
 
     # Calibration intentionally happens before GPU allocation and never runs

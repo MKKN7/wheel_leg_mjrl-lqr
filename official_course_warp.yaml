@@ -1,0 +1,161 @@
+schema_version: 1
+batch_config: warp_official_standard_batch.yaml
+flat_ppo_config: warp_flat_ppo.yaml
+terrain_curriculum: ../official_standard_curriculum.yaml
+canonical_scene: ../official_standard_ground.xml
+
+terrain_features:
+  lookahead_distances_m: [0.10, 0.28, 0.50, 0.76]
+  lateral_offsets_m: [-0.18, 0.0, 0.18]
+  height_normalization_m: 0.25
+  slope_normalization: 0.50
+
+route_reward:
+  progress_reward_per_m: 0.20
+  progress_delta_clip_m: 0.10
+  completion_bonus: 5.0
+  jump_peak_increment_weight: 3.0
+  jump_landing_bonus: 4.0
+  jump_failure_penalty: 20.0
+  obstacle_penalty: 30.0
+
+controller:
+  command_speed_gain_nm_per_mps: 3.0
+  command_yaw_gain_nm_per_rad_s: 1.0
+  command_wheel_feedforward_limit_nm: 1.20
+  command_wheel_accel_limit_nm: 0.35
+  command_wheel_brake_limit_nm: 1.20
+  terrain_support_reference_max_rate_mps: 0.30
+
+jump_supervisor:
+  prepare_length_m: 0.315
+  crouch_length_m: 0.205
+  thrust_length_m: 0.385
+  flight_retract_length_m: 0.205
+  flight_preload_length_m: 0.320
+  landing_length_m: 0.320
+  prepare_seconds: 0.12
+  crouch_seconds: 0.10
+  thrust_seconds: 0.35
+  flight_retract_seconds: 0.10
+  maximum_airborne_seconds: 1.20
+  landing_confirm_seconds: 0.08
+  recovery_seconds: 0.30
+  prelanding_seconds: 0.05
+  landing_torque_fraction: 0.30
+  # The dedicated airborne recovery is intentionally stronger than the
+  # walking LQR attenuation; the final actuator clip still enforces 80%.
+  flight_torque_fraction: 0.50
+  jump_residual_fraction: 0.05
+  thrust_leg_force_limit_n: 180.0
+  # Leave explicit headroom for the gas-spring generalized force and float
+  # rounding at the 80-percent actuator envelope.
+  thrust_hip_torque_nm: 26.0
+  # Wheel torque is held at zero during the vertical launch.  Applying drive
+  # torque while the wheels are still constrained turns the impulse into
+  # horizontal scrub and prevents the body from clearing a riser.
+  thrust_wheel_torque_nm: 0.0
+  minimum_liftoff_vertical_speed_mps: 0.10
+  # Require a real body-rise witness before leaving the constrained thrust
+  # phase.  This prevents a single proxy-contact gap from cutting thrust early.
+  minimum_liftoff_body_rise_m: 0.180
+  # Direct-jump linkage extension is wider than the flat 0.400 m travel gate;
+  # this value is applied only to direct-jump stages and remains fail-closed.
+  maximum_jump_leg_length_m: 0.460
+  airborne_hip_kp_nm_per_rad: 20.0
+  airborne_hip_kd_nm_per_rad_s: 4.0
+  airborne_wheel_attitude_kp_nm_per_rad: 6.0
+  airborne_wheel_attitude_kd_nm_per_rad_s: 0.48
+  airborne_wheel_torque_limit_nm: 2.40
+  minimum_peak_body_rise_m: 0.120
+  maximum_landing_vertical_speed_mps: 1.00
+  maximum_landing_angular_speed_rad_s: 2.50
+  collision_guard_margin_m: 0.002
+
+stability_gate:
+  duration_seconds: 8.0
+  require_no_terminated: true
+  require_no_overflow: true
+  require_finite_state: true
+  minimum_progress_m: 0.05
+  maximum_speed_mae_mps: 0.80
+  maximum_unsafe_rate: 0.0
+
+courses:
+  official_grade15_up:
+    terrain_stage_id: grade15
+    task_id: grade15_up
+    route_index: 0
+    support_geoms: [support_grade15_lead, support_grade15_ramp, support_grade15_platform]
+    obstacle_geoms: []
+    direct_jump: false
+  official_grade15_down:
+    terrain_stage_id: grade15
+    task_id: grade15_down
+    route_index: 0
+    support_geoms: [support_grade15_lead, support_grade15_ramp, support_grade15_platform]
+    obstacle_geoms: []
+    direct_jump: false
+  official_grade20_up:
+    terrain_stage_id: grade20
+    task_id: grade20_up
+    route_index: 0
+    support_geoms: [support_grade20_lead, support_grade20_ramp, support_grade20_platform]
+    obstacle_geoms: []
+    direct_jump: false
+  official_grade20_down:
+    terrain_stage_id: grade20
+    task_id: grade20_down
+    route_index: 0
+    support_geoms: [support_grade20_lead, support_grade20_ramp, support_grade20_platform]
+    obstacle_geoms: []
+    direct_jump: false
+  official_step150_up:
+    terrain_stage_id: step150
+    task_id: step150_up
+    route_index: 0
+    support_geoms: [support_step150_lead, support_step150_platform]
+    obstacle_geoms: []
+    direct_jump: true
+  official_step150_down:
+    terrain_stage_id: step150
+    task_id: step150_down
+    route_index: 0
+    support_geoms: [support_step150_lead, support_step150_platform]
+    obstacle_geoms: []
+    direct_jump: false
+  official_stair2x100_up:
+    terrain_stage_id: stair2x100
+    task_id: stair2x100_up
+    route_index: 0
+    support_geoms: [support_stair2x100_lead, support_stair2x100_lower, support_stair2x100_upper]
+    obstacle_geoms: []
+    direct_jump: true
+  official_stair2x100_down:
+    terrain_stage_id: stair2x100
+    task_id: stair2x100_down
+    route_index: 0
+    support_geoms: [support_stair2x100_lead, support_stair2x100_lower, support_stair2x100_upper]
+    obstacle_geoms: []
+    direct_jump: false
+  official_step200_lab:
+    terrain_stage_id: step200_lab
+    task_id: step200_lab
+    route_index: 0
+    support_geoms: [support_step200_lab_lead, support_step200_lab_platform]
+    obstacle_geoms: []
+    direct_jump: true
+  official_fly17_jump:
+    terrain_stage_id: fly17
+    task_id: fly17_jump
+    route_index: 0
+    support_geoms: [support_fly17_lead, support_fly17_ramp, support_fly17_landing]
+    obstacle_geoms: []
+    direct_jump: true
+  official_doghole450:
+    terrain_stage_id: doghole450
+    task_id: doghole450
+    route_index: 0
+    support_geoms: [support_doghole_floor]
+    obstacle_geoms: [obstacle_doghole_roof, obstacle_doghole_left_wall, obstacle_doghole_right_wall]
+    direct_jump: false

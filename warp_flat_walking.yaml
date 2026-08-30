@@ -1,0 +1,35 @@
+# GPU task parameters consumed by warp_task.load_flat_walking_config.
+# Keep this file synchronized with the experiment manifest/checkpoint.
+flat_walking:
+  command_speed_mps: 0.0
+  command_yaw_rate_rad_s: 0.0
+  command_leg_length_m: null
+  command_speed_limit_mps: 3.0
+  command_yaw_rate_limit_rad_s: 0.45
+  leg_length_min_m: 0.205
+  leg_length_max_m: 0.300
+  leg_command_rate_mps: 0.05
+  episode_seconds: 8.0
+  contact_loss_timeout_seconds: 0.18
+  contact_clearance_m: 0.010
+  safety_leg_length_min_m: 0.180
+  safety_leg_length_max_m: 0.400
+  max_leg_length_difference_m: 0.015
+  terrain_compensated_leg_reward:
+    enabled: true
+    support_height_to_leg_difference_gain: -1.0
+    target_leg_difference_limit_m: 0.160
+    reward_error_scale_m: 0.040
+    flat_leg_difference_penalty: 0.060
+    uneven_leg_difference_penalty: 0.020
+    turning_leg_penalty_fraction: 0.25
+    relief_start_m: 0.008
+    relief_full_m: 0.080
+    flat_attitude_reward_weight: 0.30
+    uneven_attitude_reward_weight: 0.50
+    terrain_raw_leg_difference_limit_m: 0.200
+  # Residual PPO is LQR-owned. The common-leg channel remains masked until a
+  # GPU leg-reference scheduler has parity evidence.
+  direct_control_mode: false
+  residual_limits: [8.0, 8.0, 0.75, 8.0, 8.0, 0.75, 1.0]
+  leg_action_enabled: false

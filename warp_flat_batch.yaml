@@ -1,0 +1,51 @@
+schema_version: 1
+backend: mujoco_warp
+
+# Deliberately independent from the RMUC preflight scene: flat PPO must not
+# instantiate an hfield route or a terrain obstacle mesh.
+xml_path: ../wheeled_infantry.xml
+num_worlds: 128
+physics_substeps_per_action: 10
+smoke_actions: 2
+
+runtime:
+  device: cuda:0
+  cache_path: C:/Users/ASUS/Desktop/try2/warp_curriculum_runtime_cache
+  temporary_path: C:/Users/ASUS/Desktop/try2/warp_curriculum_runtime_temp
+  cuda_graph: false
+  # Keep behavior aligned with the official/RMUC GPU configs on this Windows
+  # host; NVRTC PCH is disabled because its temporary directory can be ACL-locked.
+  use_precompiled_headers: false
+
+data_capacity:
+  nconmax: 128
+  nccdmax: 128
+  njmax: 256
+  njmax_nnz: 5120
+  naconmax: 4096
+  naccdmax: 4096
+  nvmax: 44
+
+safety:
+  torque_fraction_of_rated: 0.80
+  estop_on_nonfinite_control: true
+  estop_on_nonfinite_state: true
+  estop_on_overflow: true
+
+fall_guard:
+  enabled: true
+  max_attitude_error_rad: 1.00
+  max_root_height_drop_m: 0.22
+
+preflight:
+  verify_single_step_parity: true
+  verify_estop: true
+  qpos_max_abs_error: 0.00001
+  qvel_max_abs_error: 0.00010
+  sensordata_max_abs_error: 0.00100
+
+# This remains false because WarpPhysicsBatch is intentionally generic. The
+# separately named flat PPO manifest supplies the calibrated residual adapter.
+scope:
+  controller_backend: raw_controls_only
+  ppo_training_enabled: false

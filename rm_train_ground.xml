@@ -36,7 +36,7 @@
     <mesh name="base_visual_carbon" file="base_visual_carbon.stl" scale="0.001 0.001 0.001" />
     <mesh name="base_visual_plastic" file="base_visual_plastic.stl" scale="0.001 0.001 0.001" />
     <!-- RMUC assets: hfield supplies collision; OBJ meshes are visual-only. -->
-    <hfield name="rmuc_training_hfield" file="../assets/rmuc/hfield_collision_1024x573.png" size="14.525000 8.025000 1.730000 0.100000" />
+    <hfield name="rmuc_training_hfield" file="../assets/rmuc/hfield_collision_512x286.png" size="14.525000 8.025000 1.730000 0.100000" />
     <mesh name="rmuc_floor_visual" file="../assets/rmuc/RMUC20261-floor.obj" />
     <mesh name="rmuc_building_visual" file="../assets/rmuc/RMUC20261-building_vis.obj" />
   </asset>

@@ -125,6 +125,10 @@ class TerrainTask:
     max_episode_seconds: float
     routes: tuple[TerrainRoute, ...]
     jump_trigger_progress_m: float | None = None
+    # Optional route-progress threshold at which a direct jump may be
+    # considered to have reached its landing zone.  Adapters that own a
+    # direct-jump supervisor must require this field explicitly.
+    jump_landing_progress_m: float | None = None
     completion_mode: str = "route_progress"
     command_tracking_hold_seconds: float | None = None
     speed_tracking_tolerance_mps: float | None = None
@@ -626,6 +630,7 @@ def _task(
         path,
         optional={
             "jump_trigger_progress_m",
+            "jump_landing_progress_m",
             "completion_mode",
             "command_tracking_hold_seconds",
             "speed_tracking_tolerance_mps",
@@ -649,6 +654,15 @@ def _task(
         else _finite_float(
             mapping["jump_trigger_progress_m"],
             f"{path}.jump_trigger_progress_m",
+            minimum=0.0,
+        )
+    )
+    jump_landing_progress_m = (
+        None
+        if "jump_landing_progress_m" not in mapping
+        else _finite_float(
+            mapping["jump_landing_progress_m"],
+            f"{path}.jump_landing_progress_m",
             minimum=0.0,
         )
     )
@@ -736,6 +750,7 @@ def _task(
         ),
         routes=routes,
         jump_trigger_progress_m=jump_trigger_progress_m,
+        jump_landing_progress_m=jump_landing_progress_m,
         completion_mode=completion_mode,
         command_tracking_hold_seconds=command_tracking_hold_seconds,
         speed_tracking_tolerance_mps=speed_tracking_tolerance_mps,
@@ -765,6 +780,19 @@ def _task(
         raise TerrainCurriculumError(
             f"{path}.jump_trigger_progress_m must precede the task completion threshold"
         )
+    if task.jump_landing_progress_m is not None:
+        if task.jump_trigger_progress_m is None and not task.command.jump_request:
+            raise TerrainCurriculumError(
+                f"{path}.jump_landing_progress_m requires a jump command or progress jump trigger"
+            )
+        if task.jump_trigger_progress_m is not None and task.jump_landing_progress_m <= task.jump_trigger_progress_m:
+            raise TerrainCurriculumError(
+                f"{path}.jump_landing_progress_m must follow jump_trigger_progress_m"
+            )
+        if task.jump_landing_progress_m >= completion_progress_m:
+            raise TerrainCurriculumError(
+                f"{path}.jump_landing_progress_m must precede the task completion threshold"
+            )
     return task
 
 

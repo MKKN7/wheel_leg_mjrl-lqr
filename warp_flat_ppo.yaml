@@ -1,0 +1,116 @@
+schema_version: 3
+backend: mujoco_warp_flat_ppo_fixed_gain_v2
+reward_schema: warp_flat_terrain_compensated_reward_v2
+batch_config: warp_flat_batch.yaml
+
+# Exact 67-D observation / 7-D policy task. Terrain and jump slices retain
+# their documented flat inactive values. The seventh leg-reference action is
+# deliberately masked until a separately validated supervisor consumes it.
+flat_walking:
+  command_speed_mps: 0.0
+  command_yaw_rate_rad_s: 0.0
+  command_leg_length_m: 0.250
+  command_speed_limit_mps: 3.0
+  command_yaw_rate_limit_rad_s: 0.45
+  leg_length_min_m: 0.205
+  leg_length_max_m: 0.300
+  leg_command_rate_mps: 0.050
+  episode_seconds: 8.0
+  contact_loss_timeout_seconds: 0.180
+  contact_clearance_m: 0.010
+  safety_leg_length_min_m: 0.180
+  safety_leg_length_max_m: 0.400
+  max_leg_length_difference_m: 0.015
+  # Flat worlds retain the 15 mm P0 difference gate.  Route adapters publish
+  # immutable CUDA terrain samples; only two active contacts unlock the
+  # target leg difference below, so an airborne/stale sample fails closed.
+  terrain_compensated_leg_reward:
+    enabled: true
+    support_height_to_leg_difference_gain: -1.0
+    target_leg_difference_limit_m: 0.160
+    reward_error_scale_m: 0.040
+    flat_leg_difference_penalty: 0.060
+    uneven_leg_difference_penalty: 0.020
+    turning_leg_penalty_fraction: 0.25
+    relief_start_m: 0.008
+    relief_full_m: 0.080
+    flat_attitude_reward_weight: 0.30
+    uneven_attitude_reward_weight: 0.50
+    terrain_raw_leg_difference_limit_m: 0.200
+  direct_control_mode: false
+  residual_limits: [8.0, 8.0, 0.75, 8.0, 8.0, 0.75, 0.0]
+  leg_action_enabled: false
+
+# Every fixed-gain controller/calibration parameter is explicit. CPU LQR
+# calibration runs once before CUDA batch allocation; this config is immutable
+# for the subsequent GPU rollout.
+flat_controller:
+  command_speed_mps: 0.0
+  command_yaw_rate_rad_s: 0.0
+  command_leg_length_m: 0.250
+  calibration_seed: 7
+  gas_spring_enabled: true
+  gas_spring_torque_nm: 10.775
+  # The controller also clamps qfrc_applied against per-world remaining hip
+  # headroom after residual control, keeping the combined torque within 32 Nm.
+  gas_spring_max_abs_generalized_force_nm: 10.775
+  stance_guard_kp_nm_per_rad: 800.0
+  stance_guard_kd_nm_per_rad_per_s: 20.0
+  leg_force_kp_n_per_m: 700.0
+  leg_force_kd_ns_per_m: 45.0
+  leg_force_limit_n: 100.0
+  max_forward_feedback_mps: 0.250
+  lqr_reference_speed_limit_mps: 0.100
+  command_speed_gain_nm_per_mps: 0.0
+  command_yaw_gain_nm_per_rad_s: 0.0
+  command_wheel_feedforward_limit_nm: 0.0
+  max_torque_fraction: 0.80
+  yaw_alignment_enabled: true
+
+ppo:
+  total_timesteps: 65536
+  rollout_steps: 32
+  epochs: 4
+  minibatch_size: 1024
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.20
+  value_coefficient: 0.50
+  entropy_coefficient: 0.001
+  max_gradient_norm: 0.50
+  hidden_size: 256
+  initial_action_std: 0.12
+  seed: 7
+
+output:
+  checkpoint_path: ../artifacts/warp_flat_ppo_fixed_gain_v2.pt
+  metrics_path: ../artifacts/warp_flat_ppo_fixed_gain_v2.metrics.csv
+  checkpoint_interval_updates: 1
+
+smoke:
+  rollout_steps: 4
+  epochs: 1
+  minibatch_size: 512
+  checkpoint_path: ../artifacts/warp_flat_ppo_fixed_gain_v2_smoke.pt
+  metrics_path: ../artifacts/warp_flat_ppo_fixed_gain_v2_smoke.metrics.csv
+
+scope:
+  task_mode: flat_walking_only
+  terrain_enabled: false
+  jump_enabled: false
+  domain_randomization_enabled: false
+  controller_backend: fixed_gain_flat_controller_v2
+  dynamic_lqr_enabled: false
+  zero_command_only: true
+  leg_action_enabled: false
+
+# PPO is unreachable until this complete, GPU-resident nominal run succeeds.
+# The final result is the only allowed host synchronization in the gate.
+stability_gate:
+  duration_seconds: 8.0
+  required_num_worlds: 128
+  zero_residual: true
+  require_no_terminated: true
+  require_no_overflow: true
+  require_finite_state: true

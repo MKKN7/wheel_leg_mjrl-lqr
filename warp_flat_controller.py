@@ -539,6 +539,18 @@ class FixedGainFlatController:
         self._position_error = torch.zeros((self.num_worlds, int(model.nv)), dtype=torch.float32, device=self.device)
         self._velocity_error = torch.zeros_like(self._position_error)
         self._command = torch.zeros((self.num_worlds, ACTION_SIZE), dtype=torch.float32, device=self.device)
+        self._task_actuator_override = torch.empty_like(self._command)
+        # Dedicated airborne recovery workspaces.  They are allocated once so
+        # direct-jump flight never creates per-substep CUDA arrays.
+        self._flight_command = torch.empty_like(self._command)
+        self._flight_hip_position_error = torch.empty(
+            (self.num_worlds, int(self._hip_dof.numel())), dtype=torch.float32, device=self.device
+        )
+        self._flight_hip_velocity_error = torch.empty_like(self._flight_hip_position_error)
+        self._flight_hip_correction = torch.empty_like(self._flight_hip_position_error)
+        self._flight_hip_target = torch.empty_like(self._flight_hip_position_error)
+        self._flight_wheel_target = torch.empty((self.num_worlds, 2), dtype=torch.float32, device=self.device)
+        self._flight_phase_mask = torch.empty(self.num_worlds, dtype=torch.bool, device=self.device)
         self._wheel_feedforward = torch.zeros(
             (self.num_worlds, 2), dtype=torch.float32, device=self.device
         )
@@ -938,6 +950,97 @@ class FixedGainFlatController:
                 out=self._wheel_feedforward,
             )
             self._command.index_add_(1, self._wheel_actuator, self._wheel_feedforward)
+
+        # Direct-jump tasks may publish a deterministic, YAML-bounded actuator
+        # target for their short thrust phase.  It is applied before the same
+        # final 80-percent actuator clip used by all residual commands, and
+        # the generalized-force path still reserves gas-spring headroom from
+        # that clipped command.
+        override_target = getattr(task, "_jump_actuator_override_target", None)
+        override_enabled = getattr(task, "_jump_actuator_override_enabled", None)
+        if override_target is not None or override_enabled is not None:
+            if (
+                not isinstance(override_target, torch.Tensor)
+                or override_target.shape != self._command.shape
+                or override_target.device != self.device
+                or override_target.dtype != torch.float32
+                or not isinstance(override_enabled, torch.Tensor)
+                or override_enabled.shape != (self.num_worlds,)
+                or override_enabled.device != self.device
+                or override_enabled.dtype != torch.bool
+            ):
+                raise ValueError("jump actuator override must be CUDA [world, 6] with a CUDA [world] mask")
+            torch.where(
+                override_enabled.unsqueeze(1),
+                override_target,
+                self._command,
+                out=self._task_actuator_override,
+            )
+            self._command.copy_(self._task_actuator_override)
+
+        # Direct-jump flight uses the dedicated airborne recovery law from the
+        # CPU controller, evaluated from the already-populated CUDA state-error
+        # buffer.  The task publishes only immutable, YAML-validated gains;
+        # non-jump tasks leave this path disabled.
+        jump_phase = getattr(task, "_jump_phase", None)
+        if getattr(task, "_jump_airborne_recovery_enabled", False):
+            if (
+                not isinstance(jump_phase, torch.Tensor)
+                or jump_phase.shape != (self.num_worlds,)
+                or jump_phase.device != self.device
+                or jump_phase.dtype != torch.int64
+            ):
+                raise ValueError("jump phase must be a CUDA int64 [world] tensor")
+            torch.eq(jump_phase, 4, out=self._flight_phase_mask)
+            self._flight_command.copy_(self._command)
+            torch.index_select(
+                self._position_error,
+                1,
+                self._hip_dof,
+                out=self._flight_hip_position_error,
+            )
+            self._flight_hip_position_error.neg_()
+            torch.index_select(
+                task.batch.qvel,
+                1,
+                self._hip_dof,
+                out=self._flight_hip_velocity_error,
+            )
+            self._flight_hip_velocity_error.neg_()
+            self._flight_hip_correction.copy_(self._flight_hip_position_error)
+            self._flight_hip_correction.mul_(float(getattr(task, "_jump_airborne_hip_kp")))
+            self._flight_hip_correction.add_(
+                self._flight_hip_velocity_error,
+                alpha=float(getattr(task, "_jump_airborne_hip_kd")),
+            )
+            torch.index_select(
+                self._flight_command,
+                1,
+                self._hip_actuator,
+                out=self._flight_hip_target,
+            )
+            self._flight_hip_target.add_(self._flight_hip_correction)
+            self._flight_command.index_copy_(1, self._hip_actuator, self._flight_hip_target)
+            self._flight_wheel_target.copy_(
+                self._position_error[:, self.root_dof_address + 3].unsqueeze(1)
+            )
+            self._flight_wheel_target.mul_(float(getattr(task, "_jump_airborne_wheel_kp")))
+            self._flight_wheel_target.add_(
+                task.batch.qvel[:, self.root_dof_address + 3].unsqueeze(1),
+                alpha=float(getattr(task, "_jump_airborne_wheel_kd")),
+            )
+            self._flight_wheel_target.clamp_(
+                -float(getattr(task, "_jump_airborne_wheel_limit")),
+                float(getattr(task, "_jump_airborne_wheel_limit")),
+            )
+            self._flight_command.index_copy_(1, self._wheel_actuator, self._flight_wheel_target)
+            torch.where(
+                self._flight_phase_mask.unsqueeze(1),
+                self._flight_command,
+                self._command,
+                out=self._task_actuator_override,
+            )
+            self._command.copy_(self._task_actuator_override)
 
         torch.nan_to_num(self._command, nan=0.0, posinf=0.0, neginf=0.0, out=self._command)
         torch.clamp(self._command, min=self._control_low, max=self._control_high, out=self._command)

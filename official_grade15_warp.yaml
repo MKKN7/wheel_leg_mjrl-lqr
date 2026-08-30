@@ -1,0 +1,54 @@
+schema_version: 1
+stage_id: official_grade15_up
+task_mode: official_grade15_up
+batch_config: warp_official_grade15_batch.yaml
+flat_ppo_config: warp_flat_ppo.yaml
+terrain_curriculum: ../official_standard_curriculum.yaml
+canonical_scene: ../official_standard_ground.xml
+terrain_stage_id: grade15
+task_id: grade15_up
+route_index: 0
+
+# This exact non-obstacle support sequence is cross-checked against both the
+# official curriculum scene contract and the compiled MuJoCo model.
+support_geoms:
+  - support_grade15_lead
+  - support_grade15_ramp
+  - support_grade15_platform
+
+terrain_features:
+  lookahead_distances_m: [0.10, 0.28, 0.50, 0.76]
+  lateral_offsets_m: [-0.18, 0.0, 0.18]
+  height_normalization_m: 0.25
+  slope_normalization: 0.50
+
+route_reward:
+  progress_reward_per_m: 0.20
+  progress_delta_clip_m: 0.10
+  completion_bonus: 5.0
+
+# These only add bounded wheel feedback around the existing fixed-gain
+# baseline. MuJoCo-Warp still clips actuator controls to the batch 80% cap.
+controller:
+  command_speed_gain_nm_per_mps: 3.0
+  command_yaw_gain_nm_per_rad_s: 0.0
+  command_wheel_feedforward_limit_nm: 0.60
+  # The calibrated baseline has a passive drift after the +X yaw rebase.
+  # Permit only a small acceleration term and retain a separate bounded brake.
+  command_wheel_accel_limit_nm: 0.05
+  command_wheel_brake_limit_nm: 1.20
+  terrain_support_reference_max_rate_mps: 0.30
+
+# This is a conditional capability: no PPO policy is allocated until this
+# real GPU zero-residual, command-following gate passes.
+stability_gate:
+  duration_seconds: 8.0
+  require_no_terminated: true
+  require_no_overflow: true
+  require_finite_state: true
+  # This is a motion/stability preflight, not the 90%-completion evaluation
+  # gate in official_standard_curriculum.yaml. It prevents a stationary fake
+  # pass while keeping the full route evaluation fail-closed.
+  minimum_progress_m: 0.50
+  maximum_speed_mae_mps: 0.50
+  maximum_unsafe_rate: 0.0

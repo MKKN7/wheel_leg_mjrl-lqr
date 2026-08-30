@@ -1146,20 +1146,29 @@ def _validate_gate_pass(
     if value["obstacle_guard_verified"] is not True:
         raise WarpCurriculumConfigError(f"conditional GPU gate {name!r} did not verify its analytic obstacle guard")
     if stage.jump_enabled:
+        # Official static-box routes expose an immutable final support index,
+        # so their gate must prove landing on that exact platform.  The RMUC
+        # hfield adapter predates that index contract and proves hfield
+        # contact/kinematics instead; requiring an absent field here would
+        # block the declared RMUC stair-jump stage before PPO starts.  Do not
+        # weaken the official-course requirement.
+        requires_landing_target = stage.controller_backend == "official_course_controller_v1"
         jump_fields = (
-            "jump_supervisor_verified", "jump_triggered_worlds", "landing_confirmed_worlds",
-            "jump_minimum_peak_worlds", "landing_kinematics_worlds", "minimum_flight_seconds",
-            "landing_preload_seconds",
+            ("jump_supervisor_verified", "jump_triggered_worlds", "landing_confirmed_worlds")
+            + (("landing_target_met_worlds",) if requires_landing_target else ())
+            + ("jump_minimum_peak_worlds", "landing_kinematics_worlds", "minimum_flight_seconds", "landing_preload_seconds")
         )
         for field in jump_fields:
             if field not in value:
                 raise WarpCurriculumConfigError(f"jump GPU gate {name!r} is missing {field!r}")
         if value["jump_supervisor_verified"] is not True:
             raise WarpCurriculumConfigError(f"jump GPU gate {name!r} did not verify the direct-jump supervisor")
-        for field in (
-            "jump_triggered_worlds", "landing_confirmed_worlds", "jump_minimum_peak_worlds",
-            "landing_kinematics_worlds",
-        ):
+        required_counts = (
+            ("jump_triggered_worlds", "landing_confirmed_worlds")
+            + (("landing_target_met_worlds",) if requires_landing_target else ())
+            + ("jump_minimum_peak_worlds", "landing_kinematics_worlds")
+        )
+        for field in required_counts:
             if _gate_int(value[field], f"{name}.{field}", minimum=0) != worlds:
                 raise WarpCurriculumConfigError(f"jump GPU gate {name!r} must prove {field} for every world")
         minimum_flight = _gate_float(value["minimum_flight_seconds"], f"{name}.minimum_flight_seconds", nonnegative=True)

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import logging
+import math
 import os
 from pathlib import Path
 from time import perf_counter
@@ -24,6 +26,11 @@ from entrypoint_paths import project_path, resolve_cli_input
 
 WARP_BATCH_CONFIG_SCHEMA = 1
 MAX_TORQUE_FRACTION_OF_RATED = 0.80
+MAX_TORQUE_LIMIT_RATIO_SIM = 1.00
+MAX_TORQUE_LIMIT_RATIO_REAL = 0.80
+RUN_MODE_SIM_TRAINING = "sim_training"
+RUN_MODE_REAL_HARDWARE = "real_hardware"
+RUN_MODES = (RUN_MODE_SIM_TRAINING, RUN_MODE_REAL_HARDWARE)
 DOMAIN_RANDOMIZATION_FIELDS = (
     "body_mass",
     "body_inertia",
@@ -35,6 +42,9 @@ DOMAIN_RANDOMIZATION_FIELDS = (
 
 class WarpBatchError(RuntimeError):
     """Raised when the GPU batch harness cannot safely start."""
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,51 @@ class WarpSafetyConfig:
     estop_on_nonfinite_control: bool
     estop_on_nonfinite_state: bool
     estop_on_overflow: bool
+    run_mode: str = RUN_MODE_SIM_TRAINING
+    torque_limit_ratio_sim: float = MAX_TORQUE_LIMIT_RATIO_SIM
+    torque_limit_ratio_real: float = MAX_TORQUE_LIMIT_RATIO_REAL
+    current_limit_A: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.run_mode not in RUN_MODES:
+            raise ValueError(f"run_mode must be one of {RUN_MODES!r}")
+        for name, value, upper in (
+            ("torque_limit_ratio_sim", self.torque_limit_ratio_sim, MAX_TORQUE_LIMIT_RATIO_SIM),
+            ("torque_limit_ratio_real", self.torque_limit_ratio_real, MAX_TORQUE_LIMIT_RATIO_REAL),
+        ):
+            if isinstance(value, bool) or not np.isfinite(float(value)) or not 0.0 < float(value) <= upper:
+                raise ValueError(f"{name} must be finite and within (0, {upper:.2f}]")
+        selected_limit = (
+            self.torque_limit_ratio_sim
+            if self.run_mode == RUN_MODE_SIM_TRAINING
+            else self.torque_limit_ratio_real
+        )
+        if isinstance(self.torque_fraction_of_rated, bool) or not np.isfinite(float(self.torque_fraction_of_rated)):
+            raise ValueError("torque_fraction_of_rated must be finite")
+        if not 0.0 < float(self.torque_fraction_of_rated) <= float(selected_limit) + 1.0e-12:
+            raise ValueError(
+                "torque_fraction_of_rated must be positive and no greater than the active run-mode limit"
+            )
+        if self.current_limit_A is not None:
+            if (
+                isinstance(self.current_limit_A, bool)
+                or not np.isfinite(float(self.current_limit_A))
+                or float(self.current_limit_A) <= 0.0
+            ):
+                raise ValueError("current_limit_A must be finite and positive when provided")
+        if self.run_mode == RUN_MODE_REAL_HARDWARE and self.current_limit_A is None:
+            raise ValueError("real_hardware requires an independent positive current_limit_A")
+
+    @property
+    def effective_torque_fraction(self) -> float:
+        """Return the explicitly selected torque cap for this run mode.
+
+        ``torque_fraction_of_rated`` is retained as a legacy alias so old
+        manifests remain reproducible.  New manifests should set the two
+        mode-specific ratios and omit the alias.
+        """
+
+        return float(self.torque_fraction_of_rated)
 
 
 @dataclass(frozen=True)
@@ -158,6 +213,18 @@ class WarpBatchConfig:
     domain_randomization: WarpDomainRandomizationConfig = WarpDomainRandomizationConfig()
     static_terrain_support: WarpStaticTerrainSupportConfig = WarpStaticTerrainSupportConfig()
 
+    @property
+    def run_mode(self) -> str:
+        """Expose the YAML-selected mode at the batch boundary."""
+
+        return self.safety.run_mode
+
+    @property
+    def effective_torque_fraction(self) -> float:
+        """Return the active mode's derated actuator limit."""
+
+        return self.safety.effective_torque_fraction
+
 
 @dataclass(frozen=True)
 class WarpBatchStep:
@@ -249,6 +316,140 @@ def _finite_number(value: object, name: str) -> float:
     if not np.isfinite(result):
         raise WarpBatchError(f"{name} must be finite")
     return result
+
+
+def _torque_limit_ratio(value: object, name: str, *, maximum: float) -> float:
+    """Validate a mode-specific fraction of the actuator's rated torque."""
+
+    result = _finite_number(value, name)
+    if result <= 0.0 or result > maximum:
+        raise WarpBatchError(f"{name} must be within (0, {maximum:.2f}]")
+    return result
+
+
+def _load_safety_config(
+    raw: Mapping[str, Any], *, run_mode: str, mode_declared: bool
+) -> WarpSafetyConfig:
+    """Parse mode-aware torque and global-estop settings.
+
+    ``torque_fraction_of_rated`` is an explicit legacy alias.  It is accepted
+    only when the corresponding new ratio is absent or exactly equal; a
+    conflicting pair is rejected instead of silently selecting one value.
+    """
+
+    allowed = {
+        "torque_fraction_of_rated",
+        "torque_limit_ratio_sim",
+        "torque_limit_ratio_real",
+        "current_limit_A",
+        "estop_on_nonfinite_control",
+        "estop_on_nonfinite_state",
+        "estop_on_overflow",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise WarpBatchError(f"safety has unknown keys: {unknown}")
+
+    legacy_present = "torque_fraction_of_rated" in raw
+    legacy = (
+        _finite_number(raw["torque_fraction_of_rated"], "safety.torque_fraction_of_rated")
+        if legacy_present
+        else None
+    )
+    if legacy is not None:
+        # The legacy key was defined as the old 80-percent derating.  Keep
+        # that meaning independent of the newly selected run mode.
+        legacy_limit = MAX_TORQUE_FRACTION_OF_RATED
+        if legacy <= 0.0 or legacy > legacy_limit:
+            raise WarpBatchError(
+                "safety.torque_fraction_of_rated must be within "
+                f"(0, {legacy_limit:.2f}] for run_mode={run_mode!r}"
+            )
+
+    sim_explicit = "torque_limit_ratio_sim" in raw
+    real_explicit = "torque_limit_ratio_real" in raw
+    if mode_declared and (not sim_explicit or not real_explicit) and not (
+        legacy_present and not sim_explicit and not real_explicit
+    ):
+        missing = [
+            name
+            for name, present in (
+                ("torque_limit_ratio_sim", sim_explicit),
+                ("torque_limit_ratio_real", real_explicit),
+            )
+            if not present
+        ]
+        raise WarpBatchError(
+            "explicit run_mode requires safety mode-specific ratios; "
+            f"missing={missing}"
+        )
+    if not mode_declared and (sim_explicit or real_explicit):
+        raise WarpBatchError(
+            "safety.torque_limit_ratio_sim/real require an explicit top-level run_mode"
+        )
+    sim_ratio = _torque_limit_ratio(
+        raw.get("torque_limit_ratio_sim", MAX_TORQUE_LIMIT_RATIO_SIM),
+        "safety.torque_limit_ratio_sim",
+        maximum=MAX_TORQUE_LIMIT_RATIO_SIM,
+    )
+    real_ratio = _torque_limit_ratio(
+        raw.get("torque_limit_ratio_real", MAX_TORQUE_LIMIT_RATIO_REAL),
+        "safety.torque_limit_ratio_real",
+        maximum=MAX_TORQUE_LIMIT_RATIO_REAL,
+    )
+    selected_key = (
+        "torque_limit_ratio_sim"
+        if run_mode == RUN_MODE_SIM_TRAINING
+        else "torque_limit_ratio_real"
+    )
+    selected_ratio = sim_ratio if run_mode == RUN_MODE_SIM_TRAINING else real_ratio
+    selected_explicit = sim_explicit if run_mode == RUN_MODE_SIM_TRAINING else real_explicit
+    if legacy is not None:
+        if selected_explicit and not math.isclose(legacy, selected_ratio, rel_tol=0.0, abs_tol=1.0e-12):
+            raise WarpBatchError(
+                "safety.torque_fraction_of_rated conflicts with "
+                f"safety.{selected_key}; remove the legacy key or make them equal"
+            )
+        if not selected_explicit:
+            # Preserve the old manifest's exact cap while making the selected
+            # value visible through the new mode-specific field.
+            if run_mode == RUN_MODE_SIM_TRAINING:
+                sim_ratio = legacy
+            else:
+                real_ratio = legacy
+            selected_ratio = legacy
+            _LOGGER.warning(
+                "legacy safety.torque_fraction_of_rated is active for %s; "
+                "migrate to safety.%s",
+                run_mode,
+                selected_key,
+            )
+    current_limit = raw.get("current_limit_A")
+    if current_limit is not None:
+        current_limit = _finite_number(current_limit, "safety.current_limit_A")
+        if current_limit <= 0.0:
+            raise WarpBatchError("safety.current_limit_A must be finite and positive")
+    if run_mode == RUN_MODE_REAL_HARDWARE and current_limit is None:
+        raise WarpBatchError("real_hardware requires safety.current_limit_A")
+    try:
+        return WarpSafetyConfig(
+            torque_fraction_of_rated=selected_ratio,
+            estop_on_nonfinite_control=_boolean(
+                _required(raw, "estop_on_nonfinite_control"), "safety.estop_on_nonfinite_control"
+            ),
+            estop_on_nonfinite_state=_boolean(
+                _required(raw, "estop_on_nonfinite_state"), "safety.estop_on_nonfinite_state"
+            ),
+            estop_on_overflow=_boolean(
+                _required(raw, "estop_on_overflow"), "safety.estop_on_overflow"
+            ),
+            run_mode=run_mode,
+            torque_limit_ratio_sim=sim_ratio,
+            torque_limit_ratio_real=real_ratio,
+            current_limit_A=current_limit,
+        )
+    except ValueError as error:
+        raise WarpBatchError(f"invalid safety configuration: {error}") from error
 
 
 def _relative_range(value: object, name: str, *, upper_bound: float | None = None) -> tuple[float, float]:
@@ -479,26 +680,30 @@ def load_warp_batch_config(path: str | Path) -> WarpBatchConfig:
     if capacity.naccdmax > capacity.naconmax:
         raise WarpBatchError("data_capacity.naccdmax cannot exceed naconmax")
 
-    safety_raw = _mapping(_required(root, "safety"), "safety")
-    torque_fraction = _required(safety_raw, "torque_fraction_of_rated")
-    if isinstance(torque_fraction, bool) or not isinstance(torque_fraction, (int, float)):
-        raise WarpBatchError("safety.torque_fraction_of_rated must be numeric")
-    torque_fraction = float(torque_fraction)
-    if not np.isfinite(torque_fraction) or not 0.0 < torque_fraction <= MAX_TORQUE_FRACTION_OF_RATED:
+    run_mode = root.get("run_mode", RUN_MODE_SIM_TRAINING)
+    if not isinstance(run_mode, str) or run_mode not in RUN_MODES or run_mode.strip() != run_mode:
         raise WarpBatchError(
-            "safety.torque_fraction_of_rated must be finite and within "
-            f"(0, {MAX_TORQUE_FRACTION_OF_RATED:.2f}]"
+            "run_mode must be exactly 'sim_training' or 'real_hardware'"
         )
-    safety = WarpSafetyConfig(
-        torque_fraction_of_rated=torque_fraction,
-        estop_on_nonfinite_control=_boolean(
-            _required(safety_raw, "estop_on_nonfinite_control"), "safety.estop_on_nonfinite_control"
-        ),
-        estop_on_nonfinite_state=_boolean(
-            _required(safety_raw, "estop_on_nonfinite_state"), "safety.estop_on_nonfinite_state"
-        ),
-        estop_on_overflow=_boolean(_required(safety_raw, "estop_on_overflow"), "safety.estop_on_overflow"),
-    )
+    if "run_mode" not in root:
+        # Existing manifests predate the mode split and carry an explicit
+        # 0.80 legacy cap.  Keep that experiment reproducible, but make the
+        # assumption visible so a migration cannot be mistaken for a new
+        # real-hardware deployment contract.
+        _LOGGER.warning(
+            "Warp batch configuration %s omits run_mode; assuming sim_training "
+            "for compatibility with its legacy torque_fraction_of_rated key",
+            source_path,
+        )
+    safety_raw = _mapping(_required(root, "safety"), "safety")
+    try:
+        safety = _load_safety_config(
+            safety_raw,
+            run_mode=run_mode,
+            mode_declared="run_mode" in root,
+        )
+    except ValueError as error:
+        raise WarpBatchError(f"invalid safety configuration: {error}") from error
 
     fall_guard_raw = _mapping(_required(root, "fall_guard"), "fall_guard")
     fall_guard = WarpFallGuardConfig(
@@ -1198,7 +1403,7 @@ class WarpPhysicsBatch:
         self._warp.copy(self.data.qfrc_applied, self._safe_applied_forces_warp)
 
     def _rated_control_limits(self) -> tuple[np.ndarray, np.ndarray]:
-        return _signed_rated_control_limits(self.host_model, self.config.safety.torque_fraction_of_rated)
+        return _signed_rated_control_limits(self.host_model, self.config.effective_torque_fraction)
 
     def _initialize_generalized_force_budget(
         self,

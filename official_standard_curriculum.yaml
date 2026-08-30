@@ -223,8 +223,10 @@ tasks:
       forward_speed_mps: 0.22
       yaw_rate_rad_s: 0.0
       jump_request: false
-    jump_trigger_progress_m: 1.00
-    jump_launch_speed_mps: 0.30
+    # Start the prepare/crouch/thrust sequence before the 150 mm riser.  Keep
+    # 50 mm of margin so measured progress noise cannot skip the one-shot edge.
+    jump_trigger_progress_m: 0.75
+    jump_launch_speed_mps: 0.55
     required_consecutive_successes: 1
     required_distance_m: 6.80
     completion_tolerance_m: 0.30
@@ -267,8 +269,10 @@ tasks:
       forward_speed_mps: 0.20
       yaw_rate_rad_s: 0.0
       jump_request: false
-    jump_trigger_progress_m: 1.00
-    jump_launch_speed_mps: 0.30
+    # The first 100 mm riser starts at 1.00 m progress.  Trigger close enough
+    # to the riser for the bounded direct-jump supervisor to clear it.
+    jump_trigger_progress_m: 0.75
+    jump_launch_speed_mps: 0.55
     required_consecutive_successes: 1
     required_distance_m: 6.80
     completion_tolerance_m: 0.30
@@ -311,8 +315,10 @@ tasks:
       forward_speed_mps: 0.18
       yaw_rate_rad_s: 0.0
       jump_request: false
-    jump_trigger_progress_m: 1.00
-    jump_launch_speed_mps: 0.32
+    # The 200 mm lab riser also begins at 1.00 m progress; launch preparation
+    # must happen on the lead surface rather than at the contact edge.
+    jump_trigger_progress_m: 0.75
+    jump_launch_speed_mps: 0.55
     required_consecutive_successes: 3
     required_distance_m: 6.80
     completion_tolerance_m: 0.30

@@ -22,6 +22,11 @@ import torch
 
 
 MAX_TORQUE_FRACTION_OF_RATED = 0.80
+MAX_TORQUE_LIMIT_RATIO_SIM = 1.00
+MAX_TORQUE_LIMIT_RATIO_REAL = 0.80
+RUN_MODE_SIM_TRAINING = "sim_training"
+RUN_MODE_REAL_HARDWARE = "real_hardware"
+RUN_MODES = (RUN_MODE_SIM_TRAINING, RUN_MODE_REAL_HARDWARE)
 
 # Integer codes are kept stable for logging and replay buffers.  Zero means
 # that the world is safe at the current step.
@@ -57,14 +62,47 @@ class WarpSafetyLimits:
     min_leg_length_m: float | None = None
     max_leg_length_m: float | None = None
     max_contact_loss_steps: int | None = None
+    # Mode-aware torque fields are validated here as well as in the YAML
+    # loader so direct task construction cannot bypass the deployment policy.
+    # ``None`` is the pre-mode API spelling.  It retains the historical
+    # 80-percent cap until a caller explicitly selects a deployment mode.
+    run_mode: str | None = None
+    torque_limit_ratio_sim: float = MAX_TORQUE_LIMIT_RATIO_SIM
+    torque_limit_ratio_real: float = MAX_TORQUE_LIMIT_RATIO_REAL
+    current_limit_A: float | None = None
 
     def __post_init__(self) -> None:
         fraction = float(self.torque_fraction_of_rated)
-        if not math.isfinite(fraction) or not 0.0 < fraction <= MAX_TORQUE_FRACTION_OF_RATED:
+        if self.run_mode is not None and self.run_mode not in RUN_MODES:
+            raise ValueError(f"run_mode must be one of {RUN_MODES!r}")
+        selected_mode = self.run_mode
+        for name, value, upper in (
+            ("torque_limit_ratio_sim", self.torque_limit_ratio_sim, MAX_TORQUE_LIMIT_RATIO_SIM),
+            ("torque_limit_ratio_real", self.torque_limit_ratio_real, MAX_TORQUE_LIMIT_RATIO_REAL),
+        ):
+            if isinstance(value, bool) or not math.isfinite(float(value)) or not 0.0 < float(value) <= upper:
+                raise ValueError(f"{name} must be within (0, {upper:.2f}]")
+        active_limit = (
+            self.torque_limit_ratio_sim
+            if selected_mode == RUN_MODE_SIM_TRAINING
+            else self.torque_limit_ratio_real
+        )
+        if selected_mode is None:
+            active_limit = MAX_TORQUE_FRACTION_OF_RATED
+        if not math.isfinite(fraction) or not 0.0 < fraction <= float(active_limit) + 1.0e-12:
             raise ValueError(
-                "torque_fraction_of_rated must be within "
-                f"(0, {MAX_TORQUE_FRACTION_OF_RATED:.2f}]"
+                "torque_fraction_of_rated must be positive and no greater than "
+                f"the active {(selected_mode or 'legacy') } limit ({active_limit:.2f})"
             )
+        if self.current_limit_A is not None:
+            if (
+                isinstance(self.current_limit_A, bool)
+                or not math.isfinite(float(self.current_limit_A))
+                or float(self.current_limit_A) <= 0.0
+            ):
+                raise ValueError("current_limit_A must be finite and positive when provided")
+        if selected_mode == RUN_MODE_REAL_HARDWARE and self.current_limit_A is None:
+            raise ValueError("real_hardware requires an independent positive current_limit_A")
         if (
             not math.isfinite(float(self.max_attitude_error_rad))
             or not math.isfinite(float(self.max_root_height_drop_m))
@@ -90,6 +128,12 @@ class WarpSafetyLimits:
                 or self.max_contact_loss_steps < 1
             ):
                 raise ValueError("max_contact_loss_steps must be a positive integer when enabled")
+
+    @property
+    def effective_torque_fraction(self) -> float:
+        """Return the validated torque fraction selected by ``run_mode``."""
+
+        return float(self.torque_fraction_of_rated)
 
 
 @dataclass(frozen=True)

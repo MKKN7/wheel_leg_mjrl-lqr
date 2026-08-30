@@ -20,8 +20,14 @@ ROOT = Path(__file__).resolve().parent
 SOURCE_XML = ROOT / "wheeled_infantry.xml"
 OUTPUT_XML = ROOT / "rm_train_ground.xml"
 STAGED_ASSET_DIR = ROOT / "assets" / "rmuc"
-COLLISION_HFIELD_NAME = "hfield_collision_1024x573.png"
-COLLISION_HFIELD_RESOLUTION = (1024, 573)
+# Keep the supplied 2048x1146 image as the visual/source asset.  MuJoCo-Warp's
+# hfield narrowphase caps the contact manifold for each geom pair at
+# MJ_MAXCONPAIR (50).  A 1024x573 collision grid lets the wheel and guide-wheel
+# footprints cover more than that many cells on the RMUC mesh and therefore
+# raises a deterministic HFIELD overflow.  The 512x286 grid keeps the same
+# surveyed extents/elevation range while bounding the per-pair prism count.
+COLLISION_HFIELD_NAME = "hfield_collision_512x286.png"
+COLLISION_HFIELD_RESOLUTION = (512, 286)
 
 ASSET_NAMES = (
     "hfield.png",
@@ -91,7 +97,7 @@ def stage_assets(source_dir: Path) -> None:
 
 
 def build_collision_hfield(source: Path) -> None:
-    """Produce an RL-stable collision grid while retaining the supplied full image."""
+    """Produce a Warp-safe collision grid while retaining the supplied image."""
     destination = STAGED_ASSET_DIR / COLLISION_HFIELD_NAME
     with Image.open(source) as image:
         if image.size != (2048, 1146):

@@ -151,6 +151,16 @@ class JumpSupervisorSettings:
     flight_torque_fraction: float
     jump_residual_fraction: float
     thrust_leg_force_limit_n: float
+    thrust_hip_torque_nm: float
+    thrust_wheel_torque_nm: float
+    minimum_liftoff_vertical_speed_mps: float
+    minimum_liftoff_body_rise_m: float
+    maximum_jump_leg_length_m: float
+    airborne_hip_kp_nm_per_rad: float
+    airborne_hip_kd_nm_per_rad_s: float
+    airborne_wheel_attitude_kp_nm_per_rad: float
+    airborne_wheel_attitude_kd_nm_per_rad_s: float
+    airborne_wheel_torque_limit_nm: float
     minimum_peak_body_rise_m: float
     maximum_landing_vertical_speed_mps: float
     maximum_landing_angular_speed_rad_s: float
@@ -164,10 +174,38 @@ class JumpSupervisorSettings:
         for name in (
             "prepare_seconds", "crouch_seconds", "thrust_seconds", "maximum_airborne_seconds",
             "landing_confirm_seconds", "recovery_seconds", "prelanding_seconds", "thrust_leg_force_limit_n",
-            "maximum_landing_vertical_speed_mps", "maximum_landing_angular_speed_rad_s",
+            "thrust_hip_torque_nm", "minimum_liftoff_vertical_speed_mps",
+            "minimum_liftoff_body_rise_m", "maximum_jump_leg_length_m",
+            "airborne_hip_kp_nm_per_rad", "airborne_hip_kd_nm_per_rad_s",
+            "airborne_wheel_attitude_kp_nm_per_rad", "airborne_wheel_attitude_kd_nm_per_rad_s",
+            "airborne_wheel_torque_limit_nm", "maximum_landing_vertical_speed_mps",
+            "maximum_landing_angular_speed_rad_s",
         ):
             if float(getattr(self, name)) <= 0.0:
                 raise OfficialCourseAdapterError(f"jump_supervisor.{name} must be positive")
+        if self.thrust_hip_torque_nm > 32.0 or self.thrust_wheel_torque_nm > 2.4:
+            raise OfficialCourseAdapterError(
+                "jump_supervisor thrust actuator targets must remain within the 80-percent actuator limits"
+            )
+        if self.maximum_jump_leg_length_m < self.thrust_length_m:
+            raise OfficialCourseAdapterError(
+                "jump_supervisor.maximum_jump_leg_length_m must cover the thrust leg length"
+            )
+        # The 0.46 m ceiling is below the calibrated linkage's mechanical
+        # envelope.  It prevents a malformed YAML value from disabling the
+        # generic leg-travel estop during a direct jump.
+        if self.maximum_jump_leg_length_m > 0.46:
+            raise OfficialCourseAdapterError(
+                "jump_supervisor.maximum_jump_leg_length_m exceeds the verified 0.46 m envelope"
+            )
+        if self.minimum_liftoff_body_rise_m < self.minimum_peak_body_rise_m:
+            raise OfficialCourseAdapterError(
+                "jump_supervisor.minimum_liftoff_body_rise_m must cover the minimum peak-rise witness"
+            )
+        if self.airborne_wheel_torque_limit_nm > 2.4:
+            raise OfficialCourseAdapterError(
+                "jump_supervisor.airborne_wheel_torque_limit_nm exceeds the 80-percent wheel limit"
+            )
         if self.prelanding_seconds < 0.050:
             raise OfficialCourseAdapterError("jump_supervisor.prelanding_seconds must be at least 50 ms")
         for name in ("landing_torque_fraction", "flight_torque_fraction", "jump_residual_fraction"):
@@ -450,22 +488,64 @@ class AnalyticObstacleGuard:
         base_half_size = np.asarray(task.batch.host_model.geom_size[base_geom_id, :3], dtype=np.float32)
         if not np.isfinite(base_half_size).all() or np.any(base_half_size <= 0.0):
             raise OfficialCourseAdapterError("base_collision size must be finite and positive")
-        # A sphere enclosing the collision box is conservative under arbitrary
-        # chassis yaw/pitch, and does not rely on the incomplete cylinder-box
-        # contact manifold exposed by the current Warp release.
-        self._body_radius = float(np.linalg.norm(base_half_size))
+        # Keep the base box dimensions explicit.  A bounding sphere would be
+        # fail-safe for intrusion, but it also shrinks the usable doghole
+        # clearance by more than 110 mm at nominal yaw.  The orientation-aware
+        # AABB below remains conservative while preserving the actual box
+        # footprint and its measured 80 mm roof clearance.
+        self._base_half_size = self.torch.as_tensor(
+            base_half_size, dtype=self.torch.float32, device=self.device
+        )
         self._base_geom_id = self.torch.as_tensor([base_geom_id], dtype=self.torch.long, device=self.device)
         self._base_geom_position = self.torch.empty((self.num_worlds, 1, 3), dtype=self.torch.float32, device=self.device)
         if layout is None:
             self._center = self._rotation = self._half_size = None
+            self._rotation_t = None
+            self._obstacle_abs_rotation_t = None
+            self._base_local_extent = None
+            self._delta = None
+            self._axis_overlap = None
+            self._obstacle_overlap = None
             self._local = self._distance = None
             return
+        geom_xmat = getattr(task, "_geom_xmat", None)
+        if geom_xmat is None:
+            try:
+                geom_xmat = task.batch._warp.to_torch(task.batch.data.geom_xmat)
+            except (AttributeError, RuntimeError, TypeError) as error:
+                raise OfficialCourseAdapterError(
+                    "analytic obstacle guard requires a resident geom_xmat CUDA view"
+                ) from error
+        expected_xmat_shape = (self.num_worlds, int(task.batch.host_model.ngeom), 3, 3)
+        if getattr(geom_xmat, "shape", None) != expected_xmat_shape or geom_xmat.device != self.device:
+            raise OfficialCourseAdapterError(
+                "analytic obstacle guard geom_xmat view has an invalid CUDA shape/device"
+            )
+        self._geom_xmat = geom_xmat
+        self._base_geom_rotation = self.torch.empty(
+            (self.num_worlds, 1, 3, 3), dtype=self.torch.float32, device=self.device
+        )
+        self._base_abs_rotation = self.torch.empty_like(self._base_geom_rotation)
+        self._base_world_extent = self.torch.empty(
+            (self.num_worlds, 3), dtype=self.torch.float32, device=self.device
+        )
         self._center = self.torch.as_tensor(layout.center, dtype=self.torch.float32, device=self.device)
         self._rotation = self.torch.as_tensor(layout.rotation, dtype=self.torch.float32, device=self.device)
+        # Keep the transpose as a view.  The explicit products in ``unsafe``
+        # below are equivalent to einsum("kij,nkj->nki", rotation.T, delta)
+        # but write directly into resident buffers on every physics tick.
+        self._rotation_t = self._rotation.transpose(1, 2)
+        self._obstacle_abs_rotation_t = self.torch.abs(self._rotation_t)
         self._half_size = self.torch.as_tensor(layout.half_size, dtype=self.torch.float32, device=self.device)
         count = len(layout.names)
+        self._base_local_extent = self.torch.empty(
+            (self.num_worlds, count, 3), dtype=self.torch.float32, device=self.device
+        )
+        self._delta = self.torch.empty((self.num_worlds, count, 3), dtype=self.torch.float32, device=self.device)
         self._local = self.torch.empty((self.num_worlds, count, 3), dtype=self.torch.float32, device=self.device)
         self._distance = self.torch.empty((self.num_worlds, count, 3), dtype=self.torch.float32, device=self.device)
+        self._axis_overlap = self.torch.empty((self.num_worlds, count, 3), dtype=self.torch.bool, device=self.device)
+        self._obstacle_overlap = self.torch.empty((self.num_worlds, count), dtype=self.torch.bool, device=self.device)
 
     def unsafe(self) -> Any:
         if self.layout is None:
@@ -474,14 +554,59 @@ class AnalyticObstacleGuard:
         torch = self.torch
         torch.index_select(self.task._geom_xpos, 1, self._base_geom_id, out=self._base_geom_position)
         self._body_center.copy_(self._base_geom_position[:, 0])
-        # Transform a conservative chassis-sphere center into every obstacle
-        # frame.  Inflating each obstacle by the bounding-sphere radius makes
-        # roof/wall intrusion a P0 stop before relying on contact reporting.
-        delta = self._body_center.unsqueeze(1) - self._center.unsqueeze(0)
-        self._local.copy_(torch.einsum("bij,nkj->nki", self._rotation.transpose(1, 2), delta))
-        self._distance.copy_(self._local.abs())
-        self._distance.sub_(self._half_size.unsqueeze(0)).sub_(self._body_radius + self.margin_m)
-        self._unsafe.copy_((self._distance <= 0.0).all(dim=2).any(dim=1))
+        torch.index_select(self._geom_xmat, 1, self._base_geom_id, out=self._base_geom_rotation)
+        torch.abs(self._base_geom_rotation, out=self._base_abs_rotation)
+        half = self._base_half_size
+        extent = self._base_world_extent
+        extent[:, 0].copy_(self._base_abs_rotation[:, 0, 0, 0]).mul_(half[0])
+        extent[:, 0].addcmul_(self._base_abs_rotation[:, 0, 0, 1], half[1])
+        extent[:, 0].addcmul_(self._base_abs_rotation[:, 0, 0, 2], half[2])
+        extent[:, 1].copy_(self._base_abs_rotation[:, 0, 1, 0]).mul_(half[0])
+        extent[:, 1].addcmul_(self._base_abs_rotation[:, 0, 1, 1], half[1])
+        extent[:, 1].addcmul_(self._base_abs_rotation[:, 0, 1, 2], half[2])
+        extent[:, 2].copy_(self._base_abs_rotation[:, 0, 2, 0]).mul_(half[0])
+        extent[:, 2].addcmul_(self._base_abs_rotation[:, 0, 2, 1], half[1])
+        extent[:, 2].addcmul_(self._base_abs_rotation[:, 0, 2, 2], half[2])
+        # Transform the chassis-box center into every obstacle frame.  The
+        # projected AABB extents below keep roof/wall intrusion a P0 stop
+        # without depending on the incomplete cylinder-box contact manifold.
+        # The obstacle index must remain explicit here.  The former
+        # ``bij,nkj->nki`` expression summed over ``b`` and mixed all obstacle
+        # transforms.  Reuse preallocated tensors and spell out the three
+        # products to keep this check allocation-free in the CUDA hot path.
+        self._delta.copy_(self._body_center.unsqueeze(1))
+        self._delta.sub_(self._center.unsqueeze(0))
+        delta = self._delta
+        rotation_t = self._rotation_t
+        local = self._local
+        local[..., 0].copy_(delta[..., 0]).mul_(rotation_t[:, 0, 0].view(1, -1))
+        local[..., 0].addcmul_(delta[..., 1], rotation_t[:, 0, 1].view(1, -1))
+        local[..., 0].addcmul_(delta[..., 2], rotation_t[:, 0, 2].view(1, -1))
+        local[..., 1].copy_(delta[..., 0]).mul_(rotation_t[:, 1, 0].view(1, -1))
+        local[..., 1].addcmul_(delta[..., 1], rotation_t[:, 1, 1].view(1, -1))
+        local[..., 1].addcmul_(delta[..., 2], rotation_t[:, 1, 2].view(1, -1))
+        local[..., 2].copy_(delta[..., 0]).mul_(rotation_t[:, 2, 0].view(1, -1))
+        local[..., 2].addcmul_(delta[..., 1], rotation_t[:, 2, 1].view(1, -1))
+        local[..., 2].addcmul_(delta[..., 2], rotation_t[:, 2, 2].view(1, -1))
+        # Project the body AABB into each obstacle frame.  This is conservative
+        # for an oriented box and avoids the false positive caused by a sphere
+        # enclosing the entire chassis.
+        local_extent = self._base_local_extent
+        obstacle_abs_t = self._obstacle_abs_rotation_t
+        local_extent[..., 0].copy_(extent[:, 0].view(-1, 1)).mul_(obstacle_abs_t[:, 0, 0].view(1, -1))
+        local_extent[..., 0].addcmul_(extent[:, 1].view(-1, 1), obstacle_abs_t[:, 0, 1].view(1, -1))
+        local_extent[..., 0].addcmul_(extent[:, 2].view(-1, 1), obstacle_abs_t[:, 0, 2].view(1, -1))
+        local_extent[..., 1].copy_(extent[:, 0].view(-1, 1)).mul_(obstacle_abs_t[:, 1, 0].view(1, -1))
+        local_extent[..., 1].addcmul_(extent[:, 1].view(-1, 1), obstacle_abs_t[:, 1, 1].view(1, -1))
+        local_extent[..., 1].addcmul_(extent[:, 2].view(-1, 1), obstacle_abs_t[:, 1, 2].view(1, -1))
+        local_extent[..., 2].copy_(extent[:, 0].view(-1, 1)).mul_(obstacle_abs_t[:, 2, 0].view(1, -1))
+        local_extent[..., 2].addcmul_(extent[:, 1].view(-1, 1), obstacle_abs_t[:, 2, 1].view(1, -1))
+        local_extent[..., 2].addcmul_(extent[:, 2].view(-1, 1), obstacle_abs_t[:, 2, 2].view(1, -1))
+        torch.abs(self._local, out=self._distance)
+        self._distance.sub_(self._half_size.unsqueeze(0)).sub_(local_extent).sub_(self.margin_m)
+        torch.le(self._distance, 0.0, out=self._axis_overlap)
+        torch.all(self._axis_overlap, dim=2, out=self._obstacle_overlap)
+        torch.any(self._obstacle_overlap, dim=1, out=self._unsafe)
         return self._unsafe
 
 
@@ -511,6 +636,15 @@ class OfficialCourseTask(WarpFlatWalkingTask):
         self._course = course
         self._reward_settings = reward_settings
         self._jump_settings = jump_settings
+        # The controller consumes these immutable, YAML-validated gains during
+        # the FLIGHT phase.  Keeping them on the task preserves the generic
+        # six-actuator controller interface for non-jump stages.
+        self._jump_airborne_recovery_enabled = bool(course.direct_jump)
+        self._jump_airborne_hip_kp = float(jump_settings.airborne_hip_kp_nm_per_rad)
+        self._jump_airborne_hip_kd = float(jump_settings.airborne_hip_kd_nm_per_rad_s)
+        self._jump_airborne_wheel_kp = float(jump_settings.airborne_wheel_attitude_kp_nm_per_rad)
+        self._jump_airborne_wheel_kd = float(jump_settings.airborne_wheel_attitude_kd_nm_per_rad_s)
+        self._jump_airborne_wheel_limit = float(jump_settings.airborne_wheel_torque_limit_nm)
         super().__init__(batch, config, calibration=calibration)
         # StaticBoxTerrain16D only depends on the geometry data shape; the
         # generic layout deliberately supplies the exact stage support list.
@@ -573,6 +707,12 @@ class OfficialCourseTask(WarpFlatWalkingTask):
         self._jump_triggered = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
         self._jump_liftoff = torch.zeros_like(self._jump_triggered)
         self._jump_landing_confirmed = torch.zeros_like(self._jump_triggered)
+        self._jump_landing_target_met = torch.zeros_like(self._jump_triggered)
+        self._jump_landing_contacts = torch.empty_like(self._jump_triggered)
+        self._jump_landing_event = torch.empty_like(self._jump_triggered)
+        self._jump_liftoff_event = torch.empty_like(self._jump_triggered)
+        self._jump_body_liftoff = torch.empty_like(self._jump_triggered)
+        self._jump_liftoff_velocity_met = torch.empty_like(self._jump_triggered)
         self._jump_failed = torch.zeros_like(self._jump_triggered)
         self._jump_peak_rise = torch.zeros_like(self._progress)
         self._jump_minimum_peak_met = torch.zeros_like(self._jump_triggered)
@@ -591,6 +731,10 @@ class OfficialCourseTask(WarpFlatWalkingTask):
         self._jump_contact_exempt = torch.zeros(self.num_worlds, dtype=torch.bool, device=self.device)
         self._jump_phase_onehot = torch.zeros((self.num_worlds, PHASE_COUNT), dtype=torch.float32, device=self.device)
         self._jump_policy_scale = torch.ones(self.num_worlds, dtype=torch.float32, device=self.device)
+        self._jump_actuator_override_target = torch.zeros(
+            (self.num_worlds, self.batch.num_actuators), dtype=torch.float32, device=self.device
+        )
+        self._jump_actuator_override_enabled = torch.zeros_like(self._jump_triggered)
         self._jump_resume_leg_length = self._command_leg_length.clone()
         self._jump_landing_this_step = torch.zeros_like(self._jump_triggered)
         self._jump_failure_this_step = torch.zeros_like(self._jump_triggered)
@@ -605,6 +749,44 @@ class OfficialCourseTask(WarpFlatWalkingTask):
         update_support = getattr(controller, "update_terrain_support_reference", None)
         if not callable(rebase) or not callable(update_support):
             raise OfficialCourseAdapterError("official GPU course requires terrain-reference capable CUDA controller")
+        hip_ids = getattr(controller, "_hip_actuator", None)
+        wheel_ids = getattr(controller, "_wheel_actuator", None)
+        if (
+            not isinstance(hip_ids, self.torch.Tensor)
+            or tuple(hip_ids.shape) != (4,)
+            or not isinstance(wheel_ids, self.torch.Tensor)
+            or tuple(wheel_ids.shape) != (2,)
+        ):
+            raise OfficialCourseAdapterError("official direct jump requires four hip and two wheel actuator indices")
+        self._jump_actuator_override_target.zero_()
+        if self._course.direct_jump:
+            hip_target = self.torch.as_tensor(
+                (
+                    -self._jump_settings.thrust_hip_torque_nm,
+                    -self._jump_settings.thrust_hip_torque_nm,
+                    self._jump_settings.thrust_hip_torque_nm,
+                    -self._jump_settings.thrust_hip_torque_nm,
+                ),
+                dtype=self.torch.float32,
+                device=self.device,
+            ).unsqueeze(0).expand(self.num_worlds, -1)
+            wheel_target = self.torch.full(
+                (self.num_worlds, 2),
+                -self._jump_settings.thrust_wheel_torque_nm,
+                dtype=self.torch.float32,
+                device=self.device,
+            )
+            self._jump_actuator_override_target.index_copy_(1, hip_ids, hip_target)
+            self._jump_actuator_override_target.index_copy_(1, wheel_ids, wheel_target)
+            command_low = getattr(controller, "_control_low", None)
+            command_high = getattr(controller, "_control_high", None)
+            if (
+                not isinstance(command_low, self.torch.Tensor)
+                or not isinstance(command_high, self.torch.Tensor)
+                or bool((self._jump_actuator_override_target < command_low.unsqueeze(0)).any().item())
+                or bool((self._jump_actuator_override_target > command_high.unsqueeze(0)).any().item())
+            ):
+                raise OfficialCourseAdapterError("official jump thrust target exceeds the final derated actuator limits")
         rebase(self._reset_qpos, self._reset_qvel, self._all_world_mask)
 
     def _wheel_clearances_and_contacts(self) -> tuple[Any, Any]:
@@ -661,6 +843,8 @@ class OfficialCourseTask(WarpFlatWalkingTask):
         self._jump_triggered[mask] = False
         self._jump_liftoff[mask] = False
         self._jump_landing_confirmed[mask] = False
+        self._jump_landing_target_met[mask] = False
+        self._jump_actuator_override_enabled[mask] = False
         self._jump_failed[mask] = False
         self._jump_peak_rise[mask] = 0.0
         self._jump_minimum_peak_met[mask] = False
@@ -707,6 +891,12 @@ class OfficialCourseTask(WarpFlatWalkingTask):
             & ~terminated
             & ~self._route_unsafe
         )
+        # A direct-jump route is complete only after a confirmed landing on
+        # its final declared support surface.  This prevents progress after a
+        # missed/short jump from being mistaken for a successful obstacle
+        # traversal.
+        if self._course.direct_jump:
+            completion.logical_and_(self._jump_landing_confirmed)
         self._completion_this_step.copy_(completion & ~self._completed)
         self._completed.logical_or_(completion)
         self._route_reward.add_(
@@ -715,6 +905,21 @@ class OfficialCourseTask(WarpFlatWalkingTask):
 
     def _jump_support_contacts(self) -> Any:
         return self._side_support_contacts().all(dim=1)
+
+    def _jump_landing_support_contacts(self, support_contacts: Any) -> Any:
+        """Restrict direct-jump landing evidence to the final support box."""
+
+        if not self._course.direct_jump:
+            return support_contacts
+        terrain = self._course_terrain
+        if terrain is None:
+            # A direct-jump task without a terrain provider is an invalid
+            # contract; fail closed rather than accepting generic contact.
+            self._jump_landing_contacts.zero_()
+            return self._jump_landing_contacts
+        self._jump_landing_contacts.copy_(support_contacts)
+        self._jump_landing_contacts.logical_and_(terrain.wheel_landing_target_worlds)
+        return self._jump_landing_contacts
 
     def _update_jump_supervisor(self) -> None:
         """Advance one direct jump using only persistent CUDA buffers."""
@@ -726,6 +931,7 @@ class OfficialCourseTask(WarpFlatWalkingTask):
             self._jump_contact_exempt.zero_()
             self._jump_torque_scale.fill_(1.0)
             self._jump_policy_scale.fill_(1.0)
+            self._jump_actuator_override_enabled.zero_()
             self.set_contact_loss_exempt(self._jump_contact_exempt)
             self.set_controller_torque_scale(self._jump_torque_scale)
             return
@@ -752,21 +958,46 @@ class OfficialCourseTask(WarpFlatWalkingTask):
         phase.masked_fill_(transition_crouch, PHASE_THRUST)
         phase_elapsed.masked_fill_(transition_crouch, 0.0)
         contacts = self._jump_support_contacts()
-        liftoff = (phase == PHASE_THRUST) & ~contacts
-        self._jump_liftoff.logical_or_(liftoff)
-        transition_flight = self._jump_liftoff & (phase == PHASE_THRUST)
-        phase.masked_fill_(transition_flight, PHASE_FLIGHT)
-        phase_elapsed.masked_fill_(transition_flight, 0.0)
         root_height = self.batch.qpos[:, self.root_qpos_address + 2]
         rise = torch.clamp(root_height - self._route_reference_height, min=0.0)
         torch.maximum(self._jump_peak_rise, rise, out=self._jump_peak_rise)
         self._jump_minimum_peak_met.copy_(
             self._jump_peak_rise >= settings.minimum_peak_body_rise_m
         )
+        torch.ge(
+            self.batch.qvel[:, self.root_dof_address + 2],
+            settings.minimum_liftoff_vertical_speed_mps,
+            out=self._jump_liftoff_velocity_met,
+        )
+        torch.ge(rise, settings.minimum_peak_body_rise_m, out=self._jump_body_liftoff)
+        self._jump_body_liftoff.logical_and_(self._jump_liftoff_velocity_met)
+        self._jump_body_liftoff.logical_and_(rise >= settings.minimum_liftoff_body_rise_m)
+        # A support proxy may remain true through a compliant linkage motion;
+        # a body-rise witness is accepted only after at least one active side
+        # has actually cleared its support.  This prevents a supported chassis
+        # from entering FLIGHT and disabling contact protection.
+        self._jump_body_liftoff.logical_and_(~contacts)
+        self._jump_body_liftoff.logical_and_(phase == PHASE_THRUST)
+        self._jump_liftoff_event.copy_(phase == PHASE_THRUST)
+        self._jump_liftoff_event.logical_and_(~contacts)
+        # Contact proxies can clear when a leg collapses before the chassis is
+        # actually airborne.  Require a positive vertical-speed witness for
+        # the physical no-contact path; otherwise remain in THRUST and let the
+        # bounded timeout fail closed instead of entering a false flight phase.
+        self._jump_liftoff_event.logical_and_(self._jump_liftoff_velocity_met)
+        self._jump_liftoff_event.logical_or_(self._jump_body_liftoff)
+        self._jump_liftoff.logical_or_(self._jump_liftoff_event)
+        transition_flight = self._jump_liftoff & (phase == PHASE_THRUST)
+        phase.masked_fill_(transition_flight, PHASE_FLIGHT)
+        phase_elapsed.masked_fill_(transition_flight, 0.0)
         descending = self.batch.qvel[:, self.root_dof_address + 2] < 0.0
         flight = phase == PHASE_FLIGHT
         self._jump_flight_seconds.add_(flight.to(dtype=torch.float32) * self._time_step)
-        contacted_flight = flight & contacts
+        landing_contacts = self._jump_landing_support_contacts(contacts)
+        torch.logical_and(flight, landing_contacts, out=self._jump_landing_event)
+        self._jump_landing_event.logical_and_(descending)
+        self._jump_landing_target_met.logical_or_(self._jump_landing_event)
+        contacted_flight = self._jump_landing_event
         self._jump_contact_confirm.masked_fill_(~contacted_flight, 0.0)
         self._jump_contact_confirm.add_(contacted_flight.to(dtype=torch.float32) * self._time_step)
         landing_candidate = flight & (self._jump_contact_confirm >= settings.landing_confirm_seconds)
@@ -826,8 +1057,18 @@ class OfficialCourseTask(WarpFlatWalkingTask):
             clearance = torch.clamp(root_height - (self._base_root_height + root_support), min=0.0)
             descent_speed = (-self.batch.qvel[:, self.root_dof_address + 2]).clamp_min(1.0e-4)
             self._jump_time_to_touchdown.copy_(clearance / descent_speed)
+        # The wheel contact proxy is the authoritative touchdown signal for
+        # this closed-chain chassis.  Switch to the landing torque envelope as
+        # soon as the final support surface is touched; root-height prediction
+        # alone lags the wheel by the suspension geometry and can leave the
+        # controller in the flight envelope during the 50 ms confirmation
+        # window.
+        target_contact = flight & landing_contacts
         preload = flight & descending & (self._jump_time_to_touchdown <= settings.prelanding_seconds)
-        self._jump_torque_scale.masked_fill_(preload | (phase == PHASE_LANDING), settings.landing_torque_fraction)
+        self._jump_torque_scale.masked_fill_(
+            preload | target_contact | (phase == PHASE_LANDING),
+            settings.landing_torque_fraction,
+        )
         self._jump_policy_scale.fill_(1.0)
         limited_residual = (phase >= PHASE_PREPARE) & (phase <= PHASE_RECOVERY)
         self._jump_policy_scale.masked_fill_(limited_residual, settings.jump_residual_fraction)
@@ -835,6 +1076,7 @@ class OfficialCourseTask(WarpFlatWalkingTask):
             phase == PHASE_LANDING,
             min(settings.jump_residual_fraction, settings.landing_torque_fraction),
         )
+        self._jump_actuator_override_enabled.copy_(phase == PHASE_THRUST)
         launch_phase = (phase == PHASE_PREPARE) | (phase == PHASE_CROUCH) | (phase == PHASE_THRUST)
         self._command_speed.fill_(self._command_speed_value)
         self._command_speed.masked_fill_(launch_phase, self._jump_launch_speed_mps)
@@ -955,6 +1197,7 @@ class OfficialCourseTask(WarpFlatWalkingTask):
             "jump_phase": self._jump_phase,
             "jump_triggered": self._jump_triggered,
             "jump_landing_confirmed": self._jump_landing_confirmed,
+            "jump_landing_target_met": self._jump_landing_target_met,
             "jump_failed": self._jump_failed,
             "jump_peak_rise_m": self._jump_peak_rise,
             "jump_minimum_peak_met": self._jump_minimum_peak_met,
@@ -1113,6 +1356,7 @@ def _make_stability_gate(
         speed_samples = torch.zeros((), dtype=torch.int64, device=batch.device)
         jump_triggered = torch.zeros_like(terminated)
         jump_landed = torch.zeros_like(terminated)
+        jump_landing_target = torch.zeros_like(terminated)
         jump_peak_met = torch.zeros_like(terminated)
         jump_landing_kinematics = torch.zeros_like(terminated)
         jump_flight_seconds = torch.zeros(batch.num_worlds, dtype=torch.float32, device=batch.device)
@@ -1166,6 +1410,7 @@ def _make_stability_gate(
                 speed_samples.add_(batch.num_worlds)
                 jump_triggered.logical_or_(task._jump_triggered)
                 jump_landed.logical_or_(task._jump_landing_confirmed)
+                jump_landing_target.logical_or_(task._jump_landing_target_met)
                 jump_peak_met.logical_or_(task._jump_minimum_peak_met)
                 jump_landing_kinematics.logical_or_(task._jump_landing_kinematics_ok)
                 torch.maximum(jump_flight_seconds, task._jump_flight_seconds, out=jump_flight_seconds)
@@ -1181,6 +1426,7 @@ def _make_stability_gate(
                 finite_reward_terms.to(dtype=torch.int64),
                 jump_triggered.sum(dtype=torch.int64),
                 jump_landed.sum(dtype=torch.int64),
+                jump_landing_target.sum(dtype=torch.int64),
                 jump_peak_met.sum(dtype=torch.int64),
                 jump_landing_kinematics.sum(dtype=torch.int64),
                 obstacle_seen.sum(dtype=torch.int64),
@@ -1196,6 +1442,7 @@ def _make_stability_gate(
                 finite_reward_terms_flag,
                 triggered_count,
                 landed_count,
+                landing_target_count,
                 peak_count,
                 landing_kinematics_count,
                 obstacle_count,
@@ -1209,6 +1456,7 @@ def _make_stability_gate(
                 or (
                     triggered_count == batch.num_worlds
                     and landed_count == batch.num_worlds
+                    and landing_target_count == batch.num_worlds
                     and peak_count == batch.num_worlds
                     and landing_kinematics_count == batch.num_worlds
                     and minimum_flight_seconds >= action_dt
@@ -1255,6 +1503,7 @@ def _make_stability_gate(
                 "jump_supervisor_verified": jump_passed,
                 "jump_triggered_worlds": triggered_count,
                 "landing_confirmed_worlds": landed_count,
+                "landing_target_met_worlds": landing_target_count,
                 "jump_minimum_peak_worlds": peak_count,
                 "landing_kinematics_worlds": landing_kinematics_count,
                 "minimum_flight_seconds": minimum_flight_seconds,
@@ -1302,6 +1551,7 @@ def _make_stability_gate(
             ),
             "jump_triggered_worlds": domain_randomized["jump_triggered_worlds"],
             "landing_confirmed_worlds": domain_randomized["landing_confirmed_worlds"],
+            "landing_target_met_worlds": domain_randomized["landing_target_met_worlds"],
             "jump_minimum_peak_worlds": domain_randomized["jump_minimum_peak_worlds"],
             "landing_kinematics_worlds": domain_randomized["landing_kinematics_worlds"],
             "minimum_flight_seconds": domain_randomized["minimum_flight_seconds"],
@@ -1365,6 +1615,14 @@ def build_curriculum_stage(stage: Any, config: Any) -> OfficialCourseBundle:
         control_delay_steps=int(_value(config, "gpu_task").control_delay_steps),
         domain_randomization_seed=int(batch_config.domain_randomization.seed) + 3,
         leg_action_enabled=False,
+        # A direct jump intentionally extends the linkage beyond the flat
+        # stance envelope.  Keep the wider P0 travel gate local to these
+        # stages; non-jump routes retain the 0.400 m safety limit.
+        safety_leg_length_max_m=(
+            max(float(task_base.safety_leg_length_max_m), float(adapter.jump.maximum_jump_leg_length_m))
+            if course.direct_jump
+            else float(task_base.safety_leg_length_max_m)
+        ),
     )
     controller_config = replace(
         flat.flat_controller,
