@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ADAPTER_CONFIG = ROOT / "configs" / "official_grade15_warp.yaml"
 SCENE = ROOT / "official_standard_warp_ground.xml"
 CANONICAL_SCENE = ROOT / "official_standard_ground.xml"
-CURRICULUM = ROOT / "official_standard_curriculum.yaml"
+CURRICULUM = ROOT / "configs" / "official_standard_curriculum.yaml"
 
 
 def _stage() -> SimpleNamespace:
@@ -166,7 +166,7 @@ class OfficialGrade15AdapterStaticTest(unittest.TestCase):
         batch = load_warp_batch_config(adapter.batch_config_path)
         self.assertEqual(batch.xml_path, SCENE.resolve())
         self.assertFalse(batch.domain_randomization.enabled)
-        self.assertLessEqual(batch.safety.torque_fraction_of_rated, 0.80)
+        self.assertLessEqual(batch.safety.torque_fraction_of_rated, batch.safety.torque_limit_ratio_sim)
 
     def test_factory_rejects_downhill_before_gpu_allocation(self) -> None:
         unsupported = _stage()

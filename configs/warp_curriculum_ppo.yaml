@@ -26,7 +26,7 @@ curriculum:
     - id: rmuc_flat
       task_mode: flat_walking_only
       xml_path: ../wheeled_infantry.xml
-      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_curriculum_path: rmuc_terrain_curriculum.yaml
       terrain_stage_id: flat_balance
       controller_backend: fixed_gain_flat_controller_v2
       terrain_enabled: false
@@ -44,7 +44,7 @@ curriculum:
     - id: rmuc_flat_dr
       task_mode: flat_vehicle_domain_randomization
       xml_path: ../wheeled_infantry.xml
-      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_curriculum_path: rmuc_terrain_curriculum.yaml
       terrain_stage_id: flat_balance
       controller_backend: fixed_gain_flat_controller_v2
       terrain_enabled: false
@@ -61,7 +61,7 @@ curriculum:
     - id: grades
       task_mode: rmuc_grades
       xml_path: ../rm_train_ground.xml
-      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_curriculum_path: rmuc_terrain_curriculum.yaml
       terrain_stage_id: grades
       adapter_config_path: rmuc_course_warp.yaml
       controller_backend: rmuc_route_controller_v1
@@ -78,7 +78,7 @@ curriculum:
     - id: low_speed_turning
       task_mode: low_speed_turning
       xml_path: ../wheeled_infantry.xml
-      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_curriculum_path: rmuc_terrain_curriculum.yaml
       terrain_stage_id: turning
       adapter_config_path: rmuc_course_warp.yaml
       controller_backend: rmuc_route_controller_v1
@@ -98,7 +98,7 @@ curriculum:
     - id: rmuc_stair_jump
       task_mode: rmuc_stair_jump
       xml_path: ../rm_train_ground.xml
-      terrain_curriculum_path: ../rmuc_terrain_curriculum.yaml
+      terrain_curriculum_path: rmuc_terrain_curriculum.yaml
       terrain_stage_id: stair_jump
       adapter_config_path: rmuc_course_warp.yaml
       controller_backend: rmuc_route_controller_v1
@@ -119,7 +119,7 @@ curriculum:
     - id: official_grade15_up
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: grade15
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -137,7 +137,7 @@ curriculum:
     - id: official_grade15_down
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: grade15
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -155,7 +155,7 @@ curriculum:
     - id: official_grade20_up
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: grade20
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -173,7 +173,7 @@ curriculum:
     - id: official_grade20_down
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: grade20
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -191,7 +191,7 @@ curriculum:
     - id: official_step150_up
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: step150
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -209,7 +209,7 @@ curriculum:
     - id: official_step150_down
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: step150
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -227,7 +227,7 @@ curriculum:
     - id: official_stair2x100_up
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: stair2x100
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -245,7 +245,7 @@ curriculum:
     - id: official_stair2x100_down
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: stair2x100
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -263,7 +263,7 @@ curriculum:
     - id: official_step200_lab
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: step200_lab
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -281,7 +281,7 @@ curriculum:
     - id: official_fly17_jump
       task_mode: official_course
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: fly17
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat
@@ -299,7 +299,7 @@ curriculum:
     - id: official_doghole450
       task_mode: official_course_doghole
       xml_path: ../official_standard_warp_ground.xml
-      terrain_curriculum_path: ../official_standard_curriculum.yaml
+      terrain_curriculum_path: official_standard_curriculum.yaml
       terrain_stage_id: doghole450
       adapter_config_path: official_course_warp.yaml
       scene_variant: official_warp_compat

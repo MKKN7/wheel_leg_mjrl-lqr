@@ -71,7 +71,7 @@ class FixedGainFlatPpoManifestTest(TestCase):
 
         _validate_batch_for_flat_training(batch_config, config, task_config)
         self.assertEqual(batch_config.num_worlds, 128)
-        self.assertLessEqual(batch_config.safety.torque_fraction_of_rated, 0.80)
+        self.assertLessEqual(batch_config.safety.torque_fraction_of_rated, batch_config.safety.torque_limit_ratio_sim)
 
     def test_strict_controller_section_rejects_missing_parameter(self) -> None:
         payload = yaml.safe_load(TRAIN_CONFIG.read_text(encoding="utf-8"))

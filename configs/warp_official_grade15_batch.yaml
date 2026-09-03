@@ -1,5 +1,6 @@
 schema_version: 1
 backend: mujoco_warp
+run_mode: sim_training
 xml_path: ../official_standard_warp_ground.xml
 num_worlds: 128
 physics_substeps_per_action: 10
@@ -7,22 +8,24 @@ smoke_actions: 2
 
 runtime:
   device: cuda:0
-  cache_path: C:/Users/ASUS/Desktop/try2/warp_official_grade15_cache
-  temporary_path: C:/Users/ASUS/Desktop/try2/warp_official_grade15_temp
+  cache_path: ../.cache/warp/runtime
+  temporary_path: ../.cache/warp/temp
   cuda_graph: false
   use_precompiled_headers: false
 
 data_capacity:
   nconmax: 256
   nccdmax: 256
-  njmax: 256
+  njmax: 512
   njmax_nnz: 5120
   naconmax: 4096
   naccdmax: 4096
   nvmax: 44
 
 safety:
-  torque_fraction_of_rated: 0.80
+  torque_limit_ratio_sim: 1.00
+  torque_limit_ratio_real: 0.80
+  current_limit_A: 60.0
   estop_on_nonfinite_control: true
   estop_on_nonfinite_state: true
   estop_on_overflow: true

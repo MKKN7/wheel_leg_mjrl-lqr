@@ -73,6 +73,7 @@ def _valid_dual_gate_report(config, stage) -> dict:
                 "jump_supervisor_verified": True,
                 "jump_triggered_worlds": 128,
                 "landing_confirmed_worlds": 128,
+                "landing_target_met_worlds": 128,
                 "jump_minimum_peak_worlds": 128,
                 "landing_kinematics_worlds": 128,
                 "minimum_flight_seconds": config.gpu_task.stability_gate_seconds / 800.0,

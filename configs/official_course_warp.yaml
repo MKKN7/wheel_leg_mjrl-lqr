@@ -1,7 +1,7 @@
 schema_version: 1
 batch_config: warp_official_standard_batch.yaml
 flat_ppo_config: warp_flat_ppo.yaml
-terrain_curriculum: ../official_standard_curriculum.yaml
+terrain_curriculum: official_standard_curriculum.yaml
 canonical_scene: ../official_standard_ground.xml
 
 terrain_features:
@@ -33,19 +33,40 @@ jump_supervisor:
   thrust_length_m: 0.385
   flight_retract_length_m: 0.205
   flight_preload_length_m: 0.320
-  landing_length_m: 0.285
+  landing_length_m: 0.320
   prepare_seconds: 0.12
   crouch_seconds: 0.10
-  thrust_seconds: 0.12
+  thrust_seconds: 0.35
   flight_retract_seconds: 0.10
   maximum_airborne_seconds: 1.20
   landing_confirm_seconds: 0.08
   recovery_seconds: 0.30
   prelanding_seconds: 0.05
   landing_torque_fraction: 0.30
-  flight_torque_fraction: 0.10
+  # The dedicated airborne recovery is intentionally stronger than the
+  # walking LQR attenuation; the final actuator clip still enforces 80%.
+  flight_torque_fraction: 0.50
   jump_residual_fraction: 0.05
   thrust_leg_force_limit_n: 180.0
+  # Leave explicit headroom for the gas-spring generalized force and float
+  # rounding at the 80-percent actuator envelope.
+  thrust_hip_torque_nm: 26.0
+  # Wheel torque is held at zero during the vertical launch.  Applying drive
+  # torque while the wheels are still constrained turns the impulse into
+  # horizontal scrub and prevents the body from clearing a riser.
+  thrust_wheel_torque_nm: 0.0
+  minimum_liftoff_vertical_speed_mps: 0.10
+  # Require a real body-rise witness before leaving the constrained thrust
+  # phase.  This prevents a single proxy-contact gap from cutting thrust early.
+  minimum_liftoff_body_rise_m: 0.180
+  # Direct-jump linkage extension is wider than the flat 0.400 m travel gate;
+  # this value is applied only to direct-jump stages and remains fail-closed.
+  maximum_jump_leg_length_m: 0.460
+  airborne_hip_kp_nm_per_rad: 20.0
+  airborne_hip_kd_nm_per_rad_s: 4.0
+  airborne_wheel_attitude_kp_nm_per_rad: 6.0
+  airborne_wheel_attitude_kd_nm_per_rad_s: 0.48
+  airborne_wheel_torque_limit_nm: 2.40
   minimum_peak_body_rise_m: 0.120
   maximum_landing_vertical_speed_mps: 1.00
   maximum_landing_angular_speed_rad_s: 2.50

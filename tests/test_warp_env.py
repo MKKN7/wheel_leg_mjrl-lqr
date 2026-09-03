@@ -11,7 +11,12 @@ import unittest
 import numpy as np
 import yaml
 
-from warp_env import WarpBatchError, _signed_rated_control_limits, load_warp_batch_config
+from warp_env import (
+    WarpBatchError,
+    _finite_parity_error,
+    _signed_rated_control_limits,
+    load_warp_batch_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,10 +36,11 @@ class WarpBatchConfigTest(unittest.TestCase):
     def test_preflight_config_is_raw_control_only_and_not_training_enabled(self) -> None:
         config = load_warp_batch_config(CONFIG_PATH)
         self.assertEqual(config.backend, "mujoco_warp")
+        self.assertEqual(config.xml_path.name, "wheeled_infantry.xml")
         self.assertEqual(config.num_worlds, 128)
         self.assertEqual(config.controller_backend, "raw_controls_only")
         self.assertFalse(config.ppo_training_enabled)
-        self.assertLessEqual(config.safety.torque_fraction_of_rated, 0.80)
+        self.assertLessEqual(config.safety.torque_fraction_of_rated, config.safety.torque_limit_ratio_sim)
         self.assertTrue(config.fall_guard.enabled)
         self.assertAlmostEqual(config.fall_guard.max_attitude_error_rad, 1.0)
         self.assertTrue(config.preflight.verify_single_step_parity)
@@ -71,6 +77,12 @@ class WarpBatchConfigTest(unittest.TestCase):
         self.addCleanup(path.unlink)
         with self.assertRaisesRegex(WarpBatchError, "qvel_max_abs_error"):
             load_warp_batch_config(path)
+
+    def test_parity_rejects_nonfinite_values_before_tolerance_comparison(self) -> None:
+        with self.assertRaisesRegex(WarpBatchError, "GPU one-step parity state is non-finite: qpos"):
+            _finite_parity_error(np.zeros(2), np.asarray([0.0, np.nan]), name="qpos")
+        with self.assertRaisesRegex(WarpBatchError, "CPU one-step parity state is non-finite: qvel"):
+            _finite_parity_error(np.asarray([np.inf]), np.zeros(1), name="qvel")
 
     def test_signed_caps_intersect_declared_ranges_before_derating(self) -> None:
         model = SimpleNamespace(

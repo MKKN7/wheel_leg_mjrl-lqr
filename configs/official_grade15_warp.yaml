@@ -3,7 +3,7 @@ stage_id: official_grade15_up
 task_mode: official_grade15_up
 batch_config: warp_official_grade15_batch.yaml
 flat_ppo_config: warp_flat_ppo.yaml
-terrain_curriculum: ../official_standard_curriculum.yaml
+terrain_curriculum: official_standard_curriculum.yaml
 canonical_scene: ../official_standard_ground.xml
 terrain_stage_id: grade15
 task_id: grade15_up

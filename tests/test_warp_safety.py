@@ -39,6 +39,24 @@ class WarpSafetyTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             WarpSafetyLimits(torque_fraction_of_rated=0.81)
 
+    def test_mode_aware_torque_limit_uses_the_yaml_selected_mode(self) -> None:
+        simulation = WarpSafetyLimits(
+            torque_fraction_of_rated=1.0,
+            run_mode="sim_training",
+            torque_limit_ratio_sim=1.0,
+            torque_limit_ratio_real=0.8,
+            current_limit_A=60.0,
+        )
+        self.assertEqual(simulation.effective_torque_fraction, 1.0)
+        with self.assertRaises(ValueError):
+            WarpSafetyLimits(
+                torque_fraction_of_rated=1.0,
+                run_mode="real_hardware",
+                torque_limit_ratio_sim=1.0,
+                torque_limit_ratio_real=0.8,
+                current_limit_A=60.0,
+            )
+
     def test_clip_controls_replaces_nan_and_preserves_asymmetric_caps(self) -> None:
         controls = torch.tensor([[float("nan"), 9.0], [-9.0, -2.0]], dtype=torch.float32)
         low = torch.tensor([-2.0, -1.0])

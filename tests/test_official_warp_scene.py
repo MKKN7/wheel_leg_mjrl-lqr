@@ -19,7 +19,7 @@ from build_official_standard_ground import (
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_SCENE = ROOT / "official_standard_ground.xml"
 WARP_SCENE = ROOT / "official_standard_warp_ground.xml"
-GEOMETRY = ROOT / "official_terrain_geometry.yaml"
+GEOMETRY = ROOT / "configs" / "official_terrain_geometry.yaml"
 _BATCH_SIZES = {
     "body_mass": 2,
     "body_inertia": 2,

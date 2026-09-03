@@ -1,7 +1,7 @@
 schema_version: 1
 flat_ppo_config: warp_flat_ppo.yaml
 calibration_scene: ../wheeled_infantry.xml
-terrain_curriculum: ../rmuc_terrain_curriculum.yaml
+terrain_curriculum: rmuc_terrain_curriculum.yaml
 
 terrain_features:
   lookahead_distances_m: [0.10, 0.28, 0.50, 0.76]

@@ -110,14 +110,14 @@ class WarpFlatControllerCudaTest(unittest.TestCase):
         task._controller = controller
         task.reset()
         controls = controller.compute_controls(task)
-        controls[:, controller._gas_actuator_ids] = batch._control_low[controller._gas_actuator_ids]
+        controls[:, controller._gas_actuator_ids] = controller._gas_control_low
         forces = controller.applied_generalized_forces(task, safe_controls=controls)
         self.assertEqual(tuple(controls.shape), (1, ACTION_SIZE))
         self.assertEqual(tuple(forces.shape), (1, batch.host_model.nv))
         self.assertEqual(controls.device, batch.device)
         self.assertEqual(forces.device, batch.device)
         self.assertTrue(bool(torch.isfinite(controls).all().item()))
-        # At the negative derated actuator boundary, the negative gas spring
+        # At the negative controller actuator boundary, the negative gas spring
         # has no remaining signed headroom on either matching hip DOF.
         torch.testing.assert_close(
             forces[0, calibration.gas_spring_dofs],
@@ -141,7 +141,7 @@ class WarpFlatControllerCudaTest(unittest.TestCase):
         self.assertFalse(bool(result.estopped[0].item()))
         torch.testing.assert_close(result.applied_forces, forces)
 
-    def test_rejects_torque_fraction_mismatch_with_batch(self) -> None:
+    def test_allows_a_conservative_controller_torque_fraction(self) -> None:
         from warp_env import WarpPhysicsBatch, load_warp_batch_config
         from warp_flat_controller import calibrate_flat_controller
         from warp_task import WarpFlatWalkingConfig, WarpFlatWalkingTask
@@ -157,12 +157,14 @@ class WarpFlatControllerCudaTest(unittest.TestCase):
             WarpFlatWalkingConfig(),
             calibration=calibration.to_task_calibration(),
         )
-        with self.assertRaisesRegex(ValueError, "max_torque_fraction"):
-            FixedGainFlatController(
-                calibration,
-                task,
-                WarpFlatControllerConfig(max_torque_fraction=0.79),
-            )
+        controller = FixedGainFlatController(
+            calibration,
+            task,
+            WarpFlatControllerConfig(max_torque_fraction=0.79),
+        )
+        controls = controller.compute_controls(task)
+        self.assertTrue(bool((controls >= controller._controller_control_low.unsqueeze(0)).all().item()))
+        self.assertTrue(bool((controls <= controller._controller_control_high.unsqueeze(0)).all().item()))
 
     def test_rejects_generalized_force_cap_above_derated_hip_limit(self) -> None:
         from warp_env import WarpPhysicsBatch, load_warp_batch_config

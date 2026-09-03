@@ -8,6 +8,19 @@ __pycache__/
 # Runtime scratch directories created by temporary-file APIs
 tmp*/
 
+# Archived experiments and local Warp compilation caches
+experiments/**/__pycache__/
+.cache/
+warp_*_cache/
+warp_*_temp/
+
+# Generated reports that should not be committed from local runs
+classification_*.json
+reports/generated/*.json
+reports/generated/*.csv
+reports/logs/*.log
+reports/logs/*.TXT
+
 # Local MuJoCo diagnostics
 MUJOCO_LOG.TXT
 

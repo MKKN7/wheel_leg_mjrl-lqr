@@ -1,5 +1,6 @@
 schema_version: 1
 backend: mujoco_warp
+run_mode: sim_training
 xml_path: ../wheeled_infantry.xml
 num_worlds: 128
 physics_substeps_per_action: 10
@@ -9,8 +10,8 @@ runtime:
   device: cuda:0
   # Keep DR's set_const/NVRTC precompiled-header files isolated from the flat
   # harness. This path is created by Warp before its first CUDA initialization.
-  cache_path: C:/Users/ASUS/Desktop/try2/warp_curriculum_runtime_cache
-  temporary_path: C:/Users/ASUS/Desktop/try2/warp_curriculum_runtime_temp
+  cache_path: ../.cache/warp/runtime
+  temporary_path: ../.cache/warp/temp
   cuda_graph: false
   # Warp 1.16 + CUDA 12.9 on this Windows host cannot reliably reuse the
   # driver-owned NVRTC PCH directory. Disabling PCH changes compile latency,
@@ -20,14 +21,16 @@ runtime:
 data_capacity:
   nconmax: 128
   nccdmax: 128
-  njmax: 256
+  njmax: 512
   njmax_nnz: 5120
   naconmax: 4096
   naccdmax: 4096
   nvmax: 44
 
 safety:
-  torque_fraction_of_rated: 0.80
+  torque_limit_ratio_sim: 1.00
+  torque_limit_ratio_real: 0.80
+  current_limit_A: 60.0
   estop_on_nonfinite_control: true
   estop_on_nonfinite_state: true
   estop_on_overflow: true

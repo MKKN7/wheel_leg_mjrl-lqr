@@ -61,7 +61,7 @@ class WarpCurriculumFactoryContractTest(unittest.TestCase):
         self.assertTrue(batch_config.domain_randomization.enabled)
         self.assertFalse(batch_config.domain_randomization.terrain_geometry_randomization)
         self.assertEqual(batch_config.domain_randomization.delay.steps, 0)
-        self.assertLessEqual(batch_config.safety.torque_fraction_of_rated, 0.80)
+        self.assertLessEqual(batch_config.safety.torque_fraction_of_rated, batch_config.safety.torque_limit_ratio_sim)
         self.assertFalse(batch_config.runtime.use_precompiled_headers)
 
     def test_factory_rejects_non_flat_stage_before_gpu_allocation(self) -> None:

@@ -14,9 +14,9 @@ from terrain_curriculum import load_terrain_curriculum, validate_scene_contract
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRICULUM_PATH = ROOT / "official_standard_curriculum.yaml"
+CURRICULUM_PATH = ROOT / "configs" / "official_standard_curriculum.yaml"
 SCENE_PATH = ROOT / "official_standard_ground.xml"
-RMUC_CURRICULUM_PATH = ROOT / "rmuc_terrain_curriculum.yaml"
+RMUC_CURRICULUM_PATH = ROOT / "configs" / "rmuc_terrain_curriculum.yaml"
 
 
 class OfficialStandardTerrainTest(unittest.TestCase):
